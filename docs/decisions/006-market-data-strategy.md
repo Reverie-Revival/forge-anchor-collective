@@ -54,12 +54,24 @@ Pre-2017 data can always be pulled separately for curiosity. It should not be in
 - PostgreSQL handles this trivially — no partitioning or optimization needed at this scale
 
 ## Data Source
-Kraken public OHLC endpoint — no authentication required, no cost.
+Coinbase Exchange public candles endpoint — no authentication required, no cost, real BTC-USD prices.
+- Endpoint: `GET https://api.exchange.coinbase.com/products/BTC-USD/candles`
+- Granularity: `900` (15 minutes in seconds)
+- Pagination via `start` / `end` datetime window
+- Returns up to 300 candles per request — requires ~1,100 requests to pull full history
+
+### Why Coinbase Instead of Kraken or Binance
+Kraken's public OHLC API only stores a rolling window of ~720 recent candles (~7.5 days at 15m). It cannot provide historical data going back to 2017. Binance has the historical data but geo-blocks US IP addresses (HTTP 451). Coinbase Exchange API is US-accessible, free, no auth required, and provides real BTC-USD prices (not USDT) going back to 2017.
+
+## Ongoing Updates: Kraken
+Once the Coinbase backfill is complete, all incremental updates use Kraken's public OHLC endpoint instead. Since incremental runs happen frequently (daily or more often), the latest DB timestamp will always fall within Kraken's ~7.5 day rolling window.
+
+This keeps ongoing data on the exchange we trade on — price differences between Coinbase and Kraken are <0.1% and negligible for backtesting, but consistency with our execution venue is preferred for all forward data.
+
 - Endpoint: `GET https://api.kraken.com/0/public/OHLC`
 - Pair: `XBTUSD`
 - Interval: `15` (minutes)
-- Pagination via `since` parameter (Unix timestamp)
-- Returns up to 720 candles per request — requires ~440 requests to pull full history
+- Pagination via `since` Unix timestamp, returns up to 720 candles
 
 ## Ongoing Updates
 The downloader runs in two modes:
