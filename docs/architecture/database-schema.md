@@ -7,22 +7,22 @@
 
 ## Shared — market_data
 
-Stores all raw BTC price history. Lives outside both schemas — feeds everything.
+Stores all raw BTC/USD price history. Lives outside both schemas — feeds everything.
+Single interval: 15-minute candles from January 1, 2017 to present (~315,000 rows).
+See ADR 006 for the full reasoning behind interval and history decisions.
 
 ```sql
 market_data
   candle_id     BIGSERIAL PRIMARY KEY
-  timestamp     TIMESTAMPTZ NOT NULL
-  interval      VARCHAR(10) NOT NULL   -- '1h', '4h', '1d'
+  timestamp     TIMESTAMPTZ NOT NULL UNIQUE
   open          NUMERIC(12,2) NOT NULL
   high          NUMERIC(12,2) NOT NULL
   low           NUMERIC(12,2) NOT NULL
   close         NUMERIC(12,2) NOT NULL
   volume        NUMERIC(20,8) NOT NULL
-  UNIQUE (timestamp, interval)
 ```
 
-Index on `(timestamp, interval)` — nearly every query filters by time range.
+Index on `timestamp` — nearly every query filters by time range.
 
 ---
 
