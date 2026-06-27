@@ -32,13 +32,22 @@ This makes it easy to trace which stream lineage performed well across models.
 $100 live capital is low enough that live deployment serves as the real-world validation. Paper trading is optional, not required. Backtest confidence is the gate to deployment, not a calendar waiting period.
 
 ## Grading System
-| Grade | Criteria |
-|---|---|
-| Passing | Consistently beats S&P 500 for the same period |
-| Strong | 20%+ annualized return, consistently |
-| Elite | Strong grade held for 2+ consecutive years |
+S&P 500 historical average (~10% annualized) is the midpoint. Every model receives a grade regardless of outcome — poor results are data, not failure.
 
-Elite models are candidates for increased capital allocation. No model receives more capital based on short-term results alone.
+| Grade | Label | Criteria |
+|---|---|---|
+| 5 | Elite | 20%+ annualized, sustained 2+ years |
+| 4 | Strong | Consistently beats S&P (10-19%) |
+| 3 | Passing | Roughly matches S&P (8-12%) |
+| 2 | Weak | Positive return but below S&P |
+| 1 | Poor | Break-even or loss |
+
+Grade 5 (Elite) models sustained for 2+ years are candidates for increased capital allocation. No model receives more capital based on short-term results alone.
+
+## Model Commitment Rule
+Every deployed model runs for the full duration of its experiment, regardless of performance. A model that underperforms is not shut down just because a newer model is doing better — the long-term data is more valuable than the $100. Models are only stopped if capital is fully exhausted or there is a critical system failure.
+
+The goal is not to maximize returns on any single $100. The goal is to prove out a model architecture that could eventually work at scale. Cutting a model short corrupts the data.
 
 ## Why This Approach
 - Parallel models create a natural controlled experiment — same market, different strategies

@@ -29,11 +29,18 @@ Strategist/designer — deterministic code executes trades, not an LLM
 - Models are never retired — they run until capital is exhausted or manually stopped
 
 ### Grading System
-| Grade | Criteria |
-|---|---|
-| Passing | Beats S&P 500 consistently |
-| Strong | 20%+ annualized return consistently |
-| Elite | Strong grade held for 2+ years → candidate for more capital |
+S&P 500 (~10%) is the midpoint. Every model gets graded — poor results are data, not failure.
+
+| Grade | Label | Criteria |
+|---|---|---|
+| 5 | Elite | 20%+ annualized, sustained 2+ years → candidate for more capital |
+| 4 | Strong | Consistently beats S&P (10-19%) |
+| 3 | Passing | Roughly matches S&P (8-12%) |
+| 2 | Weak | Positive but below S&P |
+| 1 | Poor | Break-even or loss |
+
+### Model Commitment Rule
+Every deployed model runs for the full duration of its experiment regardless of performance. The long-term data is worth more than the $100. Models stop only if capital is exhausted or there is a critical system failure.
 
 ## Model Lifecycle (what "phases" actually mean)
 
