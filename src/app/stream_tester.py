@@ -230,17 +230,15 @@ def load_stream_history() -> pd.DataFrame:
         engine = get_engine()
         with engine.connect() as conn:
             return pd.read_sql(text("""
-                SELECT t.test_id, t.stream_name, t.stream_version,
-                       r.stream_id, t.run_number, t.window_name,
-                       t.parameters, t.test_start, t.test_end,
-                       t.total_trades, t.profit_factor, t.annualized_return_pct,
-                       t.max_drawdown_pct, t.avg_winner_pct, t.avg_loser_pct,
-                       t.win_rate, t.total_return_pct, t.ending_balance,
-                       t.initial_capital, t.saved_at, t.notes
-                FROM backtest.stream_tests t
-                LEFT JOIN backtest.stream_registry r
-                    ON r.stream_name = t.stream_name AND r.version = t.stream_version
-                ORDER BY t.run_number ASC, t.test_start ASC
+                SELECT test_id, stream_name, stream_version,
+                       run_number, window_name, parameters,
+                       test_start, test_end, total_trades, profit_factor,
+                       annualized_return_pct, max_drawdown_pct,
+                       avg_winner_pct, avg_loser_pct, win_rate,
+                       total_return_pct, ending_balance, initial_capital,
+                       saved_at, notes
+                FROM backtest.stream_tests
+                ORDER BY run_number ASC, test_start ASC
             """), conn)
     except Exception:
         return pd.DataFrame()
@@ -726,17 +724,12 @@ with st.sidebar:
     selected_stream = st.selectbox("", all_streams, label_visibility="collapsed")
     stream_runs     = run_groups.get(selected_stream, {})  # run_number → [rows]
 
-    # ── Config (run) selector ─────────────────────────────────────────────────
-    st.markdown('<p class="config-group-header" style="margin-top:14px;">Config Run</p>',
+    # ── Test Run selector ─────────────────────────────────────────────────────
+    st.markdown('<p class="config-group-header" style="margin-top:14px;">Test Run</p>',
                 unsafe_allow_html=True)
 
     run_options = []
     run_labels  = {}
-
-    # Unsaved run at top if .last_run.pkl exists
-    if has_unsaved:
-        run_options.append("__new__")
-        run_labels["__new__"] = "⏳  Latest (unsaved)"
 
     for rnum in sorted(stream_runs.keys()):
         rows = stream_runs[rnum]
@@ -755,12 +748,9 @@ with st.sidebar:
         st.caption("No saved runs for this stream yet.")
         selected_run = None
     else:
-        # Default: most recent saved run (last numeric key), not the unsaved one
-        saved_runs    = [r for r in run_options if r != "__new__"]
-        default_index = run_options.index(saved_runs[-1]) if saved_runs else 0
-        selected_run  = st.selectbox(
+        selected_run = st.selectbox(
             "", run_options,
-            index=default_index,
+            index=len(run_options) - 1,
             format_func=lambda x: run_labels.get(x, str(x)),
             label_visibility="collapsed",
         )
@@ -805,12 +795,12 @@ with st.sidebar:
             if row.get("notes"):
                 st.caption(f"💬 {row['notes']}")
 
-    elif selected_run == "__new__" and has_unsaved:
+    elif has_unsaved:
         st.divider()
         try:
             with open(LAST_RUN_PATH, "rb") as f:
                 _cur = pickle.load(f)
-            st.caption("Unsaved — run from Claude Code")
+            st.caption("Unsaved run ready ↑")
             st.caption(_compact_config(_cur.get("params", {})))
         except Exception:
             pass
@@ -818,16 +808,24 @@ with st.sidebar:
 
 # ── Main area ─────────────────────────────────────────────────────────────────
 
-if selected_run == "__new__":
+# Show unsaved run as a save-prompt banner when .last_run.pkl exists
+if has_unsaved:
     try:
         with open(LAST_RUN_PATH, "rb") as f:
-            payload = pickle.load(f)
+            _cur_payload = pickle.load(f)
+        _cur_ann = _cur_payload.get("metrics", {}).get("annualized_return_pct")
+        _cur_name = _cur_payload.get("stream_name", "")
+        with st.expander(
+            f"⏳ Unsaved run ready — {_cur_name}  "
+            f"{'· ' + f'{_cur_ann:+.1f}%' if _cur_ann else ''}  · click to view & save",
+            expanded=False,
+        ):
+            render_dashboard(_cur_payload, show_save=True)
+        st.divider()
     except Exception:
-        st.error("Could not load the current run file.")
-        st.stop()
-    render_dashboard(payload, show_save=True)
+        pass
 
-elif selected_run is not None and selected_run in stream_runs:
+if selected_run is not None and selected_run in stream_runs:
     rows       = stream_runs[selected_run]
     tab_labels = [
         row.get("window_name") or label_window(row["test_start"], row["test_end"])
