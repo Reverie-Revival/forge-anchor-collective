@@ -237,7 +237,7 @@ def load_stream_history() -> pd.DataFrame:
                        total_return_pct, ending_balance, initial_capital,
                        saved_at, notes
                 FROM backtest.stream_tests
-                ORDER BY run_number ASC, test_start ASC
+                ORDER BY run_number ASC, saved_at ASC
             """), conn)
     except Exception:
         return pd.DataFrame()
@@ -825,7 +825,7 @@ def load_pending_runs(run_rows: list) -> list:
         saved_windows.add((str(row["test_start"])[:10], str(row["test_end"])[:10]))
 
     pending = []
-    for f in sorted(RUNS_DIR.glob(f"pending_{ph}_*.pkl")):
+    for f in sorted(RUNS_DIR.glob(f"pending_{ph}_*.pkl"), key=lambda x: x.stat().st_mtime):
         # filename: pending_{hash}_{start}_{end}.pkl
         parts = f.stem.split("_")  # ['pending', hash, start-date, end-date]
         if len(parts) >= 4:
