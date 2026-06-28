@@ -326,6 +326,14 @@ def save_stream_test(stream_name, params, result, metrics, initial_capital, endi
     with open(pkl_path, "wb") as f:
         pickle.dump(payload, f)
 
+    # Clean up matching pending file if it exists
+    ph = params_hash(params)
+    start_str = str(result["start"])[:10]
+    end_str   = str(result["end"])[:10]
+    pending   = RUNS_DIR / f"pending_{ph}_{start_str}_{end_str}.pkl"
+    if pending.exists():
+        pending.unlink()
+
     return test_id, run_num, win_nm
 
 
@@ -798,82 +806,104 @@ with st.sidebar:
 
 # ── Main area ─────────────────────────────────────────────────────────────────
 
-# Check if .last_run.pkl holds a run not yet saved to the DB
-unsaved_payload = None
-if has_unsaved:
+def load_pending_runs(run_rows: list) -> list:
+    """Find pending_*.pkl files in RUNS_DIR matching the params hash of this run group."""
+    if not run_rows:
+        return []
     try:
-        with open(LAST_RUN_PATH, "rb") as f:
-            _cur = pickle.load(f)
-        cur_h     = params_hash(_cur.get("params", {}))
-        cur_start = str(_cur.get("result", {}).get("start", ""))[:10]
-        cur_end   = str(_cur.get("result", {}).get("end",   ""))[:10]
-        already_saved = False
-        if not history.empty:
-            for _, row in history.iterrows():
+        p  = run_rows[0]["parameters"] if isinstance(run_rows[0]["parameters"], dict) \
+             else json.loads(run_rows[0]["parameters"])
+        ph = params_hash(p)
+    except Exception:
+        return []
+
+    # Collect saved date windows so we don't show a pending that's already saved
+    saved_windows = set()
+    for row in run_rows:
+        saved_windows.add((str(row["test_start"])[:10], str(row["test_end"])[:10]))
+
+    pending = []
+    for f in sorted(RUNS_DIR.glob(f"pending_{ph}_*.pkl")):
+        # filename: pending_{hash}_{start}_{end}.pkl
+        parts = f.stem.split("_")  # ['pending', hash, start-date, end-date]
+        if len(parts) >= 4:
+            start_str = parts[2]
+            end_str   = parts[3]
+            if (start_str, end_str) not in saved_windows:
                 try:
-                    p = row["parameters"] if isinstance(row["parameters"], dict) \
-                        else json.loads(row["parameters"])
-                    if (params_hash(p) == cur_h
-                            and str(row["test_start"])[:10] == cur_start
-                            and str(row["test_end"])[:10]   == cur_end):
-                        already_saved = True
-                        break
+                    with open(f, "rb") as fh:
+                        payload = pickle.load(fh)
+                    pending.append({"file": f, "payload": payload,
+                                    "start": start_str, "end": end_str})
                 except Exception:
                     pass
-        if not already_saved:
-            unsaved_payload = _cur
-    except Exception:
-        pass
+    return pending
 
-# Unsaved run takes over the main area; once saved it disappears here and shows in tabs
-if unsaved_payload is not None:
-    render_dashboard(unsaved_payload, show_save=True, key_prefix="unsaved")
 
-elif selected_run is not None and selected_run in stream_runs:
-    rows       = stream_runs[selected_run]
-    tab_labels = [
-        row.get("window_name") or label_window(row["test_start"], row["test_end"])
-        for row in rows
-    ]
+# ── Main area ─────────────────────────────────────────────────────────────────
+
+if selected_run is not None and selected_run in stream_runs:
+    saved_rows   = stream_runs[selected_run]
+    pending_runs = load_pending_runs(saved_rows)
+
+    # Build tab list: saved windows first, then unsaved pending
+    tab_entries = []
+    for row in saved_rows:
+        lbl = row.get("window_name") or label_window(row["test_start"], row["test_end"])
+        tab_entries.append({"label": lbl, "type": "saved", "data": row})
+    for pr in pending_runs:
+        lbl = label_window(pr["start"], pr["end"])
+        tab_entries.append({"label": f"⏳ {lbl}", "type": "pending", "data": pr})
 
     # Deduplicate labels
-    seen, deduped = {}, []
-    for lbl in tab_labels:
+    seen = {}
+    for entry in tab_entries:
+        lbl = entry["label"]
         seen[lbl] = seen.get(lbl, 0) + 1
-        deduped.append(lbl if seen[lbl] == 1 else f"{lbl} ({seen[lbl]})")
+        if seen[lbl] > 1:
+            entry["label"] = f"{lbl} ({seen[lbl]})"
 
-    tabs = st.tabs(deduped)
-    for tab, row in zip(tabs, rows):
+    tabs = st.tabs([e["label"] for e in tab_entries])
+
+    for tab, entry in zip(tabs, tab_entries):
         with tab:
-            test_id = int(row["test_id"])
-            payload = load_run_payload(test_id)
-            if payload is not None:
-                render_dashboard(payload, show_save=False, key_prefix=f"run_{test_id}")
-            else:
-                ann = row["annualized_return_pct"]
-                pf  = row["profit_factor"]
-                dd  = row["max_drawdown_pct"]
-                wr  = row["win_rate"]
-                _, gl, gc = grade_info(ann if pd.notna(ann) else None)
-                st.markdown(
-                    f'<span class="grade-badge" style="background:{gc}22;color:{gc};'
-                    f'border:1px solid {gc}66;font-size:1rem;">{gl}</span>',
-                    unsafe_allow_html=True
-                )
-                st.caption(f"{row['stream_name']} {row['stream_version']}  ·  "
-                           f"{row['test_start'].date()} → {row['test_end'].date()}")
-                st.divider()
-                c1, c2, c3, c4 = st.columns(4)
-                c1.metric("Annualized Return", f"{ann:+.1f}%" if pd.notna(ann) else "—")
-                c2.metric("Profit Factor", f"{pf:.2f}" if pd.notna(pf) else "—")
-                c3.metric("Max Drawdown", f"{dd:.1f}%" if pd.notna(dd) else "—")
-                c4.metric("Win Rate", f"{wr*100:.0f}%" if pd.notna(wr) else "—")
-                st.info(
-                    "Full charts not available — this test was saved before per-test pkl storage. "
-                    "Re-run with the same params from Claude Code to restore charts."
-                )
-                if row.get("notes"):
-                    st.caption(f"💬 {row['notes']}")
+            if entry["type"] == "saved":
+                row     = entry["data"]
+                test_id = int(row["test_id"])
+                payload = load_run_payload(test_id)
+                if payload is not None:
+                    render_dashboard(payload, show_save=False, key_prefix=f"run_{test_id}")
+                else:
+                    ann = row["annualized_return_pct"]
+                    pf  = row["profit_factor"]
+                    dd  = row["max_drawdown_pct"]
+                    wr  = row["win_rate"]
+                    _, gl, gc = grade_info(ann if pd.notna(ann) else None)
+                    st.markdown(
+                        f'<span class="grade-badge" style="background:{gc}22;color:{gc};'
+                        f'border:1px solid {gc}66;font-size:1rem;">{gl}</span>',
+                        unsafe_allow_html=True
+                    )
+                    st.caption(f"{row['stream_name']} {row['stream_version']}  ·  "
+                               f"{str(row['test_start'])[:10]} → {str(row['test_end'])[:10]}")
+                    st.divider()
+                    c1, c2, c3, c4 = st.columns(4)
+                    c1.metric("Annualized Return", f"{ann:+.1f}%" if pd.notna(ann) else "—")
+                    c2.metric("Profit Factor",     f"{pf:.2f}"    if pd.notna(pf)  else "—")
+                    c3.metric("Max Drawdown",      f"{dd:.1f}%"   if pd.notna(dd)  else "—")
+                    c4.metric("Win Rate",          f"{wr*100:.0f}%" if pd.notna(wr) else "—")
+                    st.info("Full charts not available — saved before per-test pkl storage. "
+                            "Re-run from Claude Code to restore charts.")
+                    if row.get("notes"):
+                        st.caption(f"💬 {row['notes']}")
+
+            else:  # pending — unsaved run with full dashboard + save button
+                pr      = entry["data"]
+                payload = pr["payload"]
+                pkey    = f"pending_{pr['start']}_{pr['end']}"
+                render_dashboard(payload, show_save=True, key_prefix=pkey)
+                # Delete the pending file after successful save (handled inside render_dashboard
+                # via st.rerun; pending file cleaned up on next load since it's now in saved_windows)
 
 else:
     st.info("Waiting for a run from Claude Code. Results will appear here automatically.")
