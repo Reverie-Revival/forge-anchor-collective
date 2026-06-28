@@ -9,10 +9,29 @@ import plotly.graph_objects as go
 from sqlalchemy import create_engine, text
 import pickle
 from pathlib import Path
+import yfinance as yf
 
 LAST_RUN_PATH = Path(__file__).parent / ".last_run.pkl"
 
-SP500_ANNUALIZED = 10.0  # benchmark baseline
+SP500_HISTORICAL_AVG = 10.0  # long-run annualized S&P 500 baseline
+
+
+@st.cache_data(ttl=3600)
+def fetch_sp500(start: str, end: str):
+    """Fetch actual S&P 500 return for a date range. Cached for 1 hour."""
+    try:
+        spy = yf.download("^GSPC", start=start, end=end, auto_adjust=True, progress=False)
+        if spy.empty:
+            return None
+        s = float(spy["Close"].iloc[0].iloc[0] if hasattr(spy["Close"].iloc[0], "iloc") else spy["Close"].iloc[0])
+        e = float(spy["Close"].iloc[-1].iloc[0] if hasattr(spy["Close"].iloc[-1], "iloc") else spy["Close"].iloc[-1])
+        total = (e - s) / s * 100
+        days  = (pd.Timestamp(end) - pd.Timestamp(start)).days
+        years = days / 365.25
+        ann   = ((1 + total / 100) ** (1 / years) - 1) * 100 if years > 0 else None
+        return {"total_return_pct": round(total, 2), "annualized_return_pct": round(ann, 2) if ann else None}
+    except Exception:
+        return None
 
 
 def get_engine():
@@ -437,39 +456,67 @@ st.divider()
 
 st.markdown('<p class="section-label">Performance</p>', unsafe_allow_html=True)
 
+# Fetch actual S&P 500 return for this exact backtest period
+sp500_actual = fetch_sp500(str(result["start"].date()), str(result["end"].date()))
+sp500_ann    = sp500_actual["annualized_return_pct"] if sp500_actual else None
+bh_ann       = bh.get("annualized_return_pct")
+
 h1, h2, h3, h4 = st.columns(4)
 
 h1.metric(
+    "Starting Balance",
+    f"${initial_capital:.2f}",
+    help=f"{result.get('n_slots', 2)} slots × $10 each."
+)
+h2.metric(
     "Ending Balance",
     f"${ending_capital:.2f}",
-    delta=f"${ending_capital - initial_capital:+.2f} total P&L",
-    help=f"Started at ${initial_capital:.2f}. All trades and fees included."
+    delta=f"${ending_capital - initial_capital:+.2f}",
+    help="Total value after all trades and fees."
 )
-
-h2.metric(
+h3.metric(
     "Annualized Return",
     f"{ann:+.1f}%" if ann is not None else "—",
-    delta=f"{ann - SP500_ANNUALIZED:+.1f}% vs S&P 500" if ann is not None else None,
-    delta_color="normal" if ann is not None and ann >= SP500_ANNUALIZED else "inverse",
-    help=f"Compounded yearly return. S&P 500 benchmark: ~{SP500_ANNUALIZED:.0f}%."
+    delta=f"{ann - SP500_HISTORICAL_AVG:+.1f}% vs S&P historical avg" if ann is not None else None,
+    delta_color="normal" if ann is not None and ann >= SP500_HISTORICAL_AVG else "inverse",
+    help=f"Compounded yearly return. S&P 500 long-run average: ~{SP500_HISTORICAL_AVG:.0f}%."
 )
-
-bh_ann = bh.get("annualized_return_pct")
-vs_bh  = (ann - bh_ann) if (ann is not None and bh_ann is not None) else None
-h3.metric(
-    "vs BTC Buy & Hold",
-    f"{bh_ann:+.1f}% BTC" if bh_ann is not None else "—",
-    delta=f"{vs_bh:+.1f}% difference" if vs_bh is not None else None,
-    delta_color="normal" if vs_bh is not None and vs_bh >= 0 else "inverse",
-    help="BTC buy-and-hold return for the same period. Positive delta = this strategy beat HODL."
-)
-
 h4.metric(
     "Total Return",
     f"{metrics['total_return_pct']:+.1f}%",
-    delta=f"{period_str}",
-    delta_color="off",
-    help="Cumulative return over the full backtest period (not annualized)."
+    delta=f"{ann:+.1f}% / year" if ann is not None else None,
+    delta_color="normal" if ann is not None and ann > 0 else "inverse",
+    help=f"Cumulative return over {period_str}. Delta shows annualized equivalent."
+)
+
+# ── Benchmark row ──────────────────────────────────────────────────────────────
+
+st.markdown('<p class="section-label" style="margin-top:16px;">Benchmarks — how did we compare?</p>', unsafe_allow_html=True)
+
+b1, b2, b3 = st.columns(3)
+
+b1.metric(
+    "S&P 500 historical avg",
+    f"{SP500_HISTORICAL_AVG:.0f}% / year",
+    delta=f"{ann - SP500_HISTORICAL_AVG:+.1f}% vs us" if ann is not None else None,
+    delta_color="normal" if ann is not None and ann >= SP500_HISTORICAL_AVG else "inverse",
+    help="Long-run average annualized S&P 500 return (~10%). The baseline to beat."
+)
+
+b2.metric(
+    f"S&P 500 actual ({period_str})",
+    f"{sp500_ann:+.1f}% / year" if sp500_ann is not None else "—",
+    delta=f"{ann - sp500_ann:+.1f}% vs us" if (ann is not None and sp500_ann is not None) else None,
+    delta_color="normal" if (ann is not None and sp500_ann is not None and ann >= sp500_ann) else "inverse",
+    help=f"What S&P 500 actually returned during this exact backtest period. More honest than the historical average."
+)
+
+b3.metric(
+    "BTC buy & hold",
+    f"{bh_ann:+.1f}% / year" if bh_ann is not None else "—",
+    delta=f"{ann - bh_ann:+.1f}% vs us" if (ann is not None and bh_ann is not None) else None,
+    delta_color="normal",
+    help="What you'd have made just buying and holding BTC for the same period. No trades, no fees."
 )
 
 st.divider()
@@ -480,9 +527,13 @@ st.markdown('<p class="section-label">Trade Statistics</p>', unsafe_allow_html=T
 
 s1, s2, s3, s4, s5, s6 = st.columns(6)
 
+n_wins   = len(closed[closed["pnl"] > 0])
+n_losses = len(closed[closed["pnl"] <= 0])
 s1.metric(
     "Win Rate",
     f"{metrics['win_rate']*100:.1f}%" if metrics["win_rate"] else "—",
+    delta=f"{n_wins} wins · {n_losses} losses",
+    delta_color="off",
     help="% of closed trades that ended in profit. Win rate alone doesn't determine profitability — size of wins matters too."
 )
 s2.metric(
@@ -514,11 +565,12 @@ s6.metric(
     help="Average % loss on losing trades. Ideally smaller (in absolute terms) than avg winner."
 )
 
-st.divider()
-
-# ── Equity curve ──────────────────────────────────────────────────────────────
-
 equity = initial_capital + closed["pnl"].cumsum()
+
+peak_val  = equity.max()
+peak_ts   = closed.loc[equity.idxmax(), "exit_ts"]
+low_val   = equity.min()
+low_ts    = closed.loc[equity.idxmin(), "exit_ts"]
 
 fig_eq = go.Figure()
 fig_eq.add_trace(go.Scatter(
@@ -534,11 +586,31 @@ fig_eq.add_hline(
     annotation_text=f"Start ${initial_capital:.0f}",
     annotation_font_color="#888"
 )
-if bh_ann is not None:
-    bh_end = initial_capital * (1 + bh.get("total_return_pct", 0) / 100)
+fig_eq.add_trace(go.Scatter(
+    x=[peak_ts], y=[peak_val],
+    mode="markers+text",
+    marker=dict(color="#4ade80", size=10, symbol="circle"),
+    text=[f"  <b>High ${peak_val:.2f}</b><br>  {peak_ts.strftime('%b %d, %Y')}"],
+    textposition="middle right",
+    textfont=dict(color="#4ade80", size=12),
+    hovertemplate=f"<b>Peak</b><br>{peak_ts.strftime('%b %d, %Y')}<br>${peak_val:.2f}<extra></extra>",
+    showlegend=False,
+))
+fig_eq.add_trace(go.Scatter(
+    x=[low_ts], y=[low_val],
+    mode="markers+text",
+    marker=dict(color="#f87171", size=10, symbol="circle"),
+    text=[f"  <b>Low ${low_val:.2f}</b><br>  {low_ts.strftime('%b %d, %Y')}"],
+    textposition="middle right",
+    textfont=dict(color="#f87171", size=12),
+    hovertemplate=f"<b>Trough</b><br>{low_ts.strftime('%b %d, %Y')}<br>${low_val:.2f}<extra></extra>",
+    showlegend=False,
+))
+if sp500_ann is not None:
+    sp_end = initial_capital * ((1 + sp500_ann / 100) ** ((result["end"] - result["start"]).days / 365.25))
     fig_eq.add_annotation(
-        x=closed["exit_ts"].iloc[-1], y=bh_end,
-        text=f"BTC buy & hold: ${bh_end:.2f}",
+        x=closed["exit_ts"].iloc[-1], y=sp_end,
+        text=f"S&P 500 this period: ${sp_end:.2f}",
         showarrow=False, font=dict(color="#f59e0b", size=11),
         xanchor="right"
     )
@@ -579,36 +651,39 @@ with col_dd:
     st.plotly_chart(fig_dd, use_container_width=True)
     st.caption(f"0% = at all-time high. Worst drop: **{worst:.1f}%** before recovering. Closer to 0 is better.")
 
-# ── Return distribution ───────────────────────────────────────────────────────
+# ── Per-trade returns ─────────────────────────────────────────────────────────
 with col_dist:
-    winners = closed[closed["return_pct"] > 0]["return_pct"]
-    losers  = closed[closed["return_pct"] <= 0]["return_pct"]
+    trade_seq    = list(range(1, len(closed) + 1))
+    colors       = ["#4ade80" if r > 0 else "#f87171" for r in closed["return_pct"]]
+    hover_labels = [
+        f"Trade #{i}<br>{row.exit_ts.strftime('%b %d, %Y')}<br>{row.return_pct:+.2f}%"
+        for i, row in zip(trade_seq, closed.itertuples())
+    ]
 
-    fig_hist = go.Figure()
-    fig_hist.add_trace(go.Histogram(
-        x=winners, name="Winners",
-        marker_color="#00d4aa", opacity=0.8, xbins=dict(size=0.5)
+    fig_trades = go.Figure()
+    fig_trades.add_hline(y=0, line=dict(color="#555", width=1))
+    fig_trades.add_trace(go.Bar(
+        x=trade_seq,
+        y=closed["return_pct"],
+        marker_color=colors,
+        hovertext=hover_labels,
+        hoverinfo="text",
     ))
-    fig_hist.add_trace(go.Histogram(
-        x=losers, name="Losers",
-        marker_color="#f87171", opacity=0.8, xbins=dict(size=0.5)
-    ))
-    fig_hist.update_layout(
+    fig_trades.update_layout(
         template="plotly_dark",
-        title="Win / Loss Distribution",
-        xaxis_title="Return per trade (%)", yaxis_title="# trades",
-        barmode="overlay", height=280,
-        margin=dict(t=40, b=20, l=10, r=10),
-        legend=dict(x=0.75, y=0.99),
+        title="Every Trade — Return %",
+        xaxis_title="Trade #", yaxis_title="Return (%)",
+        height=280, margin=dict(t=40, b=20, l=10, r=10),
+        showlegend=False,
         plot_bgcolor="rgba(0,0,0,0)",
         paper_bgcolor="rgba(0,0,0,0)",
     )
-    st.plotly_chart(fig_hist, use_container_width=True)
+    st.plotly_chart(fig_trades, use_container_width=True)
     st.caption(
-        f"Green = winning trades, red = losing trades. "
-        f"Avg winner: **{metrics['avg_winner_pct']:+.1f}%** vs avg loser: **{metrics['avg_loser_pct']:.1f}%**."
+        f"Each bar is one trade in chronological order. Green = win, red = loss. "
+        f"Avg winner **{metrics['avg_winner_pct']:+.1f}%** · avg loser **{metrics['avg_loser_pct']:.1f}%**."
         if metrics["avg_winner_pct"] and metrics["avg_loser_pct"] else
-        "Distribution of per-trade returns."
+        "Each bar is one trade. Green = win, red = loss."
     )
 
 # ── Trade log ─────────────────────────────────────────────────────────────────
