@@ -230,39 +230,82 @@ def load_stream_history() -> pd.DataFrame:
         engine = get_engine()
         with engine.connect() as conn:
             return pd.read_sql(text("""
-                SELECT test_id, stream_name, stream_version, parameters,
-                       test_start, test_end,
-                       total_trades, profit_factor, annualized_return_pct,
-                       max_drawdown_pct, avg_winner_pct, avg_loser_pct,
-                       win_rate, total_return_pct, ending_balance, initial_capital,
-                       saved_at, notes
-                FROM backtest.stream_tests
-                ORDER BY saved_at ASC
+                SELECT t.test_id, t.stream_name, t.stream_version,
+                       r.stream_id, t.run_number, t.window_name,
+                       t.parameters, t.test_start, t.test_end,
+                       t.total_trades, t.profit_factor, t.annualized_return_pct,
+                       t.max_drawdown_pct, t.avg_winner_pct, t.avg_loser_pct,
+                       t.win_rate, t.total_return_pct, t.ending_balance,
+                       t.initial_capital, t.saved_at, t.notes
+                FROM backtest.stream_tests t
+                LEFT JOIN backtest.stream_registry r
+                    ON r.stream_name = t.stream_name AND r.version = t.stream_version
+                ORDER BY t.run_number ASC, t.test_start ASC
             """), conn)
     except Exception:
         return pd.DataFrame()
 
 
+def load_stream_registry() -> pd.DataFrame:
+    try:
+        engine = get_engine()
+        with engine.connect() as conn:
+            return pd.read_sql(text(
+                "SELECT stream_id, stream_name, version FROM backtest.stream_registry ORDER BY stream_id"
+            ), conn)
+    except Exception:
+        return pd.DataFrame()
+
+
+def next_run_number(conn, stream_id: int, params_h: str, history: pd.DataFrame) -> int:
+    """Return the existing run_number if this params hash already has one, else assign next."""
+    stream_rows = history[history["stream_id"] == stream_id] if not history.empty else pd.DataFrame()
+    if not stream_rows.empty:
+        for _, row in stream_rows.iterrows():
+            try:
+                p = row["parameters"] if isinstance(row["parameters"], dict) \
+                    else json.loads(row["parameters"])
+                if params_hash(p) == params_h:
+                    return int(row["run_number"])
+            except Exception:
+                pass
+    # New config — assign next run_number for this stream
+    existing = stream_rows["run_number"].dropna()
+    return int(existing.max()) + 1 if not existing.empty else 1
+
+
 def save_stream_test(stream_name, params, result, metrics, initial_capital, ending_balance,
-                     payload: dict, notes: str = "") -> int:
-    engine = get_engine()
-    name_parts    = stream_name.rsplit(" ", 1)
-    version       = name_parts[1] if len(name_parts) == 2 and name_parts[1].startswith("v") else "v1"
-    stream_nm     = name_parts[0].strip()
+                     payload: dict, window_name: str = "", notes: str = "",
+                     history: pd.DataFrame = None) -> int:
+    engine    = get_engine()
+    name_parts = stream_name.rsplit(" ", 1)
+    version    = name_parts[1] if len(name_parts) == 2 and name_parts[1].startswith("v") else "v1"
+    stream_nm  = name_parts[0].strip()
+    p_hash     = params_hash(params)
+
     with engine.connect() as conn:
+        stream_id = conn.execute(text(
+            "SELECT stream_id FROM backtest.stream_registry WHERE stream_name = :n AND version = :v"
+        ), {"n": stream_nm, "v": version}).scalar()
+
+        run_num = next_run_number(conn, stream_id, p_hash, history or pd.DataFrame())
+        win_nm  = window_name or label_window(result["start"], result["end"])
+
         row = conn.execute(text("""
             INSERT INTO backtest.stream_tests (
                 stream_name, stream_version, parameters,
                 test_start, test_end, n_slots, initial_capital, ending_balance,
                 total_trades, win_rate, total_pnl, total_return_pct,
                 annualized_return_pct, avg_winner_pct, avg_loser_pct,
-                profit_factor, max_drawdown_pct, avg_hold_candles, notes
+                profit_factor, max_drawdown_pct, avg_hold_candles,
+                stream_id, run_number, window_name, notes
             ) VALUES (
                 :stream_name, :stream_version, :parameters,
                 :test_start, :test_end, :n_slots, :initial_capital, :ending_balance,
                 :total_trades, :win_rate, :total_pnl, :total_return_pct,
                 :annualized_return_pct, :avg_winner_pct, :avg_loser_pct,
-                :profit_factor, :max_drawdown_pct, :avg_hold_candles, :notes
+                :profit_factor, :max_drawdown_pct, :avg_hold_candles,
+                :stream_id, :run_number, :window_name, :notes
             ) RETURNING test_id
         """), {
             "stream_name":           stream_nm,
@@ -283,17 +326,19 @@ def save_stream_test(stream_name, params, result, metrics, initial_capital, endi
             "profit_factor":         metrics["profit_factor"],
             "max_drawdown_pct":      metrics["max_drawdown_pct"],
             "avg_hold_candles":      metrics["avg_hold_candles"],
+            "stream_id":             stream_id,
+            "run_number":            run_num,
+            "window_name":           win_nm,
             "notes":                 notes,
         })
         test_id = row.scalar()
         conn.commit()
 
-    # Persist full payload so charts are available when revisiting this test
     pkl_path = RUNS_DIR / f"{test_id}.pkl"
     with open(pkl_path, "wb") as f:
         pickle.dump(payload, f)
 
-    return test_id
+    return test_id, run_num, win_nm
 
 
 # ── Dashboard renderer ────────────────────────────────────────────────────────
@@ -549,20 +594,24 @@ def render_dashboard(payload: dict, show_save: bool = True):
     if show_save:
         st.divider()
         st.subheader("💾 Save This Run")
-        save_notes = st.text_input(
-            "Notes (optional)",
-            placeholder="e.g. switched to 1h candles — profit factor flipped positive"
-        )
+        auto_window = label_window(result["start"], result["end"])
+        sc1, sc2 = st.columns([1, 2])
+        save_window = sc1.text_input("Window name", value=auto_window,
+                                     help="Label for this date range (e.g. Primary Window, Full History, Recent)")
+        save_notes  = sc2.text_input("Notes (optional)",
+                                     placeholder="e.g. RSI>55 cuts noise — better PF and lower drawdown")
         if st.button("Save to Database", type="secondary"):
             try:
-                test_id = save_stream_test(
+                history_df = load_stream_history()
+                test_id, run_num, win_nm = save_stream_test(
                     stream_name=display_name, params=params, result=result,
                     metrics=metrics, initial_capital=initial_capital,
-                    ending_balance=ending_capital, payload=payload, notes=save_notes,
+                    ending_balance=ending_capital, payload=payload,
+                    window_name=save_window, notes=save_notes, history=history_df,
                 )
                 st.success(
-                    f"Saved as test #{test_id} — **{display_name}**, "
-                    f"{metrics['total_trades']} trades, "
+                    f"Saved — Run #{run_num} · {win_nm} · **{display_name}** · "
+                    f"{metrics['total_trades']} trades · "
                     f"{metrics['annualized_return_pct']:+.1f}% annualized."
                 )
                 st.cache_data.clear()
@@ -653,69 +702,86 @@ with st.expander("📖 Glossary"):
         cols[i % 2].markdown(f"**{term}**  \n{defn}")
 
 
-# ── Sidebar ────────────────────────────────────────────────────────────────────
+# ── Load data ─────────────────────────────────────────────────────────────────
 
-history = load_stream_history()
+history  = load_stream_history()
+registry = load_stream_registry()
 
-# Group saved tests by params hash — same params, different date ranges = one config group
-groups = {}       # hash → list of rows (sorted by test_start)
-group_order = []  # hashes in the order they first appeared
-
+# Group saved tests by run_number within each stream
+# run_groups[stream_name][run_number] = [list of test rows]
+run_groups = {}
 if not history.empty:
     for _, row in history.iterrows():
-        try:
-            p = row["parameters"] if isinstance(row["parameters"], dict) \
-                else json.loads(row["parameters"])
-            h = params_hash(p)
-        except Exception:
-            h = str(row["test_id"])
-        if h not in groups:
-            groups[h] = []
-            group_order.append(h)
-        groups[h].append(row)
+        skey = f"{row['stream_name']} {row['stream_version']}"
+        rnum = int(row["run_number"]) if pd.notna(row.get("run_number")) else 0
+        run_groups.setdefault(skey, {}).setdefault(rnum, []).append(row)
 
-has_current = LAST_RUN_PATH.exists()
+# Available streams (from registry + any in history not yet in registry)
+registry_streams = [f"{r.stream_name} v{r.version}" for _, r in registry.iterrows()] \
+                   if not registry.empty else []
+history_streams  = list(run_groups.keys()) if run_groups else []
+all_streams      = list(dict.fromkeys(registry_streams + history_streams))  # preserve order, dedupe
 
-# Build radio options
-sidebar_options = []
-sidebar_labels  = {}
+has_unsaved = LAST_RUN_PATH.exists()
 
-if has_current:
-    sidebar_options.append("__current__")
-    sidebar_labels["__current__"] = "▶  Current Run"
-
-for i, h in enumerate(group_order, 1):
-    rows    = groups[h]
-    best    = max((r["annualized_return_pct"] for r in rows if pd.notna(r["annualized_return_pct"])),
-                  default=None)
-    name    = f"{rows[0]['stream_name']} {rows[0]['stream_version']}"
-    n_tests = len(rows)
-    label   = f"#{i}  ·  {name}"
-    if best is not None:
-        label += f"  ·  {best:+.1f}%"
-    if n_tests > 1:
-        label += f"  ({n_tests} windows)"
-    sidebar_options.append(h)
-    sidebar_labels[h] = label
+# ── Sidebar ────────────────────────────────────────────────────────────────────
 
 with st.sidebar:
-    st.header("Run History")
+    st.header("Stream Tester")
     st.caption("Triggered from Claude Code · Save to record here")
 
-    if not sidebar_options:
-        st.info("No saved runs yet.")
-        selected_key = None
+    # ── Stream selector ───────────────────────────────────────────────────────
+    st.markdown('<p class="config-group-header">Stream</p>', unsafe_allow_html=True)
+    if not all_streams:
+        st.info("No streams yet.")
+        st.stop()
+
+    selected_stream = st.selectbox("", all_streams, label_visibility="collapsed")
+    stream_runs     = run_groups.get(selected_stream, {})  # run_number → [rows]
+
+    # ── Config (run) selector ─────────────────────────────────────────────────
+    st.markdown('<p class="config-group-header" style="margin-top:14px;">Config Run</p>',
+                unsafe_allow_html=True)
+
+    run_options = []
+    run_labels  = {}
+
+    # Unsaved run at top if .last_run.pkl exists
+    if has_unsaved:
+        run_options.append("__new__")
+        run_labels["__new__"] = "⏳  Latest (unsaved)"
+
+    for rnum in sorted(stream_runs.keys()):
+        rows = stream_runs[rnum]
+        best = max((r["annualized_return_pct"] for r in rows if pd.notna(r["annualized_return_pct"])),
+                   default=None)
+        n_win = len(rows)
+        lbl   = f"#{rnum}"
+        if best is not None:
+            lbl += f"  ·  {best:+.1f}%"
+        if n_win > 1:
+            lbl += f"  ·  {n_win} windows"
+        run_options.append(rnum)
+        run_labels[rnum] = lbl
+
+    if not run_options:
+        st.caption("No saved runs for this stream yet.")
+        selected_run = None
     else:
-        selected_key = st.radio(
-            "",
-            sidebar_options,
-            format_func=lambda x: sidebar_labels.get(x, x),
+        # Default: most recent saved run (last numeric key), not the unsaved one
+        saved_runs    = [r for r in run_options if r != "__new__"]
+        default_index = run_options.index(saved_runs[-1]) if saved_runs else 0
+        selected_run  = st.selectbox(
+            "", run_options,
+            index=default_index,
+            format_func=lambda x: run_labels.get(x, str(x)),
+            label_visibility="collapsed",
         )
 
-    # Show config details for the selected group
-    if selected_key and selected_key != "__current__" and selected_key in groups:
+    # ── Config details ────────────────────────────────────────────────────────
+    if selected_run and selected_run != "__new__" and selected_run in stream_runs:
         st.divider()
-        rows = groups[selected_key]
+        rows = stream_runs[selected_run]
         try:
             p        = rows[0]["parameters"] if isinstance(rows[0]["parameters"], dict) \
                        else json.loads(rows[0]["parameters"])
@@ -730,52 +796,42 @@ with st.sidebar:
         st.markdown(f"*{readable}*")
         st.divider()
 
-        # Per-window summary in sidebar
         for row in rows:
-            window = label_window(row["test_start"], row["test_end"])
-            ann    = row["annualized_return_pct"]
-            pf     = row["profit_factor"]
+            win  = row.get("window_name") or label_window(row["test_start"], row["test_end"])
+            ann  = row["annualized_return_pct"]
+            pf   = row["profit_factor"]
             _, gl, gc = grade_info(ann if pd.notna(ann) else None)
             st.markdown(
                 f'<span class="grade-badge" style="background:{gc}20;color:{gc};'
                 f'border:1px solid {gc}55;font-size:0.75rem;padding:3px 10px;">'
-                f'{window} · {ann:+.1f}%</span>' if pd.notna(ann) else
-                f'<span class="grade-badge" style="background:#55555520;color:#aaa;'
+                f'{win}  ·  {ann:+.1f}%</span>' if pd.notna(ann) else
+                f'<span class="grade-badge" style="background:#33333380;color:#aaa;'
                 f'border:1px solid #55555555;font-size:0.75rem;padding:3px 10px;">'
-                f'{window}</span>',
+                f'{win}</span>',
                 unsafe_allow_html=True
             )
             st.caption(
-                f"PF {pf:.2f}  ·  "
-                f"DD {row['max_drawdown_pct']:.1f}%  ·  "
-                f"WR {row['win_rate']*100:.0f}%  ·  "
-                f"{row['total_trades']} trades"
+                f"PF {pf:.2f}  ·  DD {row['max_drawdown_pct']:.1f}%  ·  "
+                f"WR {row['win_rate']*100:.0f}%  ·  {row['total_trades']} trades"
                 if pd.notna(pf) else "—"
             )
-            if row["notes"]:
+            if row.get("notes"):
                 st.caption(f"💬 {row['notes']}")
 
-    elif selected_key == "__current__" and has_current:
+    elif selected_run == "__new__" and has_unsaved:
         st.divider()
         try:
             with open(LAST_RUN_PATH, "rb") as f:
                 _cur = pickle.load(f)
-            p       = _cur.get("params", {})
-            compact = _compact_config(p)
             st.caption("Unsaved — run from Claude Code")
-            st.caption(compact)
+            st.caption(_compact_config(_cur.get("params", {})))
         except Exception:
             pass
 
 
 # ── Main area ─────────────────────────────────────────────────────────────────
 
-if not sidebar_options:
-    st.info("Waiting for a run from Claude Code. Results appear here automatically.")
-    st.stop()
-
-if selected_key == "__current__":
-    # Show the live .last_run.pkl with save button
+if selected_run == "__new__":
     try:
         with open(LAST_RUN_PATH, "rb") as f:
             payload = pickle.load(f)
@@ -784,21 +840,18 @@ if selected_key == "__current__":
         st.stop()
     render_dashboard(payload, show_save=True)
 
-elif selected_key in groups:
-    # Show tabs — one per saved date-range window for this config group
-    rows     = groups[selected_key]
-    tab_labels = [label_window(r["test_start"], r["test_end"]) for r in rows]
+elif selected_run is not None and selected_run in stream_runs:
+    rows       = stream_runs[selected_run]
+    tab_labels = [
+        row.get("window_name") or label_window(row["test_start"], row["test_end"])
+        for row in rows
+    ]
 
-    # Deduplicate tab labels if needed
-    seen = {}
-    deduped = []
+    # Deduplicate labels
+    seen, deduped = {}, []
     for lbl in tab_labels:
-        if lbl in seen:
-            seen[lbl] += 1
-            deduped.append(f"{lbl} ({seen[lbl]})")
-        else:
-            seen[lbl] = 1
-            deduped.append(lbl)
+        seen[lbl] = seen.get(lbl, 0) + 1
+        deduped.append(lbl if seen[lbl] == 1 else f"{lbl} ({seen[lbl]})")
 
     tabs = st.tabs(deduped)
     for tab, row in zip(tabs, rows):
@@ -808,11 +861,10 @@ elif selected_key in groups:
             if payload is not None:
                 render_dashboard(payload, show_save=False)
             else:
-                # Fallback for tests saved before the pkl-per-test system
-                ann  = row["annualized_return_pct"]
-                pf   = row["profit_factor"]
-                dd   = row["max_drawdown_pct"]
-                wr   = row["win_rate"]
+                ann = row["annualized_return_pct"]
+                pf  = row["profit_factor"]
+                dd  = row["max_drawdown_pct"]
+                wr  = row["win_rate"]
                 _, gl, gc = grade_info(ann if pd.notna(ann) else None)
                 st.markdown(
                     f'<span class="grade-badge" style="background:{gc}22;color:{gc};'
@@ -828,8 +880,11 @@ elif selected_key in groups:
                 c3.metric("Max Drawdown", f"{dd:.1f}%" if pd.notna(dd) else "—")
                 c4.metric("Win Rate", f"{wr*100:.0f}%" if pd.notna(wr) else "—")
                 st.info(
-                    "Full charts not available for this test — it was saved before the per-test "
-                    "storage system was added. Re-run from Claude Code with the same params to get charts."
+                    "Full charts not available — this test was saved before per-test pkl storage. "
+                    "Re-run with the same params from Claude Code to restore charts."
                 )
-                if row["notes"]:
+                if row.get("notes"):
                     st.caption(f"💬 {row['notes']}")
+
+else:
+    st.info("Waiting for a run from Claude Code. Results will appear here automatically.")

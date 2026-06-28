@@ -63,12 +63,27 @@ CREATE TABLE IF NOT EXISTS backtest.streams (
     slot_count      SMALLINT NOT NULL DEFAULT 2
 );
 
+-- Registry of named streams — one row per stream identity (name + version).
+-- All 5 Model 1 streams seeded here. stream_tests references this via FK.
+CREATE TABLE IF NOT EXISTS backtest.stream_registry (
+    stream_id   SERIAL PRIMARY KEY,
+    stream_name VARCHAR(100) NOT NULL,
+    version     VARCHAR(10)  NOT NULL DEFAULT 'v1',
+    description TEXT,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(stream_name, version)
+);
+
 -- Individual stream tuning runs — saved when worth keeping during iteration.
--- One row per saved test; summary metrics only (no per-trade detail).
+-- run_number groups tests with identical params (same config, different date windows).
+-- window_name labels the date range (Primary Window / Full History / Recent / custom).
 CREATE TABLE IF NOT EXISTS backtest.stream_tests (
     test_id               SERIAL PRIMARY KEY,
     stream_name           VARCHAR(100) NOT NULL,
     stream_version        VARCHAR(20) NOT NULL DEFAULT 'v1',
+    stream_id             INTEGER REFERENCES backtest.stream_registry(stream_id),
+    run_number            INTEGER,
+    window_name           VARCHAR(50),
     parameters            JSONB NOT NULL,
     test_start            TIMESTAMPTZ,
     test_end              TIMESTAMPTZ,
