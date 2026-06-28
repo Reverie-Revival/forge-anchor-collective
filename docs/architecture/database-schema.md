@@ -60,10 +60,14 @@ Freely rebuilt during development. Never contains real money.
 Captures every stream tuning run you choose to save. One row per saved test.
 Stores the full parameter config and all key performance metrics for comparison.
 
+`run_number` groups tests with identical parameters (same config, different date windows). `window_name` labels the date range: Primary / Full History / Recent / custom.
+
 ```sql
   test_id               SERIAL PRIMARY KEY
   stream_name           VARCHAR(100) NOT NULL     -- e.g. "Momentum Rider"
   stream_version        VARCHAR(20) NOT NULL      -- "v1", "v2"
+  run_number            INTEGER                   -- groups same-config tests (1, 2, 3...)
+  window_name           VARCHAR(50)               -- "Primary", "Full History", "Recent"
   parameters            JSONB NOT NULL            -- full config snapshot at test time
   test_start            TIMESTAMPTZ               -- backtest date range start
   test_end              TIMESTAMPTZ               -- backtest date range end
@@ -85,6 +89,7 @@ Stores the full parameter config and all key performance metrics for comparison.
 ```
 
 No per-trade detail here — just summary metrics. Designed for fast iteration and comparison.
+A full pkl payload is stored at `src/app/runs/{test_id}.pkl` for chart rendering in the stream tester.
 
 ---
 
