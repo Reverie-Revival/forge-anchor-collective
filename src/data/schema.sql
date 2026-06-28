@@ -63,31 +63,21 @@ CREATE TABLE IF NOT EXISTS backtest.streams (
     slot_count      SMALLINT NOT NULL DEFAULT 2
 );
 
--- Registry of named streams — one row per stream identity (name + version).
--- All 5 Model 1 streams seeded here. stream_tests references this via FK.
-CREATE TABLE IF NOT EXISTS backtest.stream_registry (
-    stream_id   SERIAL PRIMARY KEY,
-    stream_name VARCHAR(100) NOT NULL,
-    version     VARCHAR(10)  NOT NULL DEFAULT 'v1',
-    description TEXT,
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE(stream_name, version)
-);
-
 -- Individual stream tuning runs — saved when worth keeping during iteration.
 -- run_number groups tests with identical params (same config, different date windows).
--- window_name labels the date range (Primary Window / Full History / Recent / custom).
+-- window_name labels the date range: Primary Window / Full History / Recent / custom.
+-- No FK to backtest.streams yet — that table requires a model_id and won't be populated
+-- until Model 1 is assembled. Wire the FK then.
 CREATE TABLE IF NOT EXISTS backtest.stream_tests (
     test_id               SERIAL PRIMARY KEY,
     stream_name           VARCHAR(100) NOT NULL,
-    stream_version        VARCHAR(20) NOT NULL DEFAULT 'v1',
-    stream_id             INTEGER REFERENCES backtest.stream_registry(stream_id),
+    stream_version        VARCHAR(20)  NOT NULL DEFAULT 'v1',
     run_number            INTEGER,
     window_name           VARCHAR(50),
     parameters            JSONB NOT NULL,
     test_start            TIMESTAMPTZ,
     test_end              TIMESTAMPTZ,
-    n_slots               SMALLINT NOT NULL DEFAULT 2,
+    n_slots               SMALLINT     NOT NULL DEFAULT 2,
     initial_capital       NUMERIC(10,2) NOT NULL,
     ending_balance        NUMERIC(10,4),
     total_trades          INTEGER,
@@ -101,7 +91,7 @@ CREATE TABLE IF NOT EXISTS backtest.stream_tests (
     max_drawdown_pct      NUMERIC(8,2),
     avg_hold_candles      NUMERIC(8,1),
     notes                 TEXT,
-    saved_at              TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    saved_at              TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 );
 
 -- Full model-level backtest runs (historical and paper).

@@ -246,20 +246,18 @@ def load_stream_history() -> pd.DataFrame:
         return pd.DataFrame()
 
 
-def load_stream_registry() -> pd.DataFrame:
-    try:
-        engine = get_engine()
-        with engine.connect() as conn:
-            return pd.read_sql(text(
-                "SELECT stream_id, stream_name, version FROM backtest.stream_registry ORDER BY stream_id"
-            ), conn)
-    except Exception:
-        return pd.DataFrame()
+KNOWN_STREAMS = [
+    "Momentum Rider v1",
+    "Dip Hunter v1",
+    "Breakout Scout v1",
+    "Steady Climber v1",
+    "Surge Rider v1",
+]
 
 
-def next_run_number(conn, stream_id: int, params_h: str, history: pd.DataFrame) -> int:
-    """Return the existing run_number if this params hash already has one, else assign next."""
-    stream_rows = history[history["stream_id"] == stream_id] if not history.empty else pd.DataFrame()
+def next_run_number(stream_nm: str, params_h: str, history: pd.DataFrame) -> int:
+    """Return existing run_number if this params hash is already saved, else assign next."""
+    stream_rows = history[history["stream_name"] == stream_nm] if not history.empty else pd.DataFrame()
     if not stream_rows.empty:
         for _, row in stream_rows.iterrows():
             try:
@@ -269,47 +267,43 @@ def next_run_number(conn, stream_id: int, params_h: str, history: pd.DataFrame) 
                     return int(row["run_number"])
             except Exception:
                 pass
-    # New config — assign next run_number for this stream
     existing = stream_rows["run_number"].dropna()
     return int(existing.max()) + 1 if not existing.empty else 1
 
 
 def save_stream_test(stream_name, params, result, metrics, initial_capital, ending_balance,
                      payload: dict, window_name: str = "", notes: str = "",
-                     history: pd.DataFrame = None) -> int:
-    engine    = get_engine()
+                     history: pd.DataFrame = None) -> tuple:
+    engine     = get_engine()
     name_parts = stream_name.rsplit(" ", 1)
     version    = name_parts[1] if len(name_parts) == 2 and name_parts[1].startswith("v") else "v1"
     stream_nm  = name_parts[0].strip()
     p_hash     = params_hash(params)
+    hist       = history if history is not None else pd.DataFrame()
+
+    run_num = next_run_number(stream_nm, p_hash, hist)
+    win_nm  = window_name or label_window(result["start"], result["end"])
 
     with engine.connect() as conn:
-        stream_id = conn.execute(text(
-            "SELECT stream_id FROM backtest.stream_registry WHERE stream_name = :n AND version = :v"
-        ), {"n": stream_nm, "v": version}).scalar()
-
-        run_num = next_run_number(conn, stream_id, p_hash, history or pd.DataFrame())
-        win_nm  = window_name or label_window(result["start"], result["end"])
-
         row = conn.execute(text("""
             INSERT INTO backtest.stream_tests (
-                stream_name, stream_version, parameters,
+                stream_name, stream_version, run_number, window_name, parameters,
                 test_start, test_end, n_slots, initial_capital, ending_balance,
                 total_trades, win_rate, total_pnl, total_return_pct,
                 annualized_return_pct, avg_winner_pct, avg_loser_pct,
-                profit_factor, max_drawdown_pct, avg_hold_candles,
-                stream_id, run_number, window_name, notes
+                profit_factor, max_drawdown_pct, avg_hold_candles, notes
             ) VALUES (
-                :stream_name, :stream_version, :parameters,
+                :stream_name, :stream_version, :run_number, :window_name, :parameters,
                 :test_start, :test_end, :n_slots, :initial_capital, :ending_balance,
                 :total_trades, :win_rate, :total_pnl, :total_return_pct,
                 :annualized_return_pct, :avg_winner_pct, :avg_loser_pct,
-                :profit_factor, :max_drawdown_pct, :avg_hold_candles,
-                :stream_id, :run_number, :window_name, :notes
+                :profit_factor, :max_drawdown_pct, :avg_hold_candles, :notes
             ) RETURNING test_id
         """), {
             "stream_name":           stream_nm,
             "stream_version":        version,
+            "run_number":            run_num,
+            "window_name":           win_nm,
             "parameters":            json.dumps(params),
             "test_start":            result["start"],
             "test_end":              result["end"],
@@ -326,9 +320,6 @@ def save_stream_test(stream_name, params, result, metrics, initial_capital, endi
             "profit_factor":         metrics["profit_factor"],
             "max_drawdown_pct":      metrics["max_drawdown_pct"],
             "avg_hold_candles":      metrics["avg_hold_candles"],
-            "stream_id":             stream_id,
-            "run_number":            run_num,
-            "window_name":           win_nm,
             "notes":                 notes,
         })
         test_id = row.scalar()
@@ -704,8 +695,7 @@ with st.expander("📖 Glossary"):
 
 # ── Load data ─────────────────────────────────────────────────────────────────
 
-history  = load_stream_history()
-registry = load_stream_registry()
+history = load_stream_history()
 
 # Group saved tests by run_number within each stream
 # run_groups[stream_name][run_number] = [list of test rows]
@@ -716,11 +706,8 @@ if not history.empty:
         rnum = int(row["run_number"]) if pd.notna(row.get("run_number")) else 0
         run_groups.setdefault(skey, {}).setdefault(rnum, []).append(row)
 
-# Available streams (from registry + any in history not yet in registry)
-registry_streams = [f"{r.stream_name} v{r.version}" for _, r in registry.iterrows()] \
-                   if not registry.empty else []
-history_streams  = list(run_groups.keys()) if run_groups else []
-all_streams      = list(dict.fromkeys(registry_streams + history_streams))  # preserve order, dedupe
+# All 5 streams always visible; any stream with history also shows even if not in KNOWN_STREAMS
+all_streams = list(dict.fromkeys(KNOWN_STREAMS + [s for s in run_groups if s not in KNOWN_STREAMS]))
 
 has_unsaved = LAST_RUN_PATH.exists()
 
