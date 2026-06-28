@@ -106,7 +106,8 @@ One row per model version defined for backtesting.
 
 ### backtest.streams
 
-The streams configured within a model, including their full parameter set.
+Streams locked into a model after validation. One row per stream per model.
+`locked_test_id` points to the `stream_tests` row (Primary window) that earned the lock.
 
 ```sql
   stream_id       SERIAL PRIMARY KEY
@@ -116,6 +117,10 @@ The streams configured within a model, including their full parameter set.
   strategy_type   VARCHAR(50) NOT NULL
   parameters      JSONB NOT NULL          -- all tunable thresholds
   slot_count      SMALLINT DEFAULT 2
+  locked_test_id  INTEGER REFERENCES backtest.stream_tests  -- winning run
+  grade           SMALLINT               -- 1–5
+  locked_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  notes           TEXT
 ```
 
 ### backtest.model_tests

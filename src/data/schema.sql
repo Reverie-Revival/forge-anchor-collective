@@ -52,7 +52,8 @@ CREATE TABLE IF NOT EXISTS backtest.models (
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- Streams configured within a model.
+-- Streams locked into a model after validation.
+-- locked_test_id points to the stream_tests row (Primary window) that earned the lock.
 CREATE TABLE IF NOT EXISTS backtest.streams (
     stream_id       SERIAL PRIMARY KEY,
     model_id        INTEGER NOT NULL REFERENCES backtest.models(model_id),
@@ -60,14 +61,16 @@ CREATE TABLE IF NOT EXISTS backtest.streams (
     stream_version  VARCHAR(10) NOT NULL,
     strategy_type   VARCHAR(50) NOT NULL,
     parameters      JSONB NOT NULL,
-    slot_count      SMALLINT NOT NULL DEFAULT 2
+    slot_count      SMALLINT NOT NULL DEFAULT 2,
+    locked_test_id  INTEGER REFERENCES backtest.stream_tests(test_id),
+    grade           SMALLINT,
+    locked_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    notes           TEXT
 );
 
 -- Individual stream tuning runs — saved when worth keeping during iteration.
 -- run_number groups tests with identical params (same config, different date windows).
 -- window_name labels the date range: Primary Window / Full History / Recent / custom.
--- No FK to backtest.streams yet — that table requires a model_id and won't be populated
--- until Model 1 is assembled. Wire the FK then.
 CREATE TABLE IF NOT EXISTS backtest.stream_tests (
     test_id               SERIAL PRIMARY KEY,
     stream_name           VARCHAR(100) NOT NULL,
