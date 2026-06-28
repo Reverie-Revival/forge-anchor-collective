@@ -38,7 +38,6 @@ def fetch_sp500(start: str, end: str):
         return None
 
 
-@st.cache_data
 def load_run_payload(test_id: int):
     pkl_path = RUNS_DIR / f"{test_id}.pkl"
     if not pkl_path.exists():
@@ -332,7 +331,7 @@ def save_stream_test(stream_name, params, result, metrics, initial_capital, endi
 
 # ── Dashboard renderer ────────────────────────────────────────────────────────
 
-def render_dashboard(payload: dict, show_save: bool = True):
+def render_dashboard(payload: dict, show_save: bool = True, key_prefix: str = "dash"):
     result          = payload["result"]
     trades          = payload["trades"]
     metrics         = payload["metrics"]
@@ -504,7 +503,7 @@ def render_dashboard(payload: dict, show_save: bool = True):
         showlegend=False,
         plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
     )
-    st.plotly_chart(fig_eq, use_container_width=True)
+    st.plotly_chart(fig_eq, use_container_width=True, key=f"{key_prefix}_eq")
 
     col_dd, col_dist = st.columns(2)
 
@@ -524,7 +523,7 @@ def render_dashboard(payload: dict, show_save: bool = True):
             height=280, margin=dict(t=40, b=20, l=10, r=10),
             plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
         )
-        st.plotly_chart(fig_dd, use_container_width=True)
+        st.plotly_chart(fig_dd, use_container_width=True, key=f"{key_prefix}_dd")
         st.caption(f"0% = at all-time high. Worst drop: **{worst:.1f}%** before recovering.")
 
     with col_dist:
@@ -547,7 +546,7 @@ def render_dashboard(payload: dict, show_save: bool = True):
             showlegend=False,
             plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
         )
-        st.plotly_chart(fig_trades, use_container_width=True)
+        st.plotly_chart(fig_trades, use_container_width=True, key=f"{key_prefix}_trades")
         st.caption(
             f"Each bar is one trade in order. Green = win, red = loss. "
             f"Avg winner **{metrics['avg_winner_pct']:+.1f}%** · avg loser **{metrics['avg_loser_pct']:.1f}%**."
@@ -795,37 +794,42 @@ with st.sidebar:
             if row.get("notes"):
                 st.caption(f"💬 {row['notes']}")
 
-    elif has_unsaved:
-        st.divider()
-        try:
-            with open(LAST_RUN_PATH, "rb") as f:
-                _cur = pickle.load(f)
-            st.caption("Unsaved run ready ↑")
-            st.caption(_compact_config(_cur.get("params", {})))
-        except Exception:
-            pass
 
 
 # ── Main area ─────────────────────────────────────────────────────────────────
 
-# Show unsaved run as a save-prompt banner when .last_run.pkl exists
+# Check if .last_run.pkl holds a run not yet saved to the DB
+unsaved_payload = None
 if has_unsaved:
     try:
         with open(LAST_RUN_PATH, "rb") as f:
-            _cur_payload = pickle.load(f)
-        _cur_ann = _cur_payload.get("metrics", {}).get("annualized_return_pct")
-        _cur_name = _cur_payload.get("stream_name", "")
-        with st.expander(
-            f"⏳ Unsaved run ready — {_cur_name}  "
-            f"{'· ' + f'{_cur_ann:+.1f}%' if _cur_ann else ''}  · click to view & save",
-            expanded=False,
-        ):
-            render_dashboard(_cur_payload, show_save=True)
-        st.divider()
+            _cur = pickle.load(f)
+        cur_h     = params_hash(_cur.get("params", {}))
+        cur_start = str(_cur.get("result", {}).get("start", ""))[:10]
+        cur_end   = str(_cur.get("result", {}).get("end",   ""))[:10]
+        already_saved = False
+        if not history.empty:
+            for _, row in history.iterrows():
+                try:
+                    p = row["parameters"] if isinstance(row["parameters"], dict) \
+                        else json.loads(row["parameters"])
+                    if (params_hash(p) == cur_h
+                            and str(row["test_start"])[:10] == cur_start
+                            and str(row["test_end"])[:10]   == cur_end):
+                        already_saved = True
+                        break
+                except Exception:
+                    pass
+        if not already_saved:
+            unsaved_payload = _cur
     except Exception:
         pass
 
-if selected_run is not None and selected_run in stream_runs:
+# Unsaved run takes over the main area; once saved it disappears here and shows in tabs
+if unsaved_payload is not None:
+    render_dashboard(unsaved_payload, show_save=True, key_prefix="unsaved")
+
+elif selected_run is not None and selected_run in stream_runs:
     rows       = stream_runs[selected_run]
     tab_labels = [
         row.get("window_name") or label_window(row["test_start"], row["test_end"])
@@ -844,7 +848,7 @@ if selected_run is not None and selected_run in stream_runs:
             test_id = int(row["test_id"])
             payload = load_run_payload(test_id)
             if payload is not None:
-                render_dashboard(payload, show_save=False)
+                render_dashboard(payload, show_save=False, key_prefix=f"run_{test_id}")
             else:
                 ann = row["annualized_return_pct"]
                 pf  = row["profit_factor"]
