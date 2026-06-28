@@ -75,7 +75,7 @@ def label_window(start_date, end_date) -> str:
     if s.year <= 2017 and is_recent_end:
         return "Full History"
     if s.year == 2019 and e.year == 2023:
-        return "Primary Window"
+        return "Primary"
     if s.year >= 2026 and is_recent_end:
         return "Recent"
     return f"{s.strftime('%b %Y')} → {e.strftime('%b %Y')}"
