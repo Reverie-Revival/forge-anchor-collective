@@ -593,10 +593,12 @@ def render_dashboard(payload: dict, show_save: bool = True, key_prefix: str = "d
         auto_window = label_window(result["start"], result["end"])
         sc1, sc2 = st.columns([1, 2])
         save_window = sc1.text_input("Window name", value=auto_window,
+                                     key=f"{key_prefix}_window",
                                      help="Label for this date range (e.g. Primary Window, Full History, Recent)")
         save_notes  = sc2.text_input("Notes (optional)",
+                                     key=f"{key_prefix}_notes",
                                      placeholder="e.g. RSI>55 cuts noise — better PF and lower drawdown")
-        if st.button("Save to Database", type="secondary"):
+        if st.button("Save to Database", type="secondary", key=f"{key_prefix}_save"):
             try:
                 history_df = load_stream_history()
                 test_id, run_num, win_nm = save_stream_test(
