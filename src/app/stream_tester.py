@@ -391,20 +391,21 @@ def render_dashboard(payload: dict, show_save: bool = True, key_prefix: str = "d
     h1.metric("Starting Balance", f"${initial_capital:.2f}",
               help=f"{result.get('n_slots', 2)} slots × $10 each.")
     h2.metric("Ending Balance", f"${ending_capital:.2f}",
-              delta=f"${ending_capital - initial_capital:+.2f}",
+              delta=f"{ending_capital - initial_capital:+.2f}",
+              delta_color="normal",
               help="Total value after all trades and fees.")
     h3.metric(
         "Annualized Return",
         f"{ann:+.1f}%" if ann is not None else "—",
         delta=f"{ann - SP500_HISTORICAL_AVG:+.1f}% vs S&P historical avg" if ann is not None else None,
-        delta_color="normal" if ann is not None and ann >= SP500_HISTORICAL_AVG else "inverse",
+        delta_color="normal",
         help=f"Compounded yearly return. S&P 500 long-run average: ~{SP500_HISTORICAL_AVG:.0f}%."
     )
     h4.metric(
         "Total Return",
         f"{metrics['total_return_pct']:+.1f}%",
         delta=f"{ann:+.1f}% / year" if ann is not None else None,
-        delta_color="normal" if ann is not None and ann > 0 else "inverse",
+        delta_color="normal",
         help=f"Cumulative return over {period_str}."
     )
 
@@ -416,14 +417,14 @@ def render_dashboard(payload: dict, show_save: bool = True, key_prefix: str = "d
         "S&P 500 historical avg",
         f"{SP500_HISTORICAL_AVG:.0f}% / year",
         delta=f"{ann - SP500_HISTORICAL_AVG:+.1f}% vs us" if ann is not None else None,
-        delta_color="normal" if ann is not None and ann >= SP500_HISTORICAL_AVG else "inverse",
+        delta_color="normal",
         help="Long-run average annualized S&P 500 return (~10%). The baseline to beat."
     )
     b2.metric(
         f"S&P 500 actual ({period_str})",
         f"{sp500_ann:+.1f}% / year" if sp500_ann is not None else "—",
         delta=f"{ann - sp500_ann:+.1f}% vs us" if (ann is not None and sp500_ann is not None) else None,
-        delta_color="normal" if (ann is not None and sp500_ann is not None and ann >= sp500_ann) else "inverse",
+        delta_color="normal",
         help="What S&P 500 actually returned during this exact backtest period."
     )
     b3.metric(
@@ -471,11 +472,14 @@ def render_dashboard(payload: dict, show_save: bool = True, key_prefix: str = "d
     low_val  = equity.min()
     low_ts   = closed.loc[equity.idxmin(), "exit_ts"]
 
+    curve_color = "#00d4aa" if ending_capital >= initial_capital else "#f87171"
+    fill_color  = "rgba(0,212,170,0.07)" if ending_capital >= initial_capital else "rgba(248,113,113,0.07)"
+
     fig_eq = go.Figure()
     fig_eq.add_trace(go.Scatter(
         x=closed["exit_ts"], y=equity,
-        fill="tozeroy", fillcolor="rgba(0,212,170,0.07)",
-        line=dict(color="#00d4aa", width=2.5),
+        fill="tozeroy", fillcolor=fill_color,
+        line=dict(color=curve_color, width=2.5),
         hovertemplate="<b>%{x|%b %d, %Y}</b><br>Balance: $%{y:.2f}<extra></extra>"
     ))
     fig_eq.add_hline(y=initial_capital, line=dict(color="#555", dash="dot"),
