@@ -68,11 +68,24 @@ There is no mandatory paper trading phase. $100 is low enough that live deployme
 
 ## Database Tables
 
-- `market_data` — timestamp, price, volume, indicators
-- `models` — model_version, description, deployed_at, status, capital_allocated
-- `streams` — stream_id, model_version, stream_name, stream_version, strategy_type, parameters
-- `trades` — stream_id, model_version, slot, entry/exit price, P&L, reasoning
-- `ai_decisions` — decision log with confidence and reasoning
+Shared (public schema):
+- `market_data` — 15m BTC/USD OHLCV candles, Jan 2017 → present
+- `sentiment_data` — daily Fear & Greed Index, Feb 2018 → present
+
+Backtest schema (stream tuning + model validation):
+- `backtest.stream_tests` — individual stream tuning runs (summary metrics, one row per saved test)
+- `backtest.model_tests` — full model backtests (historical and paper, gates live deployment)
+- `backtest.models` — model version registry
+- `backtest.streams` — stream configs within a model
+- `backtest.lots` — per-trade capital state machine for model-level tests
+
+Live schema (real money — not yet built):
+- `live.models`, `live.streams`, `live.lots` — mirrors backtest structure, adds Kraken order IDs
+
+Reporting schema (views only):
+- `reporting.all_lots` — unions backtest + live lots for cross-environment queries
+
+Full schema: `src/data/schema.sql` and `docs/architecture/database-schema.md`
 
 ## Benchmarks
 

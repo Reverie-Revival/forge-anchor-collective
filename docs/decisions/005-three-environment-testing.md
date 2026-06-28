@@ -29,7 +29,7 @@ All testing and trading activity lives in one of three environments: historical 
 - Precious — never touched carelessly
 
 ## Why Two Schemas, Not Three
-Historical backtest and paper test share the same lot structure, trade structure, and performance metrics. The only differences are data source (historical vs live feed) and clock speed. A `run_type` column on `backtest.runs` handles this distinction cleanly without schema duplication.
+Historical backtest and paper test share the same lot structure, trade structure, and performance metrics. The only differences are data source (historical vs live feed) and clock speed. A `run_type` column on `backtest.model_tests` handles this distinction cleanly without schema duplication.
 
 The real boundary that matters is **real money vs not**. That boundary is enforced by the schema split.
 
@@ -46,12 +46,12 @@ Every paper test has a `simulation_start` date that can be set to any historical
 2. Live real-time — transitions to Kraken live feed and runs forward indefinitely
 
 ## Traceability: Paper Test → Live Deployment
-`live.models.based_on_run_id` links every live model deployment back to the specific paper test it was selected from. This creates an auditable chain: experimental backtest found the config → paper test proved it → live model deployed from it.
+`live.models.based_on_model_test_id` links every live model deployment back to the specific paper test it was selected from. This creates an auditable chain: experimental backtest found the config → paper test proved it → live model deployed from it.
 
 ## Consequences
-- `backtest.runs.run_type` distinguishes 'historical' from 'paper'
+- `backtest.model_tests.run_type` distinguishes 'historical' from 'paper'
 - Paper tests need a `went_live_at` timestamp marking the replay-to-realtime transition
-- `selected_for_deployment` boolean on `backtest.runs` marks paper test winners
-- `live.models` carries a `based_on_run_id` FK to `backtest.runs`
+- `selected_for_deployment` boolean on `backtest.model_tests` marks paper test winners
+- `live.models` carries a `based_on_model_test_id` FK to `backtest.model_tests`
 - See `docs/architecture/database-schema.md` for full table definitions
 - See `docs/architecture/validation-workflow.md` for the full model lifecycle

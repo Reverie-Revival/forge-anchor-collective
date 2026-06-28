@@ -1,6 +1,7 @@
 -- Forge Anchor Collective — Database Schema
 -- PostgreSQL 16
 -- Run once to initialize: psql -d forge_anchor -f src/data/schema.sql
+-- Safe to re-run — all statements use IF NOT EXISTS / OR REPLACE
 
 -- ============================================================
 -- SCHEMAS
@@ -11,7 +12,7 @@ CREATE SCHEMA IF NOT EXISTS reporting;
 
 -- ============================================================
 -- SHARED — market_data
--- 15-minute BTC/USD OHLCV candles from Jan 1 2017 to present
+-- 15-minute BTC/USD OHLCV candles, Jan 2017 → present
 -- Single interval, single ticker, feeds everything
 -- ============================================================
 CREATE TABLE IF NOT EXISTS market_data (
@@ -27,10 +28,23 @@ CREATE TABLE IF NOT EXISTS market_data (
 CREATE INDEX IF NOT EXISTS idx_market_data_timestamp ON market_data (timestamp);
 
 -- ============================================================
+-- SHARED — sentiment_data
+-- Daily Fear & Greed Index, Feb 2018 → present
+-- Backfill: python -m src.data.sentiment
+-- ============================================================
+CREATE TABLE IF NOT EXISTS sentiment_data (
+    date        DATE PRIMARY KEY,
+    fng_value   SMALLINT NOT NULL,       -- 0 (Extreme Fear) → 100 (Extreme Greed)
+    fng_label   VARCHAR(30) NOT NULL     -- "Extreme Fear", "Fear", "Neutral", "Greed", "Extreme Greed"
+);
+
+-- ============================================================
 -- BACKTEST SCHEMA
--- Covers both historical simulation runs and paper tests
+-- Stream-level tuning and full model-level testing.
+-- Freely rebuilt during development. Never real money.
 -- ============================================================
 
+-- One row per model version defined for backtesting.
 CREATE TABLE IF NOT EXISTS backtest.models (
     model_id        SERIAL PRIMARY KEY,
     model_version   INTEGER NOT NULL,
@@ -38,6 +52,7 @@ CREATE TABLE IF NOT EXISTS backtest.models (
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- Streams configured within a model.
 CREATE TABLE IF NOT EXISTS backtest.streams (
     stream_id       SERIAL PRIMARY KEY,
     model_id        INTEGER NOT NULL REFERENCES backtest.models(model_id),
@@ -48,8 +63,36 @@ CREATE TABLE IF NOT EXISTS backtest.streams (
     slot_count      SMALLINT NOT NULL DEFAULT 2
 );
 
-CREATE TABLE IF NOT EXISTS backtest.runs (
-    run_id                   SERIAL PRIMARY KEY,
+-- Individual stream tuning runs — saved when worth keeping during iteration.
+-- One row per saved test; summary metrics only (no per-trade detail).
+CREATE TABLE IF NOT EXISTS backtest.stream_tests (
+    test_id               SERIAL PRIMARY KEY,
+    stream_name           VARCHAR(100) NOT NULL,
+    stream_version        VARCHAR(20) NOT NULL DEFAULT 'v1',
+    parameters            JSONB NOT NULL,
+    test_start            TIMESTAMPTZ,
+    test_end              TIMESTAMPTZ,
+    n_slots               SMALLINT NOT NULL DEFAULT 2,
+    initial_capital       NUMERIC(10,2) NOT NULL,
+    ending_balance        NUMERIC(10,4),
+    total_trades          INTEGER,
+    win_rate              NUMERIC(5,4),
+    total_pnl             NUMERIC(10,4),
+    total_return_pct      NUMERIC(8,2),
+    annualized_return_pct NUMERIC(8,2),
+    avg_winner_pct        NUMERIC(8,2),
+    avg_loser_pct         NUMERIC(8,2),
+    profit_factor         NUMERIC(8,2),
+    max_drawdown_pct      NUMERIC(8,2),
+    avg_hold_candles      NUMERIC(8,1),
+    notes                 TEXT,
+    saved_at              TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Full model-level backtest runs (historical and paper).
+-- Used to validate a complete model before live deployment.
+CREATE TABLE IF NOT EXISTS backtest.model_tests (
+    model_test_id            SERIAL PRIMARY KEY,
     model_id                 INTEGER NOT NULL REFERENCES backtest.models(model_id),
     run_type                 VARCHAR(20) NOT NULL CHECK (run_type IN ('historical', 'paper')),
     simulation_start         TIMESTAMPTZ NOT NULL,
@@ -62,9 +105,11 @@ CREATE TABLE IF NOT EXISTS backtest.runs (
     created_at               TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- Per-trade capital state machine for model-level tests.
+-- CASH → OPEN → CLOSED; capital compounds within a slot.
 CREATE TABLE IF NOT EXISTS backtest.lots (
     lot_id           BIGSERIAL PRIMARY KEY,
-    run_id           INTEGER NOT NULL REFERENCES backtest.runs(run_id),
+    model_test_id    INTEGER NOT NULL REFERENCES backtest.model_tests(model_test_id),
     model_id         INTEGER NOT NULL REFERENCES backtest.models(model_id),
     stream_id        INTEGER NOT NULL REFERENCES backtest.streams(stream_id),
     slot_number      SMALLINT NOT NULL CHECK (slot_number IN (1, 2)),
@@ -83,22 +128,23 @@ CREATE TABLE IF NOT EXISTS backtest.lots (
     closed_at        TIMESTAMPTZ
 );
 
-CREATE INDEX IF NOT EXISTS idx_backtest_lots_run ON backtest.lots (run_id);
+CREATE INDEX IF NOT EXISTS idx_backtest_lots_model_test ON backtest.lots (model_test_id);
 CREATE INDEX IF NOT EXISTS idx_backtest_lots_stream ON backtest.lots (stream_id);
 CREATE INDEX IF NOT EXISTS idx_backtest_lots_status ON backtest.lots (status);
 
 -- ============================================================
 -- LIVE SCHEMA
 -- Real money. Real Kraken orders. Never touched carelessly.
+-- Not yet built — mirrors backtest structure with Kraken order IDs added.
 -- ============================================================
 
 CREATE TABLE IF NOT EXISTS live.models (
-    model_id          SERIAL PRIMARY KEY,
-    model_version     INTEGER NOT NULL,
-    description       TEXT,
-    deployed_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    based_on_run_id   INTEGER NOT NULL,
-    status            VARCHAR(20) NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'completed'))
+    model_id            SERIAL PRIMARY KEY,
+    model_version       INTEGER NOT NULL,
+    description         TEXT,
+    deployed_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    based_on_model_test_id  INTEGER NOT NULL,   -- references backtest.model_tests
+    status              VARCHAR(20) NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'completed'))
 );
 
 CREATE TABLE IF NOT EXISTS live.streams (
@@ -139,13 +185,14 @@ CREATE INDEX IF NOT EXISTS idx_live_lots_status ON live.lots (status);
 
 -- ============================================================
 -- REPORTING SCHEMA — views only, never raw data
+-- All analytics queries go through these views.
 -- ============================================================
 
 CREATE OR REPLACE VIEW reporting.all_lots AS
 SELECT
     'backtest'          AS source,
-    r.run_type,
-    r.run_id,
+    mt.run_type,
+    mt.model_test_id,
     bl.model_id,
     bl.stream_id,
     bl.slot_number,
@@ -161,14 +208,14 @@ SELECT
     bl.entry_reason,
     bl.exit_reason
 FROM backtest.lots bl
-JOIN backtest.runs r ON bl.run_id = r.run_id
+JOIN backtest.model_tests mt ON bl.model_test_id = mt.model_test_id
 
 UNION ALL
 
 SELECT
     'live'              AS source,
     'live'              AS run_type,
-    NULL                AS run_id,
+    NULL                AS model_test_id,
     ll.model_id,
     ll.stream_id,
     ll.slot_number,

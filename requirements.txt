@@ -3,5 +3,5 @@ pandas==2.2.3
 numpy==1.26.4
 psycopg2-binary==2.9.10
 python-dotenv==1.0.1
-jupyter==1.1.1
-matplotlib==3.9.3
+plotly>=5.24.0
+sqlalchemy>=2.0.0

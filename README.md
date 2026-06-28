@@ -2,41 +2,50 @@
 
 An autonomous BTC trading system that converts market volatility into realized cash returns.
 
-BTC is the vehicle. Cash growth is the product.
+BTC is the vehicle. Cash growth is the product. Goal: beat S&P 500 annualized returns (~10%) with zero human intervention.
 
-## Objective
+## How It Works
 
-Can an autonomous system produce annualized returns that beat the S&P 500 (~10% average) while requiring zero human intervention after deployment?
+Each **Model** is a collection of 5 independent strategy streams, each running 2 capital slots of $10 each — 10 positions, $100 total. Models are versioned and deployed in parallel with their own capital. They run indefinitely and are never shut down early.
 
-## Architecture
+Every 2-3 months, a new model is designed, backtested, and deployed alongside the existing ones if backtesting earns it. Over time, the tournament generates real performance data to compare strategy lineages head-to-head.
 
-- **5 strategy streams × 2 position slots** = 10 independent $10 positions ($100 total capital)
-- **Exit method:** trailing stops (percentages, not fixed dollar amounts — works at any BTC price)
-- **AI role:** strategist and designer only. Deterministic code executes trades.
+## Model Tournament
 
-| Stream | Strategy | Personality |
+| Grade | Label | Criteria |
 |---|---|---|
-| 1 | Trend Following | Ride long moves, wide trailing stops |
-| 2 | Dip Buying | Buy panic/capitulation events |
-| 3 | Breakout Trading | Enter on breakout confirmations |
-| 4 | Sentiment Trading | React to news/social signals |
-| 5 | Opportunistic Reserve | Only enters extreme conditions |
+| 5 | Elite | 20%+ annualized, sustained 2+ years |
+| 4 | Strong | Consistently beats S&P (10-19%) |
+| 3 | Passing | Roughly matches S&P (8-12%) |
+| 2 | Weak | Positive but below S&P |
+| 1 | Poor | Break-even or loss |
 
-## Benchmarks
+S&P 500 (~10%) is the midpoint. Poor results are data, not failure.
 
-Every backtest run is compared against:
-1. S&P 500 actual return for the same period
-2. BTC buy-and-hold for the same period
-3. Cash (doing nothing)
+## Current Status
 
-## Phases
+Model 1 is in the build phase. Five candidate streams are designed and under backtesting:
 
-| Phase | Status | Description |
-|---|---|---|
-| 1 — Backtest | **Current** | Jan 2025 → present, 9mo train / 3mo validation |
-| 2 — Paper Trade | Pending | 30-60 days, no real money |
-| 3 — Live Trade | Pending | $100 USDC on Kraken, 6 month minimum |
-| 4 — Expand | Pending | Second asset only if Phase 3 succeeds |
+| Stream | Type |
+|---|---|
+| Momentum Rider v1 | Trend-following (EMA crossover) |
+| Dip Hunter v1 | Mean reversion (RSI dip) |
+| Breakout Scout v1 | Consolidation breakout |
+| Surge Rider v1 | Volume momentum |
+| Steady Climber v1 | Trend-filtered pullback |
+
+## Key Constraints
+
+- No leverage, ever
+- BTC/USD only (Model 1)
+- Limit orders only (0.25% maker fee, 0.50% round trip)
+- No LLM in the live execution path — deterministic rules only
+- All gains measured as realized cash, not unrealized BTC value
+- No real money until backtesting earns it
+
+## Tech Stack
+
+Python · PostgreSQL · Kraken Pro API · Streamlit
 
 ## Setup
 
@@ -44,32 +53,36 @@ Every backtest run is compared against:
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env  # fill in values when needed
+cp .env.example .env  # add DATABASE_URL
+```
+
+## Running the Stream Tester
+
+```bash
+.venv/bin/streamlit run src/app/stream_tester.py --browser.gatherUsageStats false
+```
+
+## Backfill Sentiment Data
+
+```bash
+python -m src.data.sentiment
 ```
 
 ## Project Structure
 
 ```
 src/
-  data/          ← historical data downloading and storage
-  backtester/    ← backtesting engine (streams/slots architecture)
-  strategies/    ← individual strategy stream implementations
-  analytics/     ← performance reporting vs benchmarks
-notebooks/       ← backtest dashboards and exploration
+  backtester/    ← backtesting engine (signals, indicators, engine, runner)
+  app/           ← Streamlit stream tester
+  data/          ← market data downloader, sentiment pipeline, schema
+  strategies/    ← live execution (not yet built)
+  analytics/     ← reporting (not yet built)
 docs/
-  decisions/     ← architecture and vendor decision records (ADRs)
-  architecture/  ← system design and data flows
-  specs/         ← strategy stream specs
-  results/       ← backtest run summaries
+  decisions/     ← ADRs: vendor choices, architecture decisions
+  architecture/  ← system design, data flows, stream attribute system
+  specs/         ← strategy stream specs and model definitions
+  results/       ← backtest run summaries (populated as models complete)
 tests/
 ```
 
-## Key Constraints
-
-- No leverage, ever
-- No LLM in the live execution path
-- Limit orders only (0.25% maker fee, 0.50% round trip)
-- No real money until backtesting proves the concept
-- Only realized cash gains count — not unrealized BTC value
-
-See `docs/decisions/` for the reasoning behind these constraints.
+See `docs/` for full architecture documentation.

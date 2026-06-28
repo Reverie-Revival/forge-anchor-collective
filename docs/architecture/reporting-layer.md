@@ -23,8 +23,8 @@ Unions `backtest.lots` and `live.lots` into a single queryable surface. Every lo
 ```sql
 SELECT
   'backtest'          AS source,
-  r.run_type,         -- 'historical' or 'paper'
-  r.run_id,
+  mt.run_type,        -- 'historical' or 'paper'
+  mt.model_test_id,
   bl.model_id,
   bl.stream_id,
   bl.slot_number,
@@ -40,14 +40,14 @@ SELECT
   bl.entry_reason,
   bl.exit_reason
 FROM backtest.lots bl
-JOIN backtest.runs r ON bl.run_id = r.run_id
+JOIN backtest.model_tests mt ON bl.model_test_id = mt.model_test_id
 
 UNION ALL
 
 SELECT
   'live'              AS source,
   'live'              AS run_type,
-  NULL                AS run_id,
+  NULL                AS model_test_id,
   ll.model_id,
   ll.stream_id,
   ll.slot_number,
@@ -71,7 +71,7 @@ FROM live.lots ll
 
 Aggregated performance metrics per model and run. The scorecard view.
 
-Columns: `source`, `run_type`, `run_id`, `model_version`, total return, annualized return, max drawdown, win rate, avg winner, avg loser, total trades, cash efficiency ratio, grade (1-5).
+Columns: `source`, `run_type`, `model_test_id`, `model_version`, total return, annualized return, max drawdown, win rate, avg winner, avg loser, total trades, cash efficiency ratio, grade (1-5).
 
 **Cash Efficiency Ratio** = Annualized Return ÷ Maximum Capital Deployed. A model using 55% of available capital to return 18% is more efficient than buy-and-hold using 100% for 20%.
 
@@ -126,7 +126,7 @@ ORDER BY avg_win_rate DESC;
 
 **Is Model 2 Paper Test 3 beating Model 1 live over the same period?**
 ```sql
-SELECT source, run_id, model_version, model_return, sp500_return, grade
+SELECT source, model_test_id, model_version, model_return, sp500_return, grade
 FROM reporting.benchmark_comparison
 WHERE model_version IN (1, 2)
 AND period_start = '2026-01-01'

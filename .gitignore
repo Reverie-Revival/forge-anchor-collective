@@ -13,6 +13,9 @@ build/
 venv/
 .pytest_cache/
 
+# Streamlit runtime
+src/app/.last_run.pkl
+
 # Jupyter
 .ipynb_checkpoints/
 

@@ -27,7 +27,7 @@ How a model moves from idea to live deployment. Every model goes through the sam
 - Compare results across runs to find what performs best across diverse market conditions
   (bull runs, bear markets, sideways chop — the model must hold up across all of them)
 - No limit on number of runs — this is pure exploration
-- All runs logged in `backtest.runs` with `run_type = 'historical'`
+- All runs logged in `backtest.model_tests` with `run_type = 'historical'`
 
 **Output:** A set of promising stream configurations worth promoting to paper testing.
 
@@ -40,7 +40,7 @@ How a model moves from idea to live deployment. Every model goes through the sam
 - Each promising configuration from Phase 1 gets its own paper test
 - Multiple paper tests run simultaneously for the same model — no limit
 - No real orders placed — Kraken live feed is used for prices only
-- All logged in `backtest.runs` with `run_type = 'paper'`
+- All logged in `backtest.model_tests` with `run_type = 'paper'`
 
 ### Configurable Simulation Start Date
 Every paper test has a `simulation_start` date — set independently of when you actually kick it off.
@@ -76,7 +76,7 @@ Paper tests are never cancelled when a better configuration is found. All run un
 When ready:
 1. Mark the winning paper test as `selected_for_deployment = TRUE`
 2. Deploy $100 live on Kraken as Model N
-3. `live.models.based_on_run_id` links back to the winning paper test
+3. `live.models.based_on_model_test_id` links back to the winning paper test
 
 ---
 
