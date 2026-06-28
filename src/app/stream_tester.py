@@ -3,6 +3,7 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
 import json
+import hashlib
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
@@ -12,13 +13,16 @@ from pathlib import Path
 import yfinance as yf
 
 LAST_RUN_PATH = Path(__file__).parent / ".last_run.pkl"
+RUNS_DIR      = Path(__file__).parent / "runs"
+RUNS_DIR.mkdir(exist_ok=True)
 
-SP500_HISTORICAL_AVG = 10.0  # long-run annualized S&P 500 baseline
+SP500_HISTORICAL_AVG = 10.0
 
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 @st.cache_data(ttl=3600)
 def fetch_sp500(start: str, end: str):
-    """Fetch actual S&P 500 return for a date range. Cached for 1 hour."""
     try:
         spy = yf.download("^GSPC", start=start, end=end, auto_adjust=True, progress=False)
         if spy.empty:
@@ -34,6 +38,15 @@ def fetch_sp500(start: str, end: str):
         return None
 
 
+@st.cache_data
+def load_run_payload(test_id: int):
+    pkl_path = RUNS_DIR / f"{test_id}.pkl"
+    if not pkl_path.exists():
+        return None
+    with open(pkl_path, "rb") as f:
+        return pickle.load(f)
+
+
 def get_engine():
     return create_engine("postgresql+psycopg2://localhost/forge_anchor")
 
@@ -44,19 +57,200 @@ def candle_hours(params: dict) -> float:
 
 def grade_info(ann):
     if ann is None:  return None, "No grade", "#555555"
-    if ann >= 20:    return 5,    "Grade 5 · Elite",   "#00d4aa"
-    if ann >= 10:    return 4,    "Grade 4 · Strong",  "#4ade80"
-    if ann >= 8:     return 3,    "Grade 3 · Passing", "#facc15"
-    if ann > 0:      return 2,    "Grade 2 · Weak",    "#fb923c"
-    return           1,           "Grade 1 · Poor",    "#f87171"
+    if ann >= 20:    return 5, "Grade 5 · Elite",   "#00d4aa"
+    if ann >= 10:    return 4, "Grade 4 · Strong",  "#4ade80"
+    if ann >= 8:     return 3, "Grade 3 · Passing", "#facc15"
+    if ann > 0:      return 2, "Grade 2 · Weak",    "#fb923c"
+    return           1,        "Grade 1 · Poor",    "#f87171"
 
 
-def save_stream_test(stream_name, params, result, metrics, initial_capital, ending_balance, notes=""):
+def params_hash(params: dict) -> str:
+    return hashlib.md5(json.dumps(params, sort_keys=True).encode()).hexdigest()[:10]
+
+
+def label_window(start_date, end_date) -> str:
+    today = pd.Timestamp.now().date()
+    s = pd.Timestamp(start_date).date()
+    e = pd.Timestamp(end_date).date()
+    is_recent_end = (today - e).days <= 60
+    if s.year <= 2017 and is_recent_end:
+        return "Full History"
+    if s.year == 2019 and e.year == 2023:
+        return "Primary Window"
+    if s.year >= 2026 and is_recent_end:
+        return "Recent"
+    return f"{s.strftime('%b %Y')} → {e.strftime('%b %Y')}"
+
+
+def _compact_config(params: dict) -> str:
+    core      = params.get("core_signal", "")
+    core_p    = params.get("core_params") or {}
+    pos       = params.get("position") or {}
+    tf        = params.get("primary_timeframe") or "15m"
+    filters   = params.get("filters") or {}
+    sentiment = params.get("sentiment") or {}
+
+    if core == "ema_crossover":
+        sig = f"{core_p.get('ema_short')}/{core_p.get('ema_long')} EMA"
+    elif core == "rsi_dip":
+        sig = f"RSI dip <{core_p.get('rsi_threshold')}"
+    elif core == "range_breakout":
+        sig = f"{core_p.get('breakout_lookback')}-candle breakout"
+    elif core == "volume_surge":
+        sig = f"{core_p.get('volume_multiplier')}× vol surge"
+    elif core == "sma_pullback":
+        sig = f"pullback to {core_p.get('pullback_sma')} SMA"
+    else:
+        sig = core
+
+    parts = [f"{sig} · {tf}"]
+    active = []
+    tc = filters.get("trend_context")
+    if tc:
+        active.append(f">{tc.get('sma_period')} SMA")
+    rsi_f = filters.get("rsi")
+    if rsi_f:
+        if rsi_f.get("min") is not None: active.append(f"RSI>{rsi_f['min']}")
+        if rsi_f.get("max") is not None: active.append(f"RSI<{rsi_f['max']}")
+    if filters.get("atr_regime"):
+        active.append("low-vol")
+    fg = (sentiment.get("fear_greed") or {})
+    if fg.get("max") is not None: active.append(f"F&G<{fg['max']}")
+    if fg.get("min") is not None: active.append(f"F&G>{fg['min']}")
+    if active:
+        parts.append(" · ".join(active))
+    trail = pos.get("trailing_stop_pct")
+    if trail:
+        parts.append(f"{trail}% trail")
+    return "  ·  ".join(parts)
+
+
+def _human_readable_description(params: dict) -> str:
+    core      = params.get("core_signal", "")
+    core_p    = params.get("core_params") or {}
+    filters   = params.get("filters") or {}
+    pos       = params.get("position") or {}
+    sentiment = params.get("sentiment") or {}
+    tf        = params.get("primary_timeframe")
+
+    tf_desc = {
+        "1h":  "hourly candles (4× less frequent than raw 15m — much less noise)",
+        "4h":  "4-hour candles (very selective — only catches larger, sustained moves)",
+        "1d":  "daily candles (only major trend-level shifts trigger an entry)",
+    }.get(tf, "15-minute candles (maximum granularity)")
+
+    if core == "ema_crossover":
+        s, l = core_p.get("ema_short"), core_p.get("ema_long")
+        core_sent = (
+            f"Enters when the {s}-period EMA crosses above the {l}-period EMA — "
+            f"the short-term trend overtaking the longer-term trend, signaling a momentum shift. "
+            f"Evaluated on {tf_desc}."
+        )
+    elif core == "rsi_dip":
+        thresh = core_p.get("rsi_threshold", 35)
+        dip    = core_p.get("dip_pct", 2.0)
+        smap   = core_p.get("sma_period", 20)
+        core_sent = (
+            f"Enters when RSI drops below {thresh} (oversold) and price is at least {dip}% "
+            f"below its {smap}-period SMA — looking for genuine panic dips likely to bounce. "
+            f"Evaluated on {tf_desc}."
+        )
+    elif core == "range_breakout":
+        lb  = core_p.get("breakout_lookback", 48)
+        hrs = lb * 0.25
+        core_sent = (
+            f"Enters when price breaks above its highest point over the last {lb} candles ({hrs:.0f}h) — "
+            f"the moment a consolidation range gives way. Evaluated on {tf_desc}."
+        )
+    elif core == "volume_surge":
+        mult = core_p.get("volume_multiplier", 2.5)
+        core_sent = (
+            f"Enters on a volume spike of {mult}× the recent average with a bullish candle. "
+            f"Evaluated on {tf_desc}."
+        )
+    elif core == "sma_pullback":
+        psma = core_p.get("pullback_sma", 50)
+        tol  = core_p.get("pullback_tolerance_pct", 1.5)
+        core_sent = (
+            f"Enters when price pulls back to within {tol}% of the {psma}-period SMA during an uptrend. "
+            f"Evaluated on {tf_desc}."
+        )
+    else:
+        core_sent = f"Core signal: {core}. Evaluated on {tf_desc}."
+
+    filter_sents = []
+    tc = filters.get("trend_context")
+    if tc:
+        req = "above" if tc.get("require", "above") == "above" else "below"
+        filter_sents.append(
+            f"Only enters when BTC is {req} its {tc.get('sma_period', 200)}-period SMA — "
+            f"aligning with the long-term trend."
+        )
+    rsi_f = filters.get("rsi")
+    if rsi_f:
+        rsi_parts = []
+        if rsi_f.get("min") is not None: rsi_parts.append(f"above {rsi_f['min']} (momentum present)")
+        if rsi_f.get("max") is not None: rsi_parts.append(f"below {rsi_f['max']} (not yet overbought)")
+        if rsi_parts:
+            filter_sents.append(f"RSI must be {' and '.join(rsi_parts)} at entry.")
+    if filters.get("atr_regime"):
+        max_pct = filters["atr_regime"].get("max_pct_of_avg", 70)
+        filter_sents.append(
+            f"Requires ATR below {max_pct}% of its recent average — only enters after calm consolidation, not chaos."
+        )
+    fg = (sentiment.get("fear_greed") or {})
+    if fg.get("min") is not None:
+        filter_sents.append(
+            f"Fear & Greed must be above {fg['min']} — only trading when sentiment supports momentum, not during panic."
+        )
+    if fg.get("max") is not None:
+        filter_sents.append(
+            f"Fear & Greed must be below {fg['max']} — avoiding euphoric markets where momentum entries tend to top out."
+        )
+
+    exit_sents = []
+    trail = pos.get("trailing_stop_pct")
+    if trail:
+        exit_sents.append(
+            f"Exits via a {trail}% trailing stop — follows price upward, only triggers if BTC drops "
+            f"{trail}% from its peak since entry."
+        )
+    if pos.get("min_hold_candles"):
+        exit_sents.append(f"Holds at least {pos['min_hold_candles']} candles before the stop can fire.")
+    if pos.get("max_hold_candles"):
+        exit_sents.append(f"Force-exits after {pos['max_hold_candles']} candles regardless.")
+
+    return " ".join([core_sent] + filter_sents + exit_sents)
+
+
+# ── Database ──────────────────────────────────────────────────────────────────
+
+def load_stream_history() -> pd.DataFrame:
+    try:
+        engine = get_engine()
+        with engine.connect() as conn:
+            return pd.read_sql(text("""
+                SELECT test_id, stream_name, stream_version, parameters,
+                       test_start, test_end,
+                       total_trades, profit_factor, annualized_return_pct,
+                       max_drawdown_pct, avg_winner_pct, avg_loser_pct,
+                       win_rate, total_return_pct, ending_balance, initial_capital,
+                       saved_at, notes
+                FROM backtest.stream_tests
+                ORDER BY saved_at ASC
+            """), conn)
+    except Exception:
+        return pd.DataFrame()
+
+
+def save_stream_test(stream_name, params, result, metrics, initial_capital, ending_balance,
+                     payload: dict, notes: str = "") -> int:
     engine = get_engine()
-    name_parts = stream_name.rsplit(" ", 1)
-    version = name_parts[1] if len(name_parts) == 2 and name_parts[1].startswith("v") else "v1"
+    name_parts    = stream_name.rsplit(" ", 1)
+    version       = name_parts[1] if len(name_parts) == 2 and name_parts[1].startswith("v") else "v1"
+    stream_nm     = name_parts[0].strip()
     with engine.connect() as conn:
-        conn.execute(text("""
+        row = conn.execute(text("""
             INSERT INTO backtest.stream_tests (
                 stream_name, stream_version, parameters,
                 test_start, test_end, n_slots, initial_capital, ending_balance,
@@ -69,9 +263,9 @@ def save_stream_test(stream_name, params, result, metrics, initial_capital, endi
                 :total_trades, :win_rate, :total_pnl, :total_return_pct,
                 :annualized_return_pct, :avg_winner_pct, :avg_loser_pct,
                 :profit_factor, :max_drawdown_pct, :avg_hold_candles, :notes
-            )
+            ) RETURNING test_id
         """), {
-            "stream_name":           name_parts[0].strip(),
+            "stream_name":           stream_nm,
             "stream_version":        version,
             "parameters":            json.dumps(params),
             "test_start":            result["start"],
@@ -91,173 +285,290 @@ def save_stream_test(stream_name, params, result, metrics, initial_capital, endi
             "avg_hold_candles":      metrics["avg_hold_candles"],
             "notes":                 notes,
         })
+        test_id = row.scalar()
         conn.commit()
 
+    # Persist full payload so charts are available when revisiting this test
+    pkl_path = RUNS_DIR / f"{test_id}.pkl"
+    with open(pkl_path, "wb") as f:
+        pickle.dump(payload, f)
 
-def _compact_config(params: dict) -> str:
-    """One-line config summary for the sidebar."""
-    core   = params.get("core_signal", "")
-    core_p = params.get("core_params") or {}
-    pos    = params.get("position") or {}
-    tf     = params.get("primary_timeframe") or "15m"
-    filters = params.get("filters") or {}
-    sentiment = params.get("sentiment") or {}
-
-    if core == "ema_crossover":
-        sig = f"{core_p.get('ema_short')}/{core_p.get('ema_long')} EMA"
-    elif core == "rsi_dip":
-        sig = f"RSI dip <{core_p.get('rsi_threshold')}"
-    elif core == "range_breakout":
-        sig = f"{core_p.get('breakout_lookback')}-candle breakout"
-    elif core == "volume_surge":
-        sig = f"{core_p.get('volume_multiplier')}× volume surge"
-    elif core == "sma_pullback":
-        sig = f"pullback to {core_p.get('pullback_sma')} SMA"
-    else:
-        sig = core
-
-    parts = [f"{sig} · {tf}"]
-
-    active_filters = []
-    tc = filters.get("trend_context")
-    if tc:
-        active_filters.append(f">{tc.get('sma_period')} SMA")
-    rsi_f = filters.get("rsi")
-    if rsi_f:
-        if rsi_f.get("min") is not None: active_filters.append(f"RSI>{rsi_f['min']}")
-        if rsi_f.get("max") is not None: active_filters.append(f"RSI<{rsi_f['max']}")
-    if filters.get("atr_regime"):
-        active_filters.append("low-vol")
-    fg = (sentiment.get("fear_greed") or {})
-    if fg.get("max") is not None: active_filters.append(f"F&G<{fg['max']}")
-    if fg.get("min") is not None: active_filters.append(f"F&G>{fg['min']}")
-    if active_filters:
-        parts.append(" · ".join(active_filters))
-
-    trail = pos.get("trailing_stop_pct")
-    if trail:
-        parts.append(f"{trail}% trail")
-
-    return "  ·  ".join(parts)
+    return test_id
 
 
-def _human_readable_description(params: dict) -> str:
-    """Full English explanation of what a config does."""
-    core      = params.get("core_signal", "")
-    core_p    = params.get("core_params") or {}
-    filters   = params.get("filters") or {}
-    pos       = params.get("position") or {}
-    sentiment = params.get("sentiment") or {}
-    tf        = params.get("primary_timeframe")
+# ── Dashboard renderer ────────────────────────────────────────────────────────
 
-    tf_desc = {
-        "1h":  "hourly candles (4× less frequent than the raw 15-minute data — much less noise)",
-        "4h":  "4-hour candles (very selective — only catches larger, more sustained moves)",
-        "1d":  "daily candles (only major trend-level shifts trigger an entry)",
-    }.get(tf, "15-minute candles (maximum granularity — every signal the data can produce)")
+def render_dashboard(payload: dict, show_save: bool = True):
+    result          = payload["result"]
+    trades          = payload["trades"]
+    metrics         = payload["metrics"]
+    params          = payload["params"]
+    bh              = payload.get("bh", {})
+    initial_capital = payload["initial_capital"]
+    ending_capital  = payload["ending_balance"]
+    display_name    = payload["stream_name"]
+    period_str      = f"{result['start'].date()} → {result['end'].date()}"
+    tf              = params.get("primary_timeframe") or "15m"
+    c_hrs           = candle_hours(params)
+    ann             = metrics["annualized_return_pct"]
+    _, grade_label, grade_color = grade_info(ann)
 
-    if core == "ema_crossover":
-        s, l = core_p.get("ema_short"), core_p.get("ema_long")
-        core_sent = (
-            f"Enters when the {s}-period EMA crosses above the {l}-period EMA — "
-            f"the short-term trend overtaking the longer-term trend, signaling a momentum shift. "
-            f"Evaluated on {tf_desc}."
+    if trades.empty or metrics["total_trades"] == 0:
+        st.warning("No trades were generated with these settings.")
+        return
+
+    closed = trades[trades["exit_reason"] != "partial"].sort_values("exit_ts").copy()
+    closed["return_pct"] = (closed["exit_price"] - closed["entry_price"]) / closed["entry_price"] * 100
+
+    # Header
+    col_title, col_grade = st.columns([3, 1])
+    with col_title:
+        st.subheader(display_name)
+        st.caption(
+            f"{period_str}  ·  {tf} candles  ·  "
+            f"{result['signals'].sum()} signals  ·  {metrics['total_trades']} trades"
         )
-    elif core == "rsi_dip":
-        thresh = core_p.get("rsi_threshold", 35)
-        dip    = core_p.get("dip_pct", 2.0)
-        smap   = core_p.get("sma_period", 20)
-        core_sent = (
-            f"Enters when RSI drops below {thresh} (oversold territory) and price is at least {dip}% "
-            f"below its {smap}-period moving average — looking for genuine panic dips likely to bounce. "
-            f"Evaluated on {tf_desc}."
-        )
-    elif core == "range_breakout":
-        lb  = core_p.get("breakout_lookback", 48)
-        hrs = lb * 0.25
-        core_sent = (
-            f"Enters when price breaks above its highest point over the last {lb} candles ({hrs:.0f} hours) — "
-            f"the moment a consolidation range gives way and a new move begins. "
-            f"Evaluated on {tf_desc}."
-        )
-    elif core == "volume_surge":
-        mult = core_p.get("volume_multiplier", 2.5)
-        core_sent = (
-            f"Enters on a volume spike of {mult}× the recent average combined with a bullish candle — "
-            f"a signal that unusually high participation is driving the move upward. "
-            f"Evaluated on {tf_desc}."
-        )
-    elif core == "sma_pullback":
-        psma = core_p.get("pullback_sma", 50)
-        tol  = core_p.get("pullback_tolerance_pct", 1.5)
-        core_sent = (
-            f"Enters when price pulls back to within {tol}% of the {psma}-period SMA during an uptrend — "
-            f"buying a healthy dip in an established trend rather than chasing momentum. "
-            f"Evaluated on {tf_desc}."
-        )
-    else:
-        core_sent = f"Core signal: {core}. Evaluated on {tf_desc}."
-
-    filter_sents = []
-    tc = filters.get("trend_context")
-    if tc:
-        sma_p = tc.get("sma_period", 200)
-        req   = "above" if tc.get("require", "above") == "above" else "below"
-        filter_sents.append(
-            f"Only enters when BTC price is {req} its {sma_p}-period SMA — "
-            f"ensuring the trade aligns with the long-term trend direction."
-        )
-    rsi_f = filters.get("rsi")
-    if rsi_f:
-        rsi_parts = []
-        if rsi_f.get("min") is not None:
-            rsi_parts.append(f"above {rsi_f['min']} (momentum is present)")
-        if rsi_f.get("max") is not None:
-            rsi_parts.append(f"below {rsi_f['max']} (not yet overbought)")
-        if rsi_parts:
-            filter_sents.append(f"RSI must be {' and '.join(rsi_parts)} at the time of entry.")
-    atr_f = filters.get("atr_regime")
-    if atr_f:
-        max_pct = atr_f.get("max_pct_of_avg", 70)
-        filter_sents.append(
-            f"Requires a calm market before entry — volatility (ATR) must be below {max_pct}% of its recent average, "
-            f"so breakouts only happen after genuine consolidation, not during chaotic chop."
-        )
-    vol_f = filters.get("volume")
-    if vol_f and filters.get("trend_context") is None:
-        filter_sents.append(
-            f"Volume must exceed {vol_f.get('min_multiplier')}× its recent average — "
-            f"filtering out low-conviction moves."
+    with col_grade:
+        st.markdown(
+            f'<div style="text-align:right;margin-top:8px;">'
+            f'<span class="grade-badge" style="background:{grade_color}22;'
+            f'color:{grade_color};border:1px solid {grade_color}66;font-size:1rem;">'
+            f'{grade_label}</span></div>',
+            unsafe_allow_html=True
         )
 
-    fg = (sentiment.get("fear_greed") or {})
-    if fg.get("max") is not None:
-        filter_sents.append(
-            f"The Fear & Greed Index must be below {fg['max']} at entry — "
-            f"only trading during fearful or neutral market sentiment, not euphoria."
+    st.divider()
+
+    # Performance KPIs
+    st.markdown('<p class="section-label">Performance</p>', unsafe_allow_html=True)
+
+    sp500_actual = fetch_sp500(str(result["start"].date()), str(result["end"].date()))
+    sp500_ann    = sp500_actual["annualized_return_pct"] if sp500_actual else None
+    bh_ann       = bh.get("annualized_return_pct")
+
+    h1, h2, h3, h4 = st.columns(4)
+    h1.metric("Starting Balance", f"${initial_capital:.2f}",
+              help=f"{result.get('n_slots', 2)} slots × $10 each.")
+    h2.metric("Ending Balance", f"${ending_capital:.2f}",
+              delta=f"${ending_capital - initial_capital:+.2f}",
+              help="Total value after all trades and fees.")
+    h3.metric(
+        "Annualized Return",
+        f"{ann:+.1f}%" if ann is not None else "—",
+        delta=f"{ann - SP500_HISTORICAL_AVG:+.1f}% vs S&P historical avg" if ann is not None else None,
+        delta_color="normal" if ann is not None and ann >= SP500_HISTORICAL_AVG else "inverse",
+        help=f"Compounded yearly return. S&P 500 long-run average: ~{SP500_HISTORICAL_AVG:.0f}%."
+    )
+    h4.metric(
+        "Total Return",
+        f"{metrics['total_return_pct']:+.1f}%",
+        delta=f"{ann:+.1f}% / year" if ann is not None else None,
+        delta_color="normal" if ann is not None and ann > 0 else "inverse",
+        help=f"Cumulative return over {period_str}."
+    )
+
+    # Benchmarks
+    st.markdown('<p class="section-label" style="margin-top:16px;">Benchmarks — how did we compare?</p>',
+                unsafe_allow_html=True)
+    b1, b2, b3 = st.columns(3)
+    b1.metric(
+        "S&P 500 historical avg",
+        f"{SP500_HISTORICAL_AVG:.0f}% / year",
+        delta=f"{ann - SP500_HISTORICAL_AVG:+.1f}% vs us" if ann is not None else None,
+        delta_color="normal" if ann is not None and ann >= SP500_HISTORICAL_AVG else "inverse",
+        help="Long-run average annualized S&P 500 return (~10%). The baseline to beat."
+    )
+    b2.metric(
+        f"S&P 500 actual ({period_str})",
+        f"{sp500_ann:+.1f}% / year" if sp500_ann is not None else "—",
+        delta=f"{ann - sp500_ann:+.1f}% vs us" if (ann is not None and sp500_ann is not None) else None,
+        delta_color="normal" if (ann is not None and sp500_ann is not None and ann >= sp500_ann) else "inverse",
+        help="What S&P 500 actually returned during this exact backtest period."
+    )
+    b3.metric(
+        "BTC buy & hold",
+        f"{bh_ann:+.1f}% / year" if bh_ann is not None else "—",
+        delta=f"{ann - bh_ann:+.1f}% vs us" if (ann is not None and bh_ann is not None) else None,
+        delta_color="normal",
+        help="What you'd have made just holding BTC for the same period."
+    )
+
+    st.divider()
+
+    # Trade stats
+    st.markdown('<p class="section-label">Trade Statistics</p>', unsafe_allow_html=True)
+    s1, s2, s3, s4, s5, s6 = st.columns(6)
+
+    n_wins   = len(closed[closed["pnl"] > 0])
+    n_losses = len(closed[closed["pnl"] <= 0])
+    s1.metric("Win Rate",
+              f"{metrics['win_rate']*100:.1f}%" if metrics["win_rate"] else "—",
+              delta=f"{n_wins} wins · {n_losses} losses",
+              delta_color="off",
+              help="% of trades that ended in profit.")
+    s2.metric("Profit Factor",
+              str(metrics["profit_factor"]) if metrics["profit_factor"] else "—",
+              help="Total $ won ÷ total $ lost. >1.0 = profitable.")
+    s3.metric("Max Drawdown",
+              f"{metrics['max_drawdown_pct']:.1f}%" if metrics["max_drawdown_pct"] is not None else "—",
+              delta="worst peak-to-trough drop", delta_color="off",
+              help="Largest drop from peak balance. Lower (less negative) is better.")
+    avg_hold_hrs = round(metrics["avg_hold_candles"] * c_hrs, 1) if metrics["avg_hold_candles"] else None
+    s4.metric("Avg Hold", f"{avg_hold_hrs}h" if avg_hold_hrs else "—",
+              help="Average time in a trade.")
+    s5.metric("Avg Winner",
+              f"{metrics['avg_winner_pct']:+.1f}%" if metrics["avg_winner_pct"] else "—",
+              help="Average % return on winning trades.")
+    s6.metric("Avg Loser",
+              f"{metrics['avg_loser_pct']:.1f}%" if metrics["avg_loser_pct"] else "—",
+              help="Average % loss on losing trades.")
+
+    # Equity curve
+    equity  = initial_capital + closed["pnl"].cumsum()
+    peak_val = equity.max()
+    peak_ts  = closed.loc[equity.idxmax(), "exit_ts"]
+    low_val  = equity.min()
+    low_ts   = closed.loc[equity.idxmin(), "exit_ts"]
+
+    fig_eq = go.Figure()
+    fig_eq.add_trace(go.Scatter(
+        x=closed["exit_ts"], y=equity,
+        fill="tozeroy", fillcolor="rgba(0,212,170,0.07)",
+        line=dict(color="#00d4aa", width=2.5),
+        hovertemplate="<b>%{x|%b %d, %Y}</b><br>Balance: $%{y:.2f}<extra></extra>"
+    ))
+    fig_eq.add_hline(y=initial_capital, line=dict(color="#555", dash="dot"),
+                     annotation_text=f"Start ${initial_capital:.0f}",
+                     annotation_font_color="#888")
+    fig_eq.add_trace(go.Scatter(
+        x=[peak_ts], y=[peak_val], mode="markers+text",
+        marker=dict(color="#4ade80", size=10, symbol="circle"),
+        text=[f"  <b>High ${peak_val:.2f}</b><br>  {peak_ts.strftime('%b %d, %Y')}"],
+        textposition="middle right", textfont=dict(color="#4ade80", size=12),
+        hovertemplate=f"<b>Peak</b><br>{peak_ts.strftime('%b %d, %Y')}<br>${peak_val:.2f}<extra></extra>",
+        showlegend=False,
+    ))
+    fig_eq.add_trace(go.Scatter(
+        x=[low_ts], y=[low_val], mode="markers+text",
+        marker=dict(color="#f87171", size=10, symbol="circle"),
+        text=[f"  <b>Low ${low_val:.2f}</b><br>  {low_ts.strftime('%b %d, %Y')}"],
+        textposition="middle right", textfont=dict(color="#f87171", size=12),
+        hovertemplate=f"<b>Trough</b><br>{low_ts.strftime('%b %d, %Y')}<br>${low_val:.2f}<extra></extra>",
+        showlegend=False,
+    ))
+    if sp500_ann is not None:
+        sp_end = initial_capital * ((1 + sp500_ann / 100) ** ((result["end"] - result["start"]).days / 365.25))
+        fig_eq.add_annotation(
+            x=closed["exit_ts"].iloc[-1], y=sp_end,
+            text=f"S&P 500 this period: ${sp_end:.2f}",
+            showarrow=False, font=dict(color="#f59e0b", size=11), xanchor="right"
         )
-    if fg.get("min") is not None:
-        filter_sents.append(
-            f"The Fear & Greed Index must be above {fg['min']} at entry — "
-            f"only trading when sentiment is positive enough to support momentum."
+    fig_eq.update_layout(
+        template="plotly_dark", title="Account Balance Over Time",
+        xaxis_title=None, yaxis_title="Balance ($)",
+        height=360, margin=dict(t=40, b=20, l=10, r=10),
+        showlegend=False,
+        plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+    )
+    st.plotly_chart(fig_eq, use_container_width=True)
+
+    col_dd, col_dist = st.columns(2)
+
+    with col_dd:
+        peak_eq  = equity.cummax()
+        drawdown = (equity - peak_eq) / peak_eq * 100
+        worst    = drawdown.min()
+        fig_dd   = go.Figure(go.Scatter(
+            x=closed["exit_ts"], y=drawdown,
+            fill="tozeroy", line=dict(color="#f87171", width=1.5),
+            fillcolor="rgba(248,113,113,0.12)",
+            hovertemplate="<b>%{x|%b %d, %Y}</b><br>%{y:.1f}% below peak<extra></extra>"
+        ))
+        fig_dd.update_layout(
+            template="plotly_dark", title=f"Drawdown  (worst: {worst:.1f}%)",
+            xaxis_title=None, yaxis_title="% below peak",
+            height=280, margin=dict(t=40, b=20, l=10, r=10),
+            plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+        )
+        st.plotly_chart(fig_dd, use_container_width=True)
+        st.caption(f"0% = at all-time high. Worst drop: **{worst:.1f}%** before recovering.")
+
+    with col_dist:
+        trade_seq    = list(range(1, len(closed) + 1))
+        colors       = ["#4ade80" if r > 0 else "#f87171" for r in closed["return_pct"]]
+        hover_labels = [
+            f"Trade #{i}<br>{row.exit_ts.strftime('%b %d, %Y')}<br>{row.return_pct:+.2f}%"
+            for i, row in zip(trade_seq, closed.itertuples())
+        ]
+        fig_trades = go.Figure()
+        fig_trades.add_hline(y=0, line=dict(color="#555", width=1))
+        fig_trades.add_trace(go.Bar(
+            x=trade_seq, y=closed["return_pct"],
+            marker_color=colors, hovertext=hover_labels, hoverinfo="text",
+        ))
+        fig_trades.update_layout(
+            template="plotly_dark", title="Every Trade — Return %",
+            xaxis_title="Trade #", yaxis_title="Return (%)",
+            height=280, margin=dict(t=40, b=20, l=10, r=10),
+            showlegend=False,
+            plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+        )
+        st.plotly_chart(fig_trades, use_container_width=True)
+        st.caption(
+            f"Each bar is one trade in order. Green = win, red = loss. "
+            f"Avg winner **{metrics['avg_winner_pct']:+.1f}%** · avg loser **{metrics['avg_loser_pct']:.1f}%**."
+            if metrics["avg_winner_pct"] and metrics["avg_loser_pct"] else
+            "Each bar is one trade. Green = win, red = loss."
         )
 
-    trail    = pos.get("trailing_stop_pct")
-    min_hold = pos.get("min_hold_candles")
-    max_hold = pos.get("max_hold_candles")
+    with st.expander(f"Trade Log ({len(closed)} trades)", expanded=False):
+        log = closed.copy()
+        log["btc_bought"]   = (log["capital"] / log["entry_price"]).round(6)
+        log["start_value"]  = log["capital"].round(2)
+        log["end_value"]    = (log["capital"] + log["pnl"]).round(2)
+        log["gain_loss"]    = log["pnl"].round(4)
+        log["return_pct"]   = log["return_pct"].round(2)
+        log["entry_price"]  = log["entry_price"].round(2)
+        log["exit_price"]   = log["exit_price"].round(2)
+        log["duration_hrs"] = (log["candles_held"] * c_hrs).round(1)
+        display = log[[
+            "slot", "entry_ts", "exit_ts",
+            "entry_price", "exit_price", "btc_bought",
+            "start_value", "end_value", "gain_loss",
+            "return_pct", "duration_hrs", "exit_reason"
+        ]].rename(columns={
+            "slot": "Slot", "entry_ts": "Entered", "exit_ts": "Exited",
+            "entry_price": "BTC In", "exit_price": "BTC Out",
+            "btc_bought": "BTC Bought",
+            "start_value": "$ In", "end_value": "$ Out",
+            "gain_loss": "P&L ($)", "return_pct": "Return %",
+            "duration_hrs": "Hours Held", "exit_reason": "Exit Reason",
+        })
+        st.dataframe(display, use_container_width=True)
 
-    exit_sents = []
-    if trail:
-        exit_sents.append(
-            f"Exits via a {trail}% trailing stop — the stop follows price upward and only triggers "
-            f"if BTC drops {trail}% from its highest point since entry, letting winners run while capping losses."
+    if show_save:
+        st.divider()
+        st.subheader("💾 Save This Run")
+        save_notes = st.text_input(
+            "Notes (optional)",
+            placeholder="e.g. switched to 1h candles — profit factor flipped positive"
         )
-    if min_hold:
-        exit_sents.append(f"Holds for at least {min_hold} candles before the stop can fire.")
-    if max_hold:
-        exit_sents.append(f"Force-exits after {max_hold} candles regardless of the trailing stop.")
-
-    return " ".join([core_sent] + filter_sents + exit_sents)
+        if st.button("Save to Database", type="secondary"):
+            try:
+                test_id = save_stream_test(
+                    stream_name=display_name, params=params, result=result,
+                    metrics=metrics, initial_capital=initial_capital,
+                    ending_balance=ending_capital, payload=payload, notes=save_notes,
+                )
+                st.success(
+                    f"Saved as test #{test_id} — **{display_name}**, "
+                    f"{metrics['total_trades']} trades, "
+                    f"{metrics['annualized_return_pct']:+.1f}% annualized."
+                )
+                st.cache_data.clear()
+                st.rerun()
+            except Exception as e:
+                st.error(f"Save failed: {e}")
 
 
 # ── Page config & CSS ──────────────────────────────────────────────────────────
@@ -266,16 +577,13 @@ st.set_page_config(page_title="Stream Tester", layout="wide", page_icon="⚓")
 
 st.markdown("""
 <style>
-/* Metric card backgrounds */
 [data-testid="metric-container"] {
     background: rgba(255,255,255,0.04);
     border: 1px solid rgba(255,255,255,0.08);
     border-radius: 12px;
     padding: 18px 20px 14px 20px;
 }
-/* Tighten sidebar padding */
 [data-testid="stSidebar"] > div:first-child { padding-top: 1rem; }
-/* Grade badge */
 .grade-badge {
     display: inline-block;
     padding: 6px 18px;
@@ -285,7 +593,6 @@ st.markdown("""
     letter-spacing: 0.04em;
     margin-bottom: 4px;
 }
-/* Section divider label */
 .section-label {
     font-size: 0.7rem;
     font-weight: 600;
@@ -293,6 +600,15 @@ st.markdown("""
     text-transform: uppercase;
     color: #888;
     margin: 0 0 8px 0;
+}
+.config-group-header {
+    font-size: 0.75rem;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: #aaa;
+    margin-top: 12px;
+    margin-bottom: 2px;
 }
 </style>
 """, unsafe_allow_html=True)
@@ -321,7 +637,7 @@ GLOSSARY = {
         "Lets winning trades run while capping the downside.",
     "Fear & Greed Index":
         "Daily 0–100 crypto sentiment score. 0 = Extreme Fear, 100 = Extreme Greed. "
-        "Can be used as an entry gate — e.g. only enter when F&G < 35 confirms genuine panic.",
+        "Can be used as an entry gate — e.g. only enter when F&G > 25 to avoid panic-driven false signals.",
     "Profit Factor":
         "Total $ won ÷ total $ lost. Above 1.0 = profitable overall. 1.5 means you made $1.50 "
         "for every $1 you lost, regardless of win rate.",
@@ -336,400 +652,184 @@ with st.expander("📖 Glossary"):
     for i, (term, defn) in enumerate(items):
         cols[i % 2].markdown(f"**{term}**  \n{defn}")
 
-# ── Sidebar — Run History ──────────────────────────────────────────────────────
+
+# ── Sidebar ────────────────────────────────────────────────────────────────────
+
+history = load_stream_history()
+
+# Group saved tests by params hash — same params, different date ranges = one config group
+groups = {}       # hash → list of rows (sorted by test_start)
+group_order = []  # hashes in the order they first appeared
+
+if not history.empty:
+    for _, row in history.iterrows():
+        try:
+            p = row["parameters"] if isinstance(row["parameters"], dict) \
+                else json.loads(row["parameters"])
+            h = params_hash(p)
+        except Exception:
+            h = str(row["test_id"])
+        if h not in groups:
+            groups[h] = []
+            group_order.append(h)
+        groups[h].append(row)
+
+has_current = LAST_RUN_PATH.exists()
+
+# Build radio options
+sidebar_options = []
+sidebar_labels  = {}
+
+if has_current:
+    sidebar_options.append("__current__")
+    sidebar_labels["__current__"] = "▶  Current Run"
+
+for i, h in enumerate(group_order, 1):
+    rows    = groups[h]
+    best    = max((r["annualized_return_pct"] for r in rows if pd.notna(r["annualized_return_pct"])),
+                  default=None)
+    name    = f"{rows[0]['stream_name']} {rows[0]['stream_version']}"
+    n_tests = len(rows)
+    label   = f"#{i}  ·  {name}"
+    if best is not None:
+        label += f"  ·  {best:+.1f}%"
+    if n_tests > 1:
+        label += f"  ({n_tests} windows)"
+    sidebar_options.append(h)
+    sidebar_labels[h] = label
 
 with st.sidebar:
     st.header("Run History")
     st.caption("Triggered from Claude Code · Save to record here")
 
-    try:
-        engine = get_engine()
-        with engine.connect() as conn:
-            history = pd.read_sql(text("""
-                SELECT test_id, stream_name, stream_version, parameters,
-                       total_trades, profit_factor, annualized_return_pct,
-                       max_drawdown_pct, avg_winner_pct, avg_loser_pct,
-                       win_rate, saved_at, notes
-                FROM backtest.stream_tests
-                ORDER BY saved_at ASC
-            """), conn)
-    except Exception:
-        history = pd.DataFrame()
-
-    if history.empty:
+    if not sidebar_options:
         st.info("No saved runs yet.")
+        selected_key = None
     else:
-        total = len(history)
-        for attempt_num, (_, row) in enumerate(history.iterrows(), start=1):
-            try:
-                p = row["parameters"] if isinstance(row["parameters"], dict) \
-                    else json.loads(row["parameters"])
-                compact  = _compact_config(p)
-                readable = _human_readable_description(p)
-            except Exception:
-                compact  = "—"
-                readable = "—"
+        selected_key = st.radio(
+            "",
+            sidebar_options,
+            format_func=lambda x: sidebar_labels.get(x, x),
+        )
 
-            pf   = f"{row['profit_factor']:.2f}"         if pd.notna(row["profit_factor"])         else "—"
-            ann  = f"{row['annualized_return_pct']:+.1f}%" if pd.notna(row["annualized_return_pct"]) else "—"
-            dd   = f"{row['max_drawdown_pct']:.1f}%"     if pd.notna(row["max_drawdown_pct"])       else "—"
-            wr   = f"{row['win_rate']*100:.0f}%"         if pd.notna(row["win_rate"])               else "—"
-            _, grade_label, grade_color = grade_info(
-                row["annualized_return_pct"] if pd.notna(row["annualized_return_pct"]) else None
-            )
+    # Show config details for the selected group
+    if selected_key and selected_key != "__current__" and selected_key in groups:
+        st.divider()
+        rows = groups[selected_key]
+        try:
+            p        = rows[0]["parameters"] if isinstance(rows[0]["parameters"], dict) \
+                       else json.loads(rows[0]["parameters"])
+            compact  = _compact_config(p)
+            readable = _human_readable_description(p)
+        except Exception:
+            compact  = "—"
+            readable = "—"
 
+        st.markdown(f"**{rows[0]['stream_name']} {rows[0]['stream_version']}**")
+        st.caption(compact)
+        st.markdown(f"*{readable}*")
+        st.divider()
+
+        # Per-window summary in sidebar
+        for row in rows:
+            window = label_window(row["test_start"], row["test_end"])
+            ann    = row["annualized_return_pct"]
+            pf     = row["profit_factor"]
+            _, gl, gc = grade_info(ann if pd.notna(ann) else None)
             st.markdown(
-                f'<span class="grade-badge" style="background:{grade_color}20;'
-                f'color:{grade_color};border:1px solid {grade_color}55;">'
-                f'#{attempt_num} &nbsp;{grade_label}</span>',
+                f'<span class="grade-badge" style="background:{gc}20;color:{gc};'
+                f'border:1px solid {gc}55;font-size:0.75rem;padding:3px 10px;">'
+                f'{window} · {ann:+.1f}%</span>' if pd.notna(ann) else
+                f'<span class="grade-badge" style="background:#55555520;color:#aaa;'
+                f'border:1px solid #55555555;font-size:0.75rem;padding:3px 10px;">'
+                f'{window}</span>',
                 unsafe_allow_html=True
             )
-            st.markdown(f"**{row['stream_name']} {row['stream_version']}**")
-            st.caption(compact)
-            st.markdown(f"*{readable}*")
             st.caption(
-                f"PF {pf}  ·  Ann {ann}  ·  DD {dd}  ·  WR {wr}  ·  {row['total_trades']} trades"
+                f"PF {pf:.2f}  ·  "
+                f"DD {row['max_drawdown_pct']:.1f}%  ·  "
+                f"WR {row['win_rate']*100:.0f}%  ·  "
+                f"{row['total_trades']} trades"
+                if pd.notna(pf) else "—"
             )
             if row["notes"]:
                 st.caption(f"💬 {row['notes']}")
-            st.divider()
+
+    elif selected_key == "__current__" and has_current:
+        st.divider()
+        try:
+            with open(LAST_RUN_PATH, "rb") as f:
+                _cur = pickle.load(f)
+            p       = _cur.get("params", {})
+            compact = _compact_config(p)
+            st.caption("Unsaved — run from Claude Code")
+            st.caption(compact)
+        except Exception:
+            pass
 
 
-# ── Main — load last run ───────────────────────────────────────────────────────
+# ── Main area ─────────────────────────────────────────────────────────────────
 
-payload = None
-if LAST_RUN_PATH.exists():
+if not sidebar_options:
+    st.info("Waiting for a run from Claude Code. Results appear here automatically.")
+    st.stop()
+
+if selected_key == "__current__":
+    # Show the live .last_run.pkl with save button
     try:
         with open(LAST_RUN_PATH, "rb") as f:
             payload = pickle.load(f)
     except Exception:
-        payload = None
+        st.error("Could not load the current run file.")
+        st.stop()
+    render_dashboard(payload, show_save=True)
 
-if not payload:
-    st.info("Waiting for a run from Claude Code. Results appear here automatically.")
-    st.stop()
+elif selected_key in groups:
+    # Show tabs — one per saved date-range window for this config group
+    rows     = groups[selected_key]
+    tab_labels = [label_window(r["test_start"], r["test_end"]) for r in rows]
 
-result          = payload["result"]
-trades          = payload["trades"]
-df              = payload["df"]
-metrics         = payload["metrics"]
-params          = payload["params"]
-bh              = payload.get("bh", {})
-initial_capital = payload["initial_capital"]
-ending_capital  = payload["ending_balance"]
-display_name    = payload["stream_name"]
-period_str      = f"{result['start'].date()} → {result['end'].date()}"
-tf              = params.get("primary_timeframe") or "15m"
-c_hrs           = candle_hours(params)
+    # Deduplicate tab labels if needed
+    seen = {}
+    deduped = []
+    for lbl in tab_labels:
+        if lbl in seen:
+            seen[lbl] += 1
+            deduped.append(f"{lbl} ({seen[lbl]})")
+        else:
+            seen[lbl] = 1
+            deduped.append(lbl)
 
-ann             = metrics["annualized_return_pct"]
-_, grade_label, grade_color = grade_info(ann)
-
-if trades.empty or metrics["total_trades"] == 0:
-    st.warning("No trades were generated with these settings.")
-    st.stop()
-
-closed = trades[trades["exit_reason"] != "partial"].sort_values("exit_ts").copy()
-closed["return_pct"] = (closed["exit_price"] - closed["entry_price"]) / closed["entry_price"] * 100
-
-# ── Header ─────────────────────────────────────────────────────────────────────
-
-col_title, col_grade = st.columns([3, 1])
-with col_title:
-    st.subheader(display_name)
-    st.caption(
-        f"{period_str}  ·  {tf} candles  ·  "
-        f"{result['signals'].sum()} signals  ·  {metrics['total_trades']} trades"
-    )
-with col_grade:
-    st.markdown(
-        f'<div style="text-align:right;margin-top:8px;">'
-        f'<span class="grade-badge" style="background:{grade_color}22;'
-        f'color:{grade_color};border:1px solid {grade_color}66;font-size:1rem;">'
-        f'{grade_label}</span></div>',
-        unsafe_allow_html=True
-    )
-
-st.divider()
-
-# ── Hero KPIs ──────────────────────────────────────────────────────────────────
-
-st.markdown('<p class="section-label">Performance</p>', unsafe_allow_html=True)
-
-# Fetch actual S&P 500 return for this exact backtest period
-sp500_actual = fetch_sp500(str(result["start"].date()), str(result["end"].date()))
-sp500_ann    = sp500_actual["annualized_return_pct"] if sp500_actual else None
-bh_ann       = bh.get("annualized_return_pct")
-
-h1, h2, h3, h4 = st.columns(4)
-
-h1.metric(
-    "Starting Balance",
-    f"${initial_capital:.2f}",
-    help=f"{result.get('n_slots', 2)} slots × $10 each."
-)
-h2.metric(
-    "Ending Balance",
-    f"${ending_capital:.2f}",
-    delta=f"${ending_capital - initial_capital:+.2f}",
-    help="Total value after all trades and fees."
-)
-h3.metric(
-    "Annualized Return",
-    f"{ann:+.1f}%" if ann is not None else "—",
-    delta=f"{ann - SP500_HISTORICAL_AVG:+.1f}% vs S&P historical avg" if ann is not None else None,
-    delta_color="normal" if ann is not None and ann >= SP500_HISTORICAL_AVG else "inverse",
-    help=f"Compounded yearly return. S&P 500 long-run average: ~{SP500_HISTORICAL_AVG:.0f}%."
-)
-h4.metric(
-    "Total Return",
-    f"{metrics['total_return_pct']:+.1f}%",
-    delta=f"{ann:+.1f}% / year" if ann is not None else None,
-    delta_color="normal" if ann is not None and ann > 0 else "inverse",
-    help=f"Cumulative return over {period_str}. Delta shows annualized equivalent."
-)
-
-# ── Benchmark row ──────────────────────────────────────────────────────────────
-
-st.markdown('<p class="section-label" style="margin-top:16px;">Benchmarks — how did we compare?</p>', unsafe_allow_html=True)
-
-b1, b2, b3 = st.columns(3)
-
-b1.metric(
-    "S&P 500 historical avg",
-    f"{SP500_HISTORICAL_AVG:.0f}% / year",
-    delta=f"{ann - SP500_HISTORICAL_AVG:+.1f}% vs us" if ann is not None else None,
-    delta_color="normal" if ann is not None and ann >= SP500_HISTORICAL_AVG else "inverse",
-    help="Long-run average annualized S&P 500 return (~10%). The baseline to beat."
-)
-
-b2.metric(
-    f"S&P 500 actual ({period_str})",
-    f"{sp500_ann:+.1f}% / year" if sp500_ann is not None else "—",
-    delta=f"{ann - sp500_ann:+.1f}% vs us" if (ann is not None and sp500_ann is not None) else None,
-    delta_color="normal" if (ann is not None and sp500_ann is not None and ann >= sp500_ann) else "inverse",
-    help=f"What S&P 500 actually returned during this exact backtest period. More honest than the historical average."
-)
-
-b3.metric(
-    "BTC buy & hold",
-    f"{bh_ann:+.1f}% / year" if bh_ann is not None else "—",
-    delta=f"{ann - bh_ann:+.1f}% vs us" if (ann is not None and bh_ann is not None) else None,
-    delta_color="normal",
-    help="What you'd have made just buying and holding BTC for the same period. No trades, no fees."
-)
-
-st.divider()
-
-# ── Stats row ──────────────────────────────────────────────────────────────────
-
-st.markdown('<p class="section-label">Trade Statistics</p>', unsafe_allow_html=True)
-
-s1, s2, s3, s4, s5, s6 = st.columns(6)
-
-n_wins   = len(closed[closed["pnl"] > 0])
-n_losses = len(closed[closed["pnl"] <= 0])
-s1.metric(
-    "Win Rate",
-    f"{metrics['win_rate']*100:.1f}%" if metrics["win_rate"] else "—",
-    delta=f"{n_wins} wins · {n_losses} losses",
-    delta_color="off",
-    help="% of closed trades that ended in profit. Win rate alone doesn't determine profitability — size of wins matters too."
-)
-s2.metric(
-    "Profit Factor",
-    str(metrics["profit_factor"]) if metrics["profit_factor"] else "—",
-    help="Total $ won ÷ total $ lost. >1.0 = profitable. 1.5 = made $1.50 per $1 lost."
-)
-s3.metric(
-    "Max Drawdown",
-    f"{metrics['max_drawdown_pct']:.1f}%" if metrics["max_drawdown_pct"] is not None else "—",
-    delta="worst peak-to-trough drop",
-    delta_color="off",
-    help="Largest drop from peak balance to lowest point. Lower (less negative) is better."
-)
-avg_hold_hrs = round(metrics["avg_hold_candles"] * c_hrs, 1) if metrics["avg_hold_candles"] else None
-s4.metric(
-    "Avg Hold",
-    f"{avg_hold_hrs}h" if avg_hold_hrs else "—",
-    help="Average time in a trade."
-)
-s5.metric(
-    "Avg Winner",
-    f"{metrics['avg_winner_pct']:+.1f}%" if metrics["avg_winner_pct"] else "—",
-    help="Average % return on winning trades."
-)
-s6.metric(
-    "Avg Loser",
-    f"{metrics['avg_loser_pct']:.1f}%" if metrics["avg_loser_pct"] else "—",
-    help="Average % loss on losing trades. Ideally smaller (in absolute terms) than avg winner."
-)
-
-equity = initial_capital + closed["pnl"].cumsum()
-
-peak_val  = equity.max()
-peak_ts   = closed.loc[equity.idxmax(), "exit_ts"]
-low_val   = equity.min()
-low_ts    = closed.loc[equity.idxmin(), "exit_ts"]
-
-fig_eq = go.Figure()
-fig_eq.add_trace(go.Scatter(
-    x=closed["exit_ts"], y=equity,
-    fill="tozeroy",
-    fillcolor="rgba(0,212,170,0.07)",
-    line=dict(color="#00d4aa", width=2.5),
-    hovertemplate="<b>%{x|%b %d, %Y}</b><br>Balance: $%{y:.2f}<extra></extra>"
-))
-fig_eq.add_hline(
-    y=initial_capital,
-    line=dict(color="#555", dash="dot"),
-    annotation_text=f"Start ${initial_capital:.0f}",
-    annotation_font_color="#888"
-)
-fig_eq.add_trace(go.Scatter(
-    x=[peak_ts], y=[peak_val],
-    mode="markers+text",
-    marker=dict(color="#4ade80", size=10, symbol="circle"),
-    text=[f"  <b>High ${peak_val:.2f}</b><br>  {peak_ts.strftime('%b %d, %Y')}"],
-    textposition="middle right",
-    textfont=dict(color="#4ade80", size=12),
-    hovertemplate=f"<b>Peak</b><br>{peak_ts.strftime('%b %d, %Y')}<br>${peak_val:.2f}<extra></extra>",
-    showlegend=False,
-))
-fig_eq.add_trace(go.Scatter(
-    x=[low_ts], y=[low_val],
-    mode="markers+text",
-    marker=dict(color="#f87171", size=10, symbol="circle"),
-    text=[f"  <b>Low ${low_val:.2f}</b><br>  {low_ts.strftime('%b %d, %Y')}"],
-    textposition="middle right",
-    textfont=dict(color="#f87171", size=12),
-    hovertemplate=f"<b>Trough</b><br>{low_ts.strftime('%b %d, %Y')}<br>${low_val:.2f}<extra></extra>",
-    showlegend=False,
-))
-if sp500_ann is not None:
-    sp_end = initial_capital * ((1 + sp500_ann / 100) ** ((result["end"] - result["start"]).days / 365.25))
-    fig_eq.add_annotation(
-        x=closed["exit_ts"].iloc[-1], y=sp_end,
-        text=f"S&P 500 this period: ${sp_end:.2f}",
-        showarrow=False, font=dict(color="#f59e0b", size=11),
-        xanchor="right"
-    )
-fig_eq.update_layout(
-    template="plotly_dark",
-    title="Account Balance Over Time",
-    xaxis_title=None, yaxis_title="Balance ($)",
-    height=360, margin=dict(t=40, b=20, l=10, r=10),
-    showlegend=False,
-    plot_bgcolor="rgba(0,0,0,0)",
-    paper_bgcolor="rgba(0,0,0,0)",
-)
-st.plotly_chart(fig_eq, use_container_width=True)
-
-col_dd, col_dist = st.columns(2)
-
-# ── Drawdown ──────────────────────────────────────────────────────────────────
-with col_dd:
-    peak     = equity.cummax()
-    drawdown = (equity - peak) / peak * 100
-    worst    = drawdown.min()
-
-    fig_dd = go.Figure(go.Scatter(
-        x=closed["exit_ts"], y=drawdown,
-        fill="tozeroy",
-        line=dict(color="#f87171", width=1.5),
-        fillcolor="rgba(248,113,113,0.12)",
-        hovertemplate="<b>%{x|%b %d, %Y}</b><br>%{y:.1f}% below peak<extra></extra>"
-    ))
-    fig_dd.update_layout(
-        template="plotly_dark",
-        title=f"Drawdown  (worst: {worst:.1f}%)",
-        xaxis_title=None, yaxis_title="% below peak",
-        height=280, margin=dict(t=40, b=20, l=10, r=10),
-        plot_bgcolor="rgba(0,0,0,0)",
-        paper_bgcolor="rgba(0,0,0,0)",
-    )
-    st.plotly_chart(fig_dd, use_container_width=True)
-    st.caption(f"0% = at all-time high. Worst drop: **{worst:.1f}%** before recovering. Closer to 0 is better.")
-
-# ── Per-trade returns ─────────────────────────────────────────────────────────
-with col_dist:
-    trade_seq    = list(range(1, len(closed) + 1))
-    colors       = ["#4ade80" if r > 0 else "#f87171" for r in closed["return_pct"]]
-    hover_labels = [
-        f"Trade #{i}<br>{row.exit_ts.strftime('%b %d, %Y')}<br>{row.return_pct:+.2f}%"
-        for i, row in zip(trade_seq, closed.itertuples())
-    ]
-
-    fig_trades = go.Figure()
-    fig_trades.add_hline(y=0, line=dict(color="#555", width=1))
-    fig_trades.add_trace(go.Bar(
-        x=trade_seq,
-        y=closed["return_pct"],
-        marker_color=colors,
-        hovertext=hover_labels,
-        hoverinfo="text",
-    ))
-    fig_trades.update_layout(
-        template="plotly_dark",
-        title="Every Trade — Return %",
-        xaxis_title="Trade #", yaxis_title="Return (%)",
-        height=280, margin=dict(t=40, b=20, l=10, r=10),
-        showlegend=False,
-        plot_bgcolor="rgba(0,0,0,0)",
-        paper_bgcolor="rgba(0,0,0,0)",
-    )
-    st.plotly_chart(fig_trades, use_container_width=True)
-    st.caption(
-        f"Each bar is one trade in chronological order. Green = win, red = loss. "
-        f"Avg winner **{metrics['avg_winner_pct']:+.1f}%** · avg loser **{metrics['avg_loser_pct']:.1f}%**."
-        if metrics["avg_winner_pct"] and metrics["avg_loser_pct"] else
-        "Each bar is one trade. Green = win, red = loss."
-    )
-
-# ── Trade log ─────────────────────────────────────────────────────────────────
-with st.expander(f"Trade Log ({len(closed)} trades)", expanded=False):
-    log = closed.copy()
-    log["btc_bought"]   = (log["capital"] / log["entry_price"]).round(6)
-    log["start_value"]  = log["capital"].round(2)
-    log["end_value"]    = (log["capital"] + log["pnl"]).round(2)
-    log["gain_loss"]    = log["pnl"].round(4)
-    log["return_pct"]   = log["return_pct"].round(2)
-    log["entry_price"]  = log["entry_price"].round(2)
-    log["exit_price"]   = log["exit_price"].round(2)
-    log["duration_hrs"] = (log["candles_held"] * c_hrs).round(1)
-
-    display = log[[
-        "slot", "entry_ts", "exit_ts",
-        "entry_price", "exit_price", "btc_bought",
-        "start_value", "end_value", "gain_loss",
-        "return_pct", "duration_hrs", "exit_reason"
-    ]].rename(columns={
-        "slot": "Slot", "entry_ts": "Entered", "exit_ts": "Exited",
-        "entry_price": "BTC In", "exit_price": "BTC Out",
-        "btc_bought": "BTC Bought",
-        "start_value": "$ In", "end_value": "$ Out", "gain_loss": "P&L ($)",
-        "return_pct": "Return %", "duration_hrs": "Hours Held", "exit_reason": "Exit Reason",
-    })
-    st.dataframe(display, use_container_width=True)
-
-# ── Save ──────────────────────────────────────────────────────────────────────
-st.divider()
-st.subheader("💾 Save This Run")
-save_notes = st.text_input(
-    "Notes (optional)",
-    placeholder="e.g. switched to 1h candles — profit factor flipped positive, drawdown still heavy"
-)
-if st.button("Save to Database", type="secondary"):
-    try:
-        save_stream_test(
-            stream_name=display_name, params=params, result=result,
-            metrics=metrics, initial_capital=initial_capital,
-            ending_balance=ending_capital, notes=save_notes,
-        )
-        st.success(
-            f"Saved — **{display_name}**, {metrics['total_trades']} trades, "
-            f"{metrics['annualized_return_pct']:+.1f}% annualized, ${ending_capital:.2f} ending balance."
-        )
-        st.rerun()
-    except Exception as e:
-        st.error(f"Save failed: {e}")
+    tabs = st.tabs(deduped)
+    for tab, row in zip(tabs, rows):
+        with tab:
+            test_id = int(row["test_id"])
+            payload = load_run_payload(test_id)
+            if payload is not None:
+                render_dashboard(payload, show_save=False)
+            else:
+                # Fallback for tests saved before the pkl-per-test system
+                ann  = row["annualized_return_pct"]
+                pf   = row["profit_factor"]
+                dd   = row["max_drawdown_pct"]
+                wr   = row["win_rate"]
+                _, gl, gc = grade_info(ann if pd.notna(ann) else None)
+                st.markdown(
+                    f'<span class="grade-badge" style="background:{gc}22;color:{gc};'
+                    f'border:1px solid {gc}66;font-size:1rem;">{gl}</span>',
+                    unsafe_allow_html=True
+                )
+                st.caption(f"{row['stream_name']} {row['stream_version']}  ·  "
+                           f"{row['test_start'].date()} → {row['test_end'].date()}")
+                st.divider()
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Annualized Return", f"{ann:+.1f}%" if pd.notna(ann) else "—")
+                c2.metric("Profit Factor", f"{pf:.2f}" if pd.notna(pf) else "—")
+                c3.metric("Max Drawdown", f"{dd:.1f}%" if pd.notna(dd) else "—")
+                c4.metric("Win Rate", f"{wr*100:.0f}%" if pd.notna(wr) else "—")
+                st.info(
+                    "Full charts not available for this test — it was saved before the per-test "
+                    "storage system was added. Re-run from Claude Code with the same params to get charts."
+                )
+                if row["notes"]:
+                    st.caption(f"💬 {row['notes']}")

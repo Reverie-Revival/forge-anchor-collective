@@ -15,6 +15,7 @@ venv/
 
 # Streamlit runtime
 src/app/.last_run.pkl
+src/app/runs/
 
 # Jupyter
 .ipynb_checkpoints/
