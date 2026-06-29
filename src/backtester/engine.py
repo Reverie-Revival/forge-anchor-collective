@@ -47,13 +47,16 @@ def _warmup_days(params: dict) -> int:
         candles = max(candles, int(core_p.get("pullback_sma", 50)))
         candles = max(candles, int(core_p.get("trend_sma", 200)))
 
-    # volume / ATR filters
+    # volume / ATR / Bollinger filters
     vol_f = filters.get("volume") or {}
     if vol_f.get("avg_period"):
         candles = max(candles, int(vol_f["avg_period"]))
     atr_f = filters.get("atr_regime") or {}
     if atr_f.get("period"):
         candles = max(candles, int(atr_f["period"]) + int(atr_f.get("avg_period", 30)))
+    bb_f = filters.get("bollinger") or {}
+    if bb_f.get("period"):
+        candles = max(candles, int(bb_f["period"]))
 
     return math.ceil(candles / cpd) + 1  # +1 day safety buffer
 

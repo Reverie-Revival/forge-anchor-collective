@@ -151,7 +151,16 @@ with st.expander("🔧 Parameter Reference"):
          "`min_multiplier` (e.g. 1.5 = 1.5× average), `avg_period` (default 20)"),
         ("**atr_regime**",         "Only enter when volatility is low (post-panic calm)",
          "`period` (default 14), `avg_period` (default 30), "
-         "`max_pct_of_avg` (e.g. 70 = ATR must be < 70% of its average)"),
+         "`max_pct_of_avg` (e.g. 70 = ATR must be < 70% of its average), "
+         "`min_consecutive_candles` (optional — ATR must be low for N consecutive candles, "
+         "confirms genuine consolidation not a single quiet candle)"),
+        ("**bollinger**",          "Bollinger Band squeeze — confirms price compression independently of ATR",
+         "`period` (default 20), `std_dev` (default 2.0), "
+         "`squeeze.max_bandwidth_pct` (e.g. 6.0 = bands must be < 6% of price — "
+         "low bandwidth = tight consolidation)"),
+        ("**breakout_candle**",    "Quality check on the entry candle — filters wick fakeouts",
+         "`body_ratio_min` (e.g. 0.4 = body must be ≥ 40% of candle range), "
+         "`close_position_min` (e.g. 0.6 = close must be in top 40% of candle range — conviction)"),
     ]
     c1, c2, c3 = st.columns([1.6, 2, 3])
     c1.markdown("**Filter**"); c2.markdown("**What it does**"); c3.markdown("**Parameters**")
@@ -170,6 +179,9 @@ with st.expander("🔧 Parameter Reference"):
         ("**entry_order_type**",     "Always `limit` (Kraken maker fee = 0.25% vs 0.40% taker)", "limit"),
         ("**entry_expiry_candles**", "Cancel pending limit order if not filled within N candles",
          "default 2"),
+        ("**partial_exit**",        "Take a portion off at a target gain, trail the remainder — "
+         "locks profit while keeping upside exposure",
+         "`at_gain_pct` (e.g. 5.0 = take partial at +5%), `exit_pct` (e.g. 50 = close half)"),
     ]
     c1, c2, c3 = st.columns([1.8, 2.8, 1.4])
     c1.markdown("**Parameter**"); c2.markdown("**What it does**"); c3.markdown("**Default / Example**")

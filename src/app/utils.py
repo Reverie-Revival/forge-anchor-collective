@@ -109,7 +109,20 @@ def _compact_config(params: dict) -> str:
         if rsi_f.get("min") is not None: active.append(f"RSI>{rsi_f['min']}")
         if rsi_f.get("max") is not None: active.append(f"RSI<{rsi_f['max']}")
     if filters.get("atr_regime"):
-        active.append("low-vol")
+        consec = filters["atr_regime"].get("min_consecutive_candles")
+        active.append(f"low-vol{f'×{consec}c' if consec else ''}")
+    bb_f = filters.get("bollinger")
+    if bb_f and (bb_f.get("squeeze") or {}).get("max_bandwidth_pct") is not None:
+        active.append(f"BB-squeeze<{bb_f['squeeze']['max_bandwidth_pct']}%")
+    bc_f = filters.get("breakout_candle")
+    if bc_f:
+        parts_bc = []
+        if bc_f.get("body_ratio_min") is not None:
+            parts_bc.append(f"body≥{int(bc_f['body_ratio_min']*100)}%")
+        if bc_f.get("close_position_min") is not None:
+            parts_bc.append(f"top{int((1-bc_f['close_position_min'])*100)}%")
+        if parts_bc:
+            active.append("candle:" + "/".join(parts_bc))
     dfh = filters.get("drawdown_from_high")
     if dfh:
         active.append(f"drop≥{dfh.get('min_drop_pct')}%/{dfh.get('lookback_days')}d")
@@ -214,10 +227,37 @@ def _human_readable_description(params: dict) -> str:
             filter_sents.append(f"RSI must be {' and '.join(rsi_parts)} at entry.")
     if filters.get("atr_regime"):
         max_pct = filters["atr_regime"].get("max_pct_of_avg", 70)
+        consec = filters["atr_regime"].get("min_consecutive_candles")
+        consec_str = (f" That low volatility must persist for at least {consec} consecutive candles — "
+                      f"confirming genuine consolidation, not a single quiet moment.") if consec else ""
         filter_sents.append(
             f"Requires ATR below {max_pct}% of its recent average — only enters after calm "
-            f"consolidation, not chaos."
+            f"consolidation, not chaos.{consec_str}"
         )
+    bb_f = filters.get("bollinger")
+    if bb_f and (bb_f.get("squeeze") or {}).get("max_bandwidth_pct") is not None:
+        bw = bb_f["squeeze"]["max_bandwidth_pct"]
+        filter_sents.append(
+            f"Bollinger Bands must be squeezed to within {bw}% of price — a second independent "
+            f"confirmation that the market is coiling before a move."
+        )
+    bc_f = filters.get("breakout_candle")
+    if bc_f:
+        bc_parts = []
+        if bc_f.get("body_ratio_min") is not None:
+            bc_parts.append(
+                f"the candle body must be at least {int(bc_f['body_ratio_min']*100)}% of the total "
+                f"candle range (filters out wick fakeouts)"
+            )
+        if bc_f.get("close_position_min") is not None:
+            bc_parts.append(
+                f"price must close in the top {int((1-bc_f['close_position_min'])*100)}% of the "
+                f"candle's range (confirms conviction, not a weak close)"
+            )
+        if bc_parts:
+            filter_sents.append(
+                f"Entry candle quality check — {' and '.join(bc_parts)}."
+            )
     fg = (sentiment.get("fear_greed") or {})
     if fg.get("min") is not None:
         filter_sents.append(
@@ -250,5 +290,11 @@ def _human_readable_description(params: dict) -> str:
         )
     if pos.get("max_hold_candles"):
         exit_sents.append(f"Force-exits after {pos['max_hold_candles']} candles regardless.")
+    partial = pos.get("partial_exit")
+    if partial:
+        exit_sents.append(
+            f"Takes {partial.get('exit_pct')}% of the position off at +{partial.get('at_gain_pct')}% "
+            f"gain to lock in profit, then trails the remainder."
+        )
 
     return " ".join([core_sent] + filter_sents + exit_sents)

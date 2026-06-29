@@ -56,8 +56,9 @@ Additional market data conditions that must be true on the same candle as the co
 | `rsi` | RSI must fall within a min/max range |
 | `drawdown_from_high` | Price must have dropped ≥ N% from its recent high — requires a real crash, not a routine dip |
 | `volume` | Volume must exceed N× average |
-| `atr_regime` | ATR must be below/above a threshold (% of average) |
-| `bollinger` | Price must be above/below/inside Bollinger Bands |
+| `atr_regime` | ATR must be below a threshold (% of average). `min_consecutive_candles` requires ATR to have been low for N consecutive candles — confirms genuine consolidation, not a one-candle dip in volatility |
+| `bollinger` | Bollinger Band filters. `squeeze.max_bandwidth_pct`: BB bandwidth ((upper−lower)/mid×100) must be below this threshold — confirms price compression independent of ATR |
+| `breakout_candle` | Quality check on the entry candle itself. `body_ratio_min`: candle body must be ≥ X fraction of total range (filters wick fakeouts). `close_position_min`: close must be in the top X fraction of the candle's range (confirms conviction) |
 
 ```json
 "filters": {
@@ -65,8 +66,9 @@ Additional market data conditions that must be true on the same candle as the co
   "rsi": { "period": 14, "min": null, "max": 65 },
   "drawdown_from_high": { "lookback_days": 90, "min_drop_pct": 25.0 },
   "volume": { "avg_period": 20, "min_multiplier": 1.5 },
-  "atr_regime": { "period": 14, "avg_period": 30, "max_pct_of_avg": 70 },
-  "bollinger": null
+  "atr_regime": { "period": 14, "avg_period": 30, "max_pct_of_avg": 70, "min_consecutive_candles": 6 },
+  "bollinger": { "period": 20, "std_dev": 2.0, "squeeze": { "max_bandwidth_pct": 6.0 } },
+  "breakout_candle": { "body_ratio_min": 0.4, "close_position_min": 0.6 }
 }
 ```
 
@@ -141,7 +143,7 @@ Controls how entries are made and exits are managed.
 | `trailing_stop_pct` | Trail stop N% below highest close since entry — required |
 | `entry_order_type` | `limit` only (per system constraint) |
 | `entry_expiry_candles` | Cancel unfilled entry after N candles |
-| `partial_exit` | Take X% off position at Y% gain, trail the rest |
+| `partial_exit` | Take X% off position at Y% gain, trail the rest — fully implemented, use freely |
 | `max_hold_candles` | Force exit after N candles regardless of trailing stop |
 | `min_hold_candles` | Don't exit within N candles even if stop triggers |
 
@@ -225,7 +227,8 @@ The complete structure every stream's `parameters` column should conform to:
     "drawdown_from_high": null,
     "volume": null,
     "atr_regime": null,
-    "bollinger": null
+    "bollinger": null,
+    "breakout_candle": null
   },
   "regime": {
     "volatility_regime": null,
