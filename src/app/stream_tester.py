@@ -243,6 +243,28 @@ def load_stream_history() -> pd.DataFrame:
         return pd.DataFrame()
 
 
+def load_locked_streams() -> dict:
+    """Returns {stream_key: {description, grade, notes}} for streams locked into a model."""
+    try:
+        engine = get_engine()
+        with engine.connect() as conn:
+            rows = pd.read_sql(text("""
+                SELECT stream_name, stream_version, description, grade, notes
+                FROM backtest.streams
+            """), conn)
+        result = {}
+        for _, row in rows.iterrows():
+            key = f"{row['stream_name']} {row['stream_version']}"
+            result[key] = {
+                "description": row["description"],
+                "grade":       row["grade"],
+                "notes":       row["notes"],
+            }
+        return result
+    except Exception:
+        return {}
+
+
 KNOWN_STREAMS = [
     "Momentum Rider v1",
     "Dip Hunter v1",
@@ -706,7 +728,8 @@ with st.expander("📖 Glossary"):
 
 # ── Load data ─────────────────────────────────────────────────────────────────
 
-history = load_stream_history()
+history        = load_stream_history()
+locked_streams = load_locked_streams()
 
 # Group saved tests by run_number within each stream
 # run_groups[stream_name][run_number] = [list of test rows]
@@ -773,17 +796,42 @@ with st.sidebar:
         st.divider()
         rows = stream_runs[selected_run]
         try:
-            p        = rows[0]["parameters"] if isinstance(rows[0]["parameters"], dict) \
-                       else json.loads(rows[0]["parameters"])
-            compact  = _compact_config(p)
-            readable = _human_readable_description(p)
+            p       = rows[0]["parameters"] if isinstance(rows[0]["parameters"], dict) \
+                      else json.loads(rows[0]["parameters"])
+            compact = _compact_config(p)
         except Exception:
-            compact  = "—"
-            readable = "—"
+            p       = {}
+            compact = "—"
+
+        stream_key   = f"{rows[0]['stream_name']} {rows[0]['stream_version']}"
+        locked_info  = locked_streams.get(stream_key, {})
+        description  = locked_info.get("description")
+        locked_grade = locked_info.get("grade")
 
         st.markdown(f"**{rows[0]['stream_name']} {rows[0]['stream_version']}**")
-        st.caption(compact)
-        st.markdown(f"*{readable}*")
+
+        if locked_grade is not None:
+            _, gl, gc = grade_info(None)  # fallback; we'll use locked_grade directly
+            grade_labels = {5: "Grade 5 · Elite", 4: "Grade 4 · Strong",
+                            3: "Grade 3 · Passing", 2: "Grade 2 · Weak", 1: "Grade 1 · Poor"}
+            grade_colors = {5: "#00d4aa", 4: "#4ade80", 3: "#facc15", 2: "#fb923c", 1: "#f87171"}
+            gl = grade_labels.get(locked_grade, "—")
+            gc = grade_colors.get(locked_grade, "#555")
+            st.markdown(
+                f'<span class="grade-badge" style="background:{gc}22;color:{gc};'
+                f'border:1px solid {gc}66;font-size:0.75rem;padding:3px 10px;">'
+                f'🔒 Locked · {gl}</span>',
+                unsafe_allow_html=True
+            )
+
+        if description:
+            st.markdown(description)
+        else:
+            st.markdown(f"*{_human_readable_description(p)}*")
+
+        with st.expander("Signal details"):
+            st.caption(compact)
+
         st.divider()
 
         for row in rows:

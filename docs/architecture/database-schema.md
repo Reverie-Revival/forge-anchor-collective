@@ -120,7 +120,8 @@ Streams locked into a model after validation. One row per stream per model.
   locked_test_id  INTEGER REFERENCES backtest.stream_tests  -- winning run
   grade           SMALLINT               -- 1–5
   locked_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
-  notes           TEXT
+  description     TEXT                   -- plain-English explanation shown in Stream Tester sidebar
+  notes           TEXT                   -- key decisions / iteration summary
 ```
 
 ### backtest.model_tests

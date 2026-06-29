@@ -65,6 +65,7 @@ CREATE TABLE IF NOT EXISTS backtest.streams (
     locked_test_id  INTEGER REFERENCES backtest.stream_tests(test_id),
     grade           SMALLINT,
     locked_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    description     TEXT,
     notes           TEXT
 );
 
