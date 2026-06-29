@@ -61,7 +61,8 @@ CREATE TABLE IF NOT EXISTS backtest.streams (
     stream_version  VARCHAR(10) NOT NULL,
     strategy_type   VARCHAR(50) NOT NULL,
     parameters      JSONB NOT NULL,
-    slot_count      SMALLINT NOT NULL DEFAULT 2,
+    slot_count      SMALLINT NOT NULL DEFAULT 2,      -- max concurrent positions for this stream
+    lot_size_usd    NUMERIC(10,2) NOT NULL DEFAULT 10.00 CHECK (lot_size_usd >= 10.00),  -- $ per position; min $10 (Kraken order minimum + fee floor)
     locked_test_id  INTEGER REFERENCES backtest.stream_tests(test_id),
     grade           SMALLINT,
     locked_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -121,7 +122,7 @@ CREATE TABLE IF NOT EXISTS backtest.lots (
     model_test_id    INTEGER NOT NULL REFERENCES backtest.model_tests(model_test_id),
     model_id         INTEGER NOT NULL REFERENCES backtest.models(model_id),
     stream_id        INTEGER NOT NULL REFERENCES backtest.streams(stream_id),
-    slot_number      SMALLINT NOT NULL CHECK (slot_number IN (1, 2)),
+    slot_number      SMALLINT NOT NULL CHECK (slot_number >= 1),
     lot_sequence     INTEGER NOT NULL,
     status           VARCHAR(10) NOT NULL DEFAULT 'CASH' CHECK (status IN ('CASH', 'OPEN', 'CLOSED')),
     opening_capital  NUMERIC(12,2) NOT NULL,
@@ -163,14 +164,15 @@ CREATE TABLE IF NOT EXISTS live.streams (
     stream_version  VARCHAR(10) NOT NULL,
     strategy_type   VARCHAR(50) NOT NULL,
     parameters      JSONB NOT NULL,
-    slot_count      SMALLINT NOT NULL DEFAULT 2
+    slot_count      SMALLINT NOT NULL DEFAULT 2,      -- max concurrent positions for this stream
+    lot_size_usd    NUMERIC(10,2) NOT NULL DEFAULT 10.00 CHECK (lot_size_usd >= 10.00)  -- $ per position; min $10 (Kraken order minimum + fee floor)
 );
 
 CREATE TABLE IF NOT EXISTS live.lots (
     lot_id           BIGSERIAL PRIMARY KEY,
     model_id         INTEGER NOT NULL REFERENCES live.models(model_id),
     stream_id        INTEGER NOT NULL REFERENCES live.streams(stream_id),
-    slot_number      SMALLINT NOT NULL CHECK (slot_number IN (1, 2)),
+    slot_number      SMALLINT NOT NULL CHECK (slot_number >= 1),
     lot_sequence     INTEGER NOT NULL,
     status           VARCHAR(10) NOT NULL DEFAULT 'CASH' CHECK (status IN ('CASH', 'OPEN', 'CLOSED')),
     opening_capital  NUMERIC(12,2) NOT NULL,

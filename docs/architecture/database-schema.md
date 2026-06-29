@@ -116,13 +116,20 @@ Streams locked into a model after validation. One row per stream per model.
   stream_version  VARCHAR(10) NOT NULL    -- "v1", "v2"
   strategy_type   VARCHAR(50) NOT NULL
   parameters      JSONB NOT NULL          -- all tunable thresholds
-  slot_count      SMALLINT DEFAULT 2
+  slot_count      SMALLINT DEFAULT 2      -- max concurrent positions for this stream
+  lot_size_usd    NUMERIC(10,2) DEFAULT 10.00  -- $ per position; stream capital = slot_count × lot_size_usd
   locked_test_id  INTEGER REFERENCES backtest.stream_tests  -- winning run
   grade           SMALLINT               -- 1–5
   locked_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
   description     TEXT                   -- plain-English explanation shown in Stream Tester sidebar
   notes           TEXT                   -- key decisions / iteration summary
 ```
+
+**Capital allocation:** Each stream owns its slice of model capital independently.
+Total model capital = Σ(lot_size_usd × slot_count) across all streams.
+A model can have 3–5 streams — not necessarily 5. High-conviction streams can get more capital or more slots.
+**Minimum lot_size_usd: $10.** Below this, Kraken's minimum order size and the 0.50% round-trip fee make positions impractical. Enforced via CHECK constraint.
+Allocation is decided at model assembly, not during stream tuning — locked streams get placeholder defaults until model-level testing finalizes weights.
 
 ### backtest.model_tests
 

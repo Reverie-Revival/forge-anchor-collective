@@ -2,6 +2,7 @@ import pandas as pd
 import numpy as np
 
 _RESAMPLE_RULES = {"1h": "1h", "4h": "4h", "1d": "1D"}
+_CANDLES_PER_DAY = {"15m": 96, "1h": 24, "4h": 6, "1d": 1}
 
 
 def resample_ohlcv(df: pd.DataFrame, timeframe: str) -> pd.DataFrame:
@@ -83,6 +84,14 @@ def add_indicators(df: pd.DataFrame, params: dict) -> pd.DataFrame:
         df["volume_avg"] = volume_sma(df["volume"], avg_period)
         df["rsi"] = rsi(df["close"], 14)
 
+    if core == "rsi_recovery":
+        df["rsi"] = rsi(df["close"], core_p.get("rsi_period", 14))
+
+    if core == "fear_dip":
+        sma_period = core_p.get("sma_period")
+        if sma_period:
+            df["sma_dip"] = sma(df["close"], sma_period)
+
     if core == "sma_pullback":
         df["sma_pullback"] = sma(df["close"], core_p.get("pullback_sma", 50))
 
@@ -103,5 +112,13 @@ def add_indicators(df: pd.DataFrame, params: dict) -> pd.DataFrame:
     if tf_conf.get("sma_period"):
         col = f"tf_sma_{tf_conf['sma_period']}"
         df[col] = sma(df["close"], tf_conf["sma_period"])
+
+    dfh_f = filters.get("drawdown_from_high") or {}
+    if dfh_f:
+        tf = params.get("primary_timeframe", "15m")
+        cpd = _CANDLES_PER_DAY.get(tf, 96)
+        lookback = int(dfh_f.get("lookback_days", 30) * cpd)
+        peak = rolling_high(df["close"], lookback).shift(1)
+        df["drawdown_from_high_pct"] = (df["close"] - peak) / peak * 100
 
     return df

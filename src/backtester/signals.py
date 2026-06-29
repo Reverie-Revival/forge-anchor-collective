@@ -42,6 +42,11 @@ def _check_filters(row: pd.Series, prev_row: pd.Series, params: dict) -> bool:
         if fng.get("max") is not None and val > fng["max"]:
             return False
 
+    dfh_f = filters.get("drawdown_from_high") or {}
+    if dfh_f and "drawdown_from_high_pct" in row.index and not pd.isna(row["drawdown_from_high_pct"]):
+        if row["drawdown_from_high_pct"] > -(dfh_f.get("min_drop_pct", 15.0)):
+            return False
+
     return True
 
 
@@ -97,6 +102,29 @@ def generate_signals(df: pd.DataFrame, params: dict) -> pd.Series:
             if rsi_min.get("max") is not None:
                 rsi_ok = rsi_ok and row["rsi"] <= rsi_min["max"]
             fired = vol_ok and bullish and rsi_ok
+
+        elif core == "rsi_recovery":
+            # Fires on the candle where RSI crosses back UP through the threshold.
+            # Previous candle oversold, current candle recovering — the snap-back entry.
+            # Optional: require_bullish_candle confirms price is already moving up on entry.
+            threshold = core_p.get("rsi_threshold", 35)
+            if pd.isna(row.get("rsi")) or pd.isna(prev.get("rsi")):
+                continue
+            fired = prev["rsi"] < threshold and row["rsi"] >= threshold
+            if fired and core_p.get("require_bullish_candle", False):
+                fired = row["close"] > prev["close"]
+
+        elif core == "fear_dip":
+            dip_pct = core_p.get("dip_pct", 3.0) / 100.0
+            sma_period = core_p.get("sma_period")
+            if sma_period:
+                if pd.isna(row.get("sma_dip")):
+                    continue
+                fired = row["close"] < row["sma_dip"] * (1 - dip_pct)
+            else:
+                if pd.isna(prev.get("close")):
+                    continue
+                fired = row["close"] < prev["close"] * (1 - dip_pct)
 
         elif core == "sma_pullback":
             if pd.isna(row.get("sma_pullback")):

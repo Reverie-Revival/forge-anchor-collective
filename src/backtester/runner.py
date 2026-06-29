@@ -4,12 +4,27 @@ Run from Claude Code — results are written to a file the Streamlit app watches
 """
 import pickle
 import os
+import json
+import hashlib
 from pathlib import Path
 
 from .engine import run_backtest
 from .metrics import compute_metrics, btc_buy_and_hold
 
 LAST_RUN_PATH = Path(__file__).parent.parent / "app" / ".last_run.pkl"
+RUNS_DIR      = Path(__file__).parent.parent / "app" / "runs"
+
+
+def _strip_none(obj):
+    if isinstance(obj, dict):
+        return {k: _strip_none(v) for k, v in obj.items() if v is not None}
+    if isinstance(obj, list):
+        return [_strip_none(v) for v in obj]
+    return obj
+
+
+def _params_hash(params: dict) -> str:
+    return hashlib.md5(json.dumps(_strip_none(params), sort_keys=True).encode()).hexdigest()[:10]
 
 
 def run(params: dict, stream_name: str, start: str = None, end: str = None, n_slots: int = 2) -> dict:
@@ -40,6 +55,16 @@ def run(params: dict, stream_name: str, start: str = None, end: str = None, n_sl
     }
 
     with open(LAST_RUN_PATH, "wb") as f:
+        pickle.dump(payload, f)
+
+    # Also write a pending file so multiple windows of the same config
+    # all show as unsaved tabs simultaneously in the Stream Tester.
+    RUNS_DIR.mkdir(exist_ok=True)
+    ph        = _params_hash(params)
+    start_str = str(result["start"])[:10]
+    end_str   = str(result["end"])[:10]
+    pending   = RUNS_DIR / f"pending_{ph}_{start_str}_{end_str}.pkl"
+    with open(pending, "wb") as f:
         pickle.dump(payload, f)
 
     ann = metrics["annualized_return_pct"]

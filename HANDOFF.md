@@ -1,46 +1,71 @@
 # Handoff
 
-## Last session: 2026-06-28
+## Last session: 2026-06-29
 
 ---
 
 ## What was completed
 
-### Bug fixes
-- **Stream Tester metric colors:** All delta_color="inverse" bugs fixed — negative values now show red correctly across all performance and benchmark metrics.
-- **Ending Balance delta:** Removed `$` prefix from delta string so Streamlit parses sign correctly.
-- **Equity chart:** Line and fill now red when ending balance < starting balance.
-- **Latest Run tab:** Fixed regression where unsaved runs weren't visible. Stream Tester now shows a "⏳ Latest Run" tab immediately after a run, before saving. Python 3.9 type hint bug also fixed.
+### Dip Hunter v1 — designed, iterated, and locked
 
-### Model 1 — stream locking workflow established
-- `backtest.streams` schema extended: added `locked_test_id`, `grade`, `locked_at`, `description`, `notes`.
-- **Model 1 inserted** (`model_id=1`): "5 streams × 2 slots × $10 = $100. BTC/USD only. Limit orders. 0.25% maker fee."
-- **Momentum Rider v1 locked** as `stream_id=1`, Grade 5, `locked_test_id=3` (Primary 17.8%). Plain-English description stored in DB and shown in sidebar.
-- Stream Tester sidebar now shows: human-readable description from DB → locked grade badge → collapsible "Signal details" for the technical config.
+Full design journey this session:
 
-### Dip Hunter v1 — iteration in progress (not locked)
+- Built `rsi_recovery` core signal: fires on the specific candle where RSI crosses back UP through threshold (prev < 30, curr >= 30). Enters the bounce, not the continuous dip.
+- Built `drawdown_from_high` filter: requires price to have dropped ≥ N% from its N-day high. Configurable `lookback_days` + `min_drop_pct`. Uses pre-start warmup data.
+- Added `require_bullish_candle` option to `rsi_recovery`: also requires close > prev_close on entry candle. Adds second confirmation the bounce is actually happening.
+- Iterated to profitability on Primary: `rsi_dip` → `rsi_recovery` (win rate 29% → 46%) → added `min_hold_candles: 48` → added bullish candle filter (Full History +0.8% ann).
+- Confirmed complementarity: MR fires in bull (F&G>25, above 200 SMA, RSI>55). DH fires in bear/extreme fear (F&G<20, 25%+ drawdown from 90d high, RSI recovering). Zero signal overlap by design.
 
-Tested 4 configurations on Primary window (2019–2023). None are ready to lock.
+**Locked config — Dip Hunter v1 (stream_id=2, locked_test_id=10):**
+```python
+params = {
+    'primary_timeframe': '1h',
+    'core_signal': 'rsi_recovery',
+    'core_params': {
+        'rsi_period': 14,
+        'rsi_threshold': 30,
+        'require_bullish_candle': True,
+    },
+    'filters': {
+        'drawdown_from_high': {'lookback_days': 90, 'min_drop_pct': 25.0}
+    },
+    'position': {
+        'trailing_stop_pct': 7.5,
+        'entry_order_type': 'limit',
+        'entry_expiry_candles': 1,
+        'min_hold_candles': 48,
+    },
+    'sentiment': {'fear_greed': {'max': 20}}
+}
+```
 
-| Config | Ann. Return | PF | Win Rate | Notes |
-|---|---|---|---|---|
-| Base spec (15m, no filter) | -81.6% | 0.55 | 26.5% | 1,720 trades — total wipeout |
-| 1h candles, no filter | -82.4% | 0.38 | 24.4% | Still wipeout — timeframe wasn't the problem |
-| 1h + 200 SMA above + RSI<30 + 5% trail | -16.4% | 0.31 | 28.9% | Better but avg loser too large |
-| SMA Pullback (50 SMA, 1h, 200 above, 5% trail) | +3.3% | 1.01 | 33.2% | First profitable — but mirrors Momentum Rider |
+| Window | Trades | Ann. Return | Win Rate | PF | Max DD |
+|---|---|---|---|---|---|
+| Primary (2019–2023) | 78 | +17.5% | 46.2% | 1.43 | -32.1% |
+| Full History (2018–2026) | 150 | +8.9% | 44.0% | 1.34 | -32.1% |
+| 2026 YTD (bear) | 22 | -18.5% | 36.4% | 0.67 | -20.4% |
 
-**Key finding — SMA Pullback is the wrong direction:**
-Both SMA Pullback and Momentum Rider require price above 200 SMA. They both fire in bull markets and both sit out bears. High correlation = no diversification value. Adding this stream would just be doubling down on the same bet.
+2026 result context: BTC was -54% YTD. DH still meaningfully outperforms buy-and-hold. The loss reflects a grinding bear with no clean dip+recovery cycles — not a strategy flaw.
 
-**The right direction for Dip Hunter:**
-Dip Hunter should fire in the conditions Momentum Rider explicitly excludes:
-- MR excludes: F&G < 25, price below 200 SMA, RSI < 55
-- Dip Hunter should target: F&G in fear/extreme fear — the exact moment MR goes quiet
+### Indicator warmup — fixed systemically
 
-True complementarity design:
-- MR fires when: F&G > 25, above 200 SMA, RSI > 55 → bull momentum
-- DH should fire when: F&G < 25, RSI oversold → fear bounce / panic snap-back
-- They would **never fire at the same time** — genuine regime separation
+`engine.py` now loads pre-start warmup data for every run. `_warmup_days(params)` computes the required lookback from all active indicators/filters. Data is loaded from `start - warmup_days`, indicators computed on the full dataset, then clipped to `start` before signals run. Day 1 of any window now has correct values for all rolling indicators (drawdown_from_high, SMA, ATR, etc.).
+
+### Stream Tester — refactored and features added
+
+Split `stream_tester.py` (1083 lines) into four focused modules:
+- `src/app/utils.py` — pure helpers (params_hash, label_window, grade_info, compact config, human-readable description)
+- `src/app/db.py` — all DB operations and path constants
+- `src/app/dashboard.py` — `render_dashboard` only
+- `src/app/stream_tester.py` — page layout, glossary, sidebar, main area (432 lines)
+
+New **Parameter Reference** expander in the app — shows every configurable attribute (core signals, filters, position params) with descriptions and valid values. Good reference when designing new streams.
+
+Fixed S&P 500 benchmark: yfinance now returns MultiIndex columns — flattened before use.
+
+Fixed params hash normalization: `_strip_none()` removes null fields before hashing so `{"a": 1, "b": null}` and `{"a": 1}` hash identically. Re-running a saved config with slightly different null handling now correctly groups as the same run.
+
+Fixed `__new__` tab rendering: unsaved runs with new params now show all pending windows as tabs (not just the single latest run).
 
 ---
 
@@ -50,70 +75,55 @@ True complementarity design:
 
 | # | Stream | Grade | Status |
 |---|---|---|---|
-| 1 | Momentum Rider v1 | 5 — Elite | Locked ✓ |
-| 2 | Dip Hunter v1 | — | Iterating |
+| 1 | Momentum Rider v1 | 4 — Strong | Locked ✓ (stream_id=1) |
+| 2 | Dip Hunter v1 | 4 — Strong | Locked ✓ (stream_id=2) |
 | 3 | Breakout Scout v1 | — | Not started |
 | 4 | Steady Climber v1 | — | Not started |
 | 5 | Surge Rider v1 | — | Not started |
 
-**`backtest.stream_tests` — 5 rows (all Momentum Rider v1). No Dip Hunter rows saved yet.**
+Note: Model 1 doesn't need all 5 streams. If 3 well-differentiated streams cover the regimes well, that's the right call. Allocation (lot_size_usd, slot_count) is decided at model assembly, not stream tuning.
 
-The SMA Pullback result is currently showing as "⏳ Latest Run" in Stream Tester (Dip Hunter v1 tab) but has NOT been saved — don't save it, it's the wrong approach.
+**`backtest.stream_tests` — 12 rows.** MR v1 (test_ids 1–5), DH v1 (test_ids 6–12).
 
 ---
 
 ## What's next
 
-### 1. Dip Hunter v1 — test the "fear bounce" design
+### 1. Design stream 3 — think about regime gaps first
 
-Run this config on Primary first:
+With MR and DH locked, the covered regimes are:
+- **Bull momentum** (MR): F&G > 25, above 200 SMA, RSI > 55
+- **Bear/fear bounce** (DH): F&G < 20, 25%+ drawdown from 90d high, RSI recovering
 
-```python
-params = {
-    'primary_timeframe': '1h',
-    'core_signal': 'rsi_dip',
-    'core_params': {
-        'rsi_period': 14,
-        'rsi_threshold': 35,
-        'sma_period': 20,
-        'dip_pct': 2.0
-    },
-    'filters': {
-        'trend_context': None,   # NO 200 SMA filter — must fire in downtrends too
-        'rsi': None,
-        'volume': None,
-        'atr_regime': None,
-        'bollinger': None
-    },
-    'position': {
-        'trailing_stop_pct': 3.0,
-        'entry_order_type': 'limit',
-        'entry_expiry_candles': 1,
-    },
-    'sentiment': {
-        'fear_greed': {'min': None, 'max': 30}  # ONLY trade when F&G < 30 (fear zone)
-    }
-}
-```
+Gaps to consider for stream 3:
+- **Neutral / transitional regime**: neither bull nor extreme fear — sideways/consolidation with no clear directional bias
+- **Breakout from range**: consolidation breaks (Breakout Scout spec exists in `docs/specs/streams/`)
+- **Trend continuation pull-back**: price in uptrend, pulls back to SMA then bounces (different from MR which is crossover-based)
 
-Key questions to answer from results:
-- Does it fire more in 2022 bear / 2026 YTD? (It should)
-- Is the win rate reasonable (target > 35%)?
-- Does the equity curve look different from Momentum Rider? (It must)
+Read the existing stream specs in `docs/specs/streams/` before designing — the groundwork was laid earlier.
 
-Iterate from there — try F&G < 25 vs < 35, RSI < 30 vs < 35, trail 2.5% vs 3% vs 5%.
+### 2. Model assembly (after all streams locked)
+- Set `lot_size_usd` and `slot_count` per stream in `backtest.streams`
+- Total must sum to $100
+- Run model-level backtest across all streams simultaneously (`backtest.model_tests`)
+- Only after model-level test passes → deployment-ready
 
-### 2. Once Dip Hunter is locked
-Same workflow as MR: insert into `backtest.streams` (model_id=1), update spec file status, write plain-English description.
-
-### Complementarity reminder
-Momentum Rider thrives: bull market, F&G > 25, RSI > 55, above 200 SMA.
-Dip Hunter must cover: bear market, extreme fear, F&G < 25, panic conditions.
-They should never fire at the same time — that's the test of true complementarity.
+### 3. Reporting dashboard
+Second Streamlit page comparing streams side-by-side and model-level performance.
 
 ---
 
-## Files changed this session
-- `src/app/stream_tester.py` — metric color fixes, latest run tab, sidebar description overhaul
-- `src/data/schema.sql` — backtest.streams new columns
-- `docs/architecture/database-schema.md` — schema doc updated
+## Key files
+
+| File | Purpose |
+|---|---|
+| `src/backtester/engine.py` | Backtest engine — `_warmup_days()` + `run_backtest()` |
+| `src/backtester/signals.py` | All core signals including `rsi_recovery` with `require_bullish_candle` |
+| `src/backtester/indicators.py` | `drawdown_from_high`, RSI, EMA, SMA, ATR |
+| `src/backtester/runner.py` | `run()` — call from Claude Code to push results to Stream Tester |
+| `src/app/stream_tester.py` | Main Streamlit app (slim orchestrator) |
+| `src/app/utils.py` | Helpers: params_hash, label_window, grade_info, descriptions |
+| `src/app/db.py` | DB ops: load/save stream tests, pending run management |
+| `src/app/dashboard.py` | render_dashboard — all charts and metrics |
+| `docs/architecture/stream-attributes.md` | Full attribute reference — keep updated as new signals/filters added |
+| `docs/specs/streams/` | Stream specs written pre-build |

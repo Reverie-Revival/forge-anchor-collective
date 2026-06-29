@@ -27,7 +27,9 @@ Every stream has exactly one core signal. This is what the stream fundamentally 
 | Signal | Description |
 |---|---|
 | `ema_crossover` | Short EMA crosses above long EMA |
-| `rsi_dip` | RSI drops below threshold while price is below SMA |
+| `rsi_recovery` | RSI crosses *back up* through threshold after being oversold — enters the bounce, not the fall |
+| `rsi_dip` | RSI drops below threshold while price is below SMA — continuous oversold entry |
+| `fear_dip` | Price drops N% below SMA (or prev candle) — no RSI required |
 | `range_breakout` | Price breaks above N-candle high after consolidation |
 | `volume_surge` | Volume spike + bullish candle + RSI in active range |
 | `sma_pullback` | Pullback to SMA in confirmed uptrend |
@@ -52,6 +54,7 @@ Additional market data conditions that must be true on the same candle as the co
 |---|---|
 | `trend_context` | Price must be above or below a long SMA |
 | `rsi` | RSI must fall within a min/max range |
+| `drawdown_from_high` | Price must have dropped ≥ N% from its recent high — requires a real crash, not a routine dip |
 | `volume` | Volume must exceed N× average |
 | `atr_regime` | ATR must be below/above a threshold (% of average) |
 | `bollinger` | Price must be above/below/inside Bollinger Bands |
@@ -60,6 +63,7 @@ Additional market data conditions that must be true on the same candle as the co
 "filters": {
   "trend_context": { "sma_period": 200, "require": "above" },
   "rsi": { "period": 14, "min": null, "max": 65 },
+  "drawdown_from_high": { "lookback_days": 90, "min_drop_pct": 25.0 },
   "volume": { "avg_period": 20, "min_multiplier": 1.5 },
   "atr_regime": { "period": 14, "avg_period": 30, "max_pct_of_avg": 70 },
   "bollinger": null
@@ -218,6 +222,7 @@ The complete structure every stream's `parameters` column should conform to:
   "filters": {
     "trend_context": null,
     "rsi": null,
+    "drawdown_from_high": null,
     "volume": null,
     "atr_regime": null,
     "bollinger": null

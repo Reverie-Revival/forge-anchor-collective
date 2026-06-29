@@ -1,16 +1,61 @@
 import os
+import math
 import pandas as pd
 import numpy as np
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
 
-from .indicators import add_indicators, resample_ohlcv
+from .indicators import add_indicators, resample_ohlcv, _CANDLES_PER_DAY
 from .signals import generate_signals
 from src.data.sentiment import load_sentiment
 
 load_dotenv()
 
 MAKER_FEE = 0.0025  # 0.25% per side
+
+
+def _warmup_days(params: dict) -> int:
+    """
+    Compute how many extra calendar days of pre-start data are needed so that
+    every indicator has a full lookback window on the first signal candle.
+    """
+    tf  = params.get("primary_timeframe", "15m")
+    cpd = _CANDLES_PER_DAY.get(tf, 96)
+
+    filters = params.get("filters") or {}
+    core    = params.get("core_signal", "")
+    core_p  = params.get("core_params") or {}
+
+    candles = 0
+
+    # drawdown_from_high — often the largest lookback
+    dfh = filters.get("drawdown_from_high") or {}
+    if dfh:
+        candles = max(candles, int(dfh.get("lookback_days", 30) * cpd))
+
+    # trend SMA filter (e.g. 200-period)
+    tc = filters.get("trend_context") or {}
+    if tc.get("sma_period"):
+        candles = max(candles, int(tc["sma_period"]))
+
+    # signal-specific lookbacks
+    if core == "ema_crossover":
+        candles = max(candles, int(core_p.get("ema_long", 50)))
+    elif core == "range_breakout":
+        candles = max(candles, int(core_p.get("breakout_lookback", 48)))
+    elif core == "sma_pullback":
+        candles = max(candles, int(core_p.get("pullback_sma", 50)))
+        candles = max(candles, int(core_p.get("trend_sma", 200)))
+
+    # volume / ATR filters
+    vol_f = filters.get("volume") or {}
+    if vol_f.get("avg_period"):
+        candles = max(candles, int(vol_f["avg_period"]))
+    atr_f = filters.get("atr_regime") or {}
+    if atr_f.get("period"):
+        candles = max(candles, int(atr_f["period"]) + int(atr_f.get("avg_period", 30)))
+
+    return math.ceil(candles / cpd) + 1  # +1 day safety buffer
 
 
 def load_market_data(start: str = None, end: str = None) -> pd.DataFrame:
@@ -168,18 +213,32 @@ def run_backtest(
       - params: the stream config used
       - stream_name: label for display
     """
-    df = load_market_data(start, end)
+    # Load extra warmup data so every indicator has a full lookback window on day 1.
+    # Indicators are computed on the full dataset; signals are clipped to [start, end].
     primary_tf = params.get("primary_timeframe")
+    warmup     = _warmup_days(params)
+    load_start = (
+        (pd.Timestamp(start) - pd.Timedelta(days=warmup)).strftime("%Y-%m-%d")
+        if start and warmup > 0 else start
+    )
+
+    df = load_market_data(load_start, end)
     if primary_tf:
         df = resample_ohlcv(df, primary_tf)
 
     # Join F&G sentiment if the stream uses it
     if params.get("sentiment"):
-        fng_map = load_sentiment(start, end)
+        fng_map = load_sentiment(load_start, end)
         df["fng_value"] = df.index.date
         df["fng_value"] = df["fng_value"].map(fng_map)
 
     df = add_indicators(df, params)
+
+    # Clip to original start — warmup rows are dropped after indicators are computed
+    if start:
+        clip_ts = pd.Timestamp(start)
+        df = df[df.index >= clip_ts]
+
     signals = generate_signals(df, params)
 
     capital_per_slot = 10.0

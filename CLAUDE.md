@@ -6,7 +6,11 @@ with zero human intervention.
 
 ## Architecture
 
-Each **Model** consists of 5 strategy streams × 2 position slots = 10 independent $10 positions ($100 total).
+Each **Model** deploys with $100 total capital, split across 3–5 strategy streams.
+Capital allocation is configurable per stream: each stream has its own `lot_size_usd` ($ per position) and `slot_count` (max concurrent positions).
+Total model capital = Σ(lot_size_usd × slot_count) across all streams.
+Default starting point: $10/lot × 2 slots per stream — but high-conviction streams can be weighted heavier.
+**Minimum lot size: $10 per slot.** Positions below $10 are impractical given Kraken's minimum order sizes and the 0.50% round-trip fee eating a disproportionate share of a small position.
 Models are versioned, deployed independently, and run in parallel with separate capital.
 
 ### Streams
@@ -50,6 +54,15 @@ Every deployed model runs for the full duration of its experiment regardless of 
 - **Gate to deploy** — backtest confidence, not calendar time
 
 There is no mandatory paper trading phase. $100 is low enough that live deployment IS the real-world test.
+
+### Stream locking vs. model finalization
+
+These are two distinct steps:
+
+1. **Lock a stream** — the stream's signal is validated in isolation. It's approved as a candidate for this model. `backtest.streams` row is written. Allocation (lot_size_usd, slot_count) gets a default placeholder.
+2. **Finalize a model** — all candidate streams assembled together, allocation weights set per stream, then model-level backtest runs all streams simultaneously. Only after model-level testing passes does the model become deployment-ready.
+
+Locking streams early is fine and expected — it's how we build up the model piece by piece. But no stream's allocation is truly decided until model assembly, when we can see how the streams interact and how much each one fires.
 
 ## Tech Stack
 
