@@ -26,10 +26,11 @@ def _render_save(payload, result, display_name, params, metrics, initial_capital
                 ending_balance=ending_capital, payload=payload,
                 window_name=save_window, notes=save_notes, history=history_df,
             )
+            ann_pct = metrics["annualized_return_pct"]
+            ann_str = f"{ann_pct:+.1f}% annualized" if ann_pct is not None else "no trades"
             st.success(
                 f"Saved — Run #{run_num} · {win_nm} · **{display_name}** · "
-                f"{metrics['total_trades']} trades · "
-                f"{metrics['annualized_return_pct']:+.1f}% annualized."
+                f"{metrics['total_trades']} trades · {ann_str}."
             )
             st.cache_data.clear()
             st.rerun()
