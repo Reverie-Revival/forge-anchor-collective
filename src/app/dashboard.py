@@ -8,6 +8,35 @@ from .utils import SP500_HISTORICAL_AVG, fetch_sp500, candle_hours, grade_info, 
 from .db import load_stream_history, save_stream_test
 
 
+def _render_save(payload, result, display_name, params, metrics, initial_capital, ending_capital, key_prefix):
+    st.divider()
+    st.subheader("💾 Save This Run")
+    auto_window = label_window(result["start"], result["end"])
+    sc1, sc2 = st.columns([1, 2])
+    save_window = sc1.text_input("Window name", value=auto_window,
+                                 key=f"{key_prefix}_window")
+    save_notes  = sc2.text_input("Notes (optional)", key=f"{key_prefix}_notes",
+                                 placeholder="e.g. bullish candle filter adds +0.8% annualized")
+    if st.button("Save to Database", type="secondary", key=f"{key_prefix}_save"):
+        try:
+            history_df = load_stream_history()
+            test_id, run_num, win_nm = save_stream_test(
+                stream_name=display_name, params=params, result=result,
+                metrics=metrics, initial_capital=initial_capital,
+                ending_balance=ending_capital, payload=payload,
+                window_name=save_window, notes=save_notes, history=history_df,
+            )
+            st.success(
+                f"Saved — Run #{run_num} · {win_nm} · **{display_name}** · "
+                f"{metrics['total_trades']} trades · "
+                f"{metrics['annualized_return_pct']:+.1f}% annualized."
+            )
+            st.cache_data.clear()
+            st.rerun()
+        except Exception as e:
+            st.error(f"Save failed: {e}")
+
+
 def render_dashboard(payload: dict, show_save: bool = True, key_prefix: str = "dash"):
     result          = payload["result"]
     trades          = payload["trades"]
@@ -23,14 +52,16 @@ def render_dashboard(payload: dict, show_save: bool = True, key_prefix: str = "d
     ann             = metrics["annualized_return_pct"]
     _, grade_label, grade_color = grade_info(ann)
 
-    if trades.empty or metrics["total_trades"] == 0:
-        st.warning("No trades were generated with these settings.")
-        return
+    has_trades = not trades.empty and metrics["total_trades"] > 0
 
-    closed = trades[trades["exit_reason"] != "partial"].sort_values("exit_ts").copy()
-    closed["return_pct"] = (
-        (closed["exit_price"] - closed["entry_price"]) / closed["entry_price"] * 100
-    )
+    if not has_trades:
+        st.warning("No trades were generated with these settings.")
+
+    if has_trades:
+        closed = trades[trades["exit_reason"] != "partial"].sort_values("exit_ts").copy()
+        closed["return_pct"] = (
+            (closed["exit_price"] - closed["entry_price"]) / closed["entry_price"] * 100
+        )
 
     # Header
     col_title, col_grade = st.columns([3, 1])
@@ -95,6 +126,11 @@ def render_dashboard(payload: dict, show_save: bool = True, key_prefix: str = "d
               delta_color="normal")
 
     st.divider()
+
+    if not has_trades:
+        if show_save:
+            _render_save(payload, result, display_name, params, metrics, initial_capital, ending_capital, key_prefix)
+        return
 
     # Trade stats
     st.markdown('<p class="section-label">Trade Statistics</p>', unsafe_allow_html=True)
@@ -246,29 +282,4 @@ def render_dashboard(payload: dict, show_save: bool = True, key_prefix: str = "d
         )
 
     if show_save:
-        st.divider()
-        st.subheader("💾 Save This Run")
-        auto_window = label_window(result["start"], result["end"])
-        sc1, sc2 = st.columns([1, 2])
-        save_window = sc1.text_input("Window name", value=auto_window,
-                                     key=f"{key_prefix}_window")
-        save_notes  = sc2.text_input("Notes (optional)", key=f"{key_prefix}_notes",
-                                     placeholder="e.g. bullish candle filter adds +0.8% annualized")
-        if st.button("Save to Database", type="secondary", key=f"{key_prefix}_save"):
-            try:
-                history_df = load_stream_history()
-                test_id, run_num, win_nm = save_stream_test(
-                    stream_name=display_name, params=params, result=result,
-                    metrics=metrics, initial_capital=initial_capital,
-                    ending_balance=ending_capital, payload=payload,
-                    window_name=save_window, notes=save_notes, history=history_df,
-                )
-                st.success(
-                    f"Saved — Run #{run_num} · {win_nm} · **{display_name}** · "
-                    f"{metrics['total_trades']} trades · "
-                    f"{metrics['annualized_return_pct']:+.1f}% annualized."
-                )
-                st.cache_data.clear()
-                st.rerun()
-            except Exception as e:
-                st.error(f"Save failed: {e}")
+        _render_save(payload, result, display_name, params, metrics, initial_capital, ending_capital, key_prefix)
