@@ -47,6 +47,31 @@ def _check_filters(row: pd.Series, prev_row: pd.Series, params: dict) -> bool:
         if row["drawdown_from_high_pct"] > -(dfh_f.get("min_drop_pct", 15.0)):
             return False
 
+    bb_f = filters.get("bollinger") or {}
+    if bb_f and "bb_bandwidth" in row.index and not pd.isna(row["bb_bandwidth"]):
+        squeeze = bb_f.get("squeeze") or {}
+        if squeeze.get("max_bandwidth_pct") is not None:
+            if row["bb_bandwidth"] > squeeze["max_bandwidth_pct"]:
+                return False
+
+    bc_f = filters.get("breakout_candle") or {}
+    if bc_f:
+        candle_range = row["high"] - row["low"]
+        if candle_range > 0:
+            if bc_f.get("body_ratio_min") is not None:
+                body = abs(row["close"] - row["open"])
+                if body / candle_range < bc_f["body_ratio_min"]:
+                    return False
+            if bc_f.get("close_position_min") is not None:
+                close_pos = (row["close"] - row["low"]) / candle_range
+                if close_pos < bc_f["close_position_min"]:
+                    return False
+
+    atr_f = filters.get("atr_regime") or {}
+    if atr_f.get("min_consecutive_candles") and "atr_low_streak" in row.index and not pd.isna(row["atr_low_streak"]):
+        if row["atr_low_streak"] < atr_f["min_consecutive_candles"]:
+            return False
+
     return True
 
 

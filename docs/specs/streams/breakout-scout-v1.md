@@ -27,7 +27,21 @@ ATR below 70% of its 30-period average confirms genuine consolidation. A close a
 - Wide 4% trail gives back meaningful profit on reversal
 - Stays mostly idle in high-volatility regimes (ATR filter rarely triggers)
 
-## Parameters
+## Available Attributes for Iteration
+
+These attributes are built and ready to tune on this stream:
+
+| Attribute | Purpose | Notes |
+|---|---|---|
+| `atr_regime.min_consecutive_candles` | Confirm consolidation has persisted for N candles | Reduces entries after a single quiet candle |
+| `bollinger.squeeze.max_bandwidth_pct` | Second compression signal — BB bands must be tight | Works alongside ATR; both must agree |
+| `breakout_candle.body_ratio_min` | Body must be ≥ N% of candle range | Filters wick fakeouts — weak-bodied candles excluded |
+| `breakout_candle.close_position_min` | Close must be in top N% of candle range | Confirms conviction on the breakout candle |
+| `partial_exit` | Take X% off at Y% gain, trail the rest | Lock profit on the initial pop, let remainder run |
+| `volume` | Require above-average volume on breakout candle | High-volume breakouts fail far less often |
+| `sentiment.fear_greed` | Gate on market sentiment | e.g. only break out above F&G 40 (neutral or higher) |
+
+## Starting Parameters
 
 ```json
 {
@@ -40,7 +54,8 @@ ATR below 70% of its 30-period average confirms genuine consolidation. A close a
     "rsi": null,
     "volume": null,
     "atr_regime": { "period": 14, "avg_period": 30, "max_pct_of_avg": 70 },
-    "bollinger": null
+    "bollinger": null,
+    "breakout_candle": null
   },
   "regime": null,
   "timeframe_confirmation": null,

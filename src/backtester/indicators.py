@@ -54,6 +54,16 @@ def rolling_high(series: pd.Series, period: int) -> pd.Series:
     return series.rolling(window=period).max()
 
 
+def bollinger_bands(series: pd.Series, period: int = 20, std_dev: float = 2.0) -> pd.DataFrame:
+    mid = sma(series, period)
+    std = series.rolling(window=period).std()
+    upper = mid + std_dev * std
+    lower = mid - std_dev * std
+    bandwidth = (upper - lower) / mid * 100  # % of price
+    return pd.DataFrame({"bb_mid": mid, "bb_upper": upper, "bb_lower": lower, "bb_bandwidth": bandwidth},
+                        index=series.index)
+
+
 def add_indicators(df: pd.DataFrame, params: dict) -> pd.DataFrame:
     """Compute all indicators required by a stream's parameter config."""
     df = df.copy()
@@ -108,6 +118,17 @@ def add_indicators(df: pd.DataFrame, params: dict) -> pd.DataFrame:
     if atr_f.get("period"):
         df["atr"] = atr(df, atr_f["period"])
         df["atr_avg"] = sma(df["atr"], atr_f.get("avg_period", 30))
+        if atr_f.get("min_consecutive_candles"):
+            max_pct = atr_f.get("max_pct_of_avg", 70) / 100.0
+            is_low = df["atr"] < df["atr_avg"] * max_pct
+            streak = is_low.groupby((~is_low).cumsum()).cumcount() + 1
+            streak[~is_low] = 0
+            df["atr_low_streak"] = streak
+
+    bb_f = filters.get("bollinger") or {}
+    if bb_f:
+        bb = bollinger_bands(df["close"], bb_f.get("period", 20), bb_f.get("std_dev", 2.0))
+        df = df.join(bb)
 
     if tf_conf.get("sma_period"):
         col = f"tf_sma_{tf_conf['sma_period']}"
