@@ -894,14 +894,57 @@ def load_pending_runs(run_rows: list) -> list:
     return pending
 
 
+def load_latest_run(selected_stream: str):
+    """Load .last_run.pkl if it exists and matches the currently selected stream."""
+    if not LAST_RUN_PATH.exists():
+        return None
+    try:
+        with open(LAST_RUN_PATH, "rb") as f:
+            payload = pickle.load(f)
+        name = payload.get("stream_name", "")
+        # Match "Dip Hunter v1" against selected_stream "Dip Hunter v1"
+        if name.strip() == selected_stream.strip():
+            return payload
+    except Exception:
+        pass
+    return None
+
+
 # ── Main area ─────────────────────────────────────────────────────────────────
 
 if selected_run is not None and selected_run in stream_runs:
     saved_rows   = stream_runs[selected_run]
     pending_runs = load_pending_runs(saved_rows)
+    latest_run   = load_latest_run(selected_stream)
 
-    # Build tab list: saved windows first, then unsaved pending
+    # Determine if latest run is already represented (saved or pending)
+    latest_already_shown = False
+    if latest_run:
+        lr = latest_run["result"]
+        lr_start = str(lr["start"])[:10]
+        lr_end   = str(lr["end"])[:10]
+        lr_ph    = params_hash(latest_run["params"])
+        for row in saved_rows:
+            try:
+                p = row["parameters"] if isinstance(row["parameters"], dict) \
+                    else json.loads(row["parameters"])
+                if (params_hash(p) == lr_ph
+                        and str(row["test_start"])[:10] == lr_start
+                        and str(row["test_end"])[:10] == lr_end):
+                    latest_already_shown = True
+                    break
+            except Exception:
+                pass
+        if not latest_already_shown:
+            for pr in pending_runs:
+                if pr["start"] == lr_start and pr["end"] == lr_end:
+                    latest_already_shown = True
+                    break
+
+    # Build tab list: latest run first (if new), then saved, then pending
     tab_entries = []
+    if latest_run and not latest_already_shown:
+        tab_entries.append({"label": "⏳ Latest Run", "type": "latest", "data": latest_run})
     for row in saved_rows:
         lbl = row.get("window_name") or label_window(row["test_start"], row["test_end"])
         tab_entries.append({"label": lbl, "type": "saved", "data": row})
@@ -921,7 +964,10 @@ if selected_run is not None and selected_run in stream_runs:
 
     for tab, entry in zip(tabs, tab_entries):
         with tab:
-            if entry["type"] == "saved":
+            if entry["type"] == "latest":
+                render_dashboard(entry["data"], show_save=True, key_prefix="latest_run")
+
+            elif entry["type"] == "saved":
                 row     = entry["data"]
                 test_id = int(row["test_id"])
                 payload = load_run_payload(test_id)
@@ -960,4 +1006,11 @@ if selected_run is not None and selected_run in stream_runs:
                 # via st.rerun; pending file cleaned up on next load since it's now in saved_windows)
 
 else:
-    st.info("Waiting for a run from Claude Code. Results will appear here automatically.")
+    # No saved runs for this stream — check if there's a latest run to show
+    latest_run = load_latest_run(selected_stream)
+    if latest_run:
+        tabs = st.tabs(["⏳ Latest Run"])
+        with tabs[0]:
+            render_dashboard(latest_run, show_save=True, key_prefix="latest_run_new")
+    else:
+        st.info("Waiting for a run from Claude Code. Results will appear here automatically.")
