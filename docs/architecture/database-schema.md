@@ -1,9 +1,9 @@
 # Database Schema
 
 **Database:** `forge_anchor` (PostgreSQL, local during build, server when live)
-**Schemas:** `backtest`, `live`, `reporting` + shared `market_data` table
+**Schemas:** `backtest`, `live`, `reporting` + shared `market_data` / `timeframe_presets` tables
 
-> **Status:** Early development — schema is subject to change. Live schema is designed but not yet built.
+> **Status:** v2 architecture. `live` schema is designed but not yet built.
 
 ---
 
@@ -45,6 +45,34 @@ Candles before Feb 2018 have no corresponding row — the backtester skips the s
 
 ---
 
+### timeframe_presets
+
+Standard date windows used across stream tests and model tests. Replaces free-text `window_name` — tests reference a preset by FK so the window definition is consistent and queryable.
+
+```sql
+timeframe_presets
+  preset_id    SERIAL PRIMARY KEY
+  name         VARCHAR(50) NOT NULL UNIQUE   -- "Primary Window", "Full History", etc.
+  start_date   DATE NOT NULL
+  end_date     DATE                          -- NULL = open-ended (runs to present)
+  description  TEXT
+  is_active    BOOLEAN NOT NULL DEFAULT TRUE
+  created_at   TIMESTAMPTZ DEFAULT NOW()
+```
+
+**Standard presets (seeded):**
+
+| Name | Start | End | Purpose |
+|---|---|---|---|
+| Primary Window | 2019-01-01 | 2023-12-31 | Main gate: varied regimes (bull/bear/recovery) |
+| Full History | 2018-01-01 | open | All available data including sentiment coverage |
+| Recent | 2024-01-01 | open | Post-halving behavior, 2025 ATH cycle |
+| 2026 YTD | 2026-01-01 | open | Current year performance |
+
+Custom date ranges are always available for one-off tests and are stored directly as `custom_start`/`custom_end` timestamps on the test row.
+
+---
+
 ## backtest schema
 
 Two types of testing live here:
@@ -60,19 +88,22 @@ Freely rebuilt during development. Never contains real money.
 Captures every stream tuning run you choose to save. One row per saved test.
 Stores the full parameter config and all key performance metrics for comparison.
 
-`run_number` groups tests with identical parameters (same config, different date windows). `window_name` labels the date range: Primary / Full History / Recent / custom.
+`run_number` groups tests with identical parameters (same config, different date windows). Date range is either a `preset_id` FK (standard window) or explicit `custom_start`/`custom_end` — exactly one must be set (CHECK constraint enforced).
 
 ```sql
   test_id               SERIAL PRIMARY KEY
   stream_name           VARCHAR(100) NOT NULL     -- e.g. "Momentum Rider"
   stream_version        VARCHAR(20) NOT NULL      -- "v1", "v2"
   run_number            INTEGER                   -- groups same-config tests (1, 2, 3...)
-  window_name           VARCHAR(50)               -- "Primary", "Full History", "Recent"
+  preset_id             INTEGER REFERENCES timeframe_presets  -- standard window FK
+  custom_start          TIMESTAMPTZ               -- set only when not using a preset
+  custom_end            TIMESTAMPTZ               -- null = open-ended custom range
+  simulation_start      TIMESTAMPTZ               -- actual first candle after warmup clip
+  simulation_end        TIMESTAMPTZ               -- actual last candle
+  slot_count            SMALLINT NOT NULL DEFAULT 1  -- max concurrent positions
+  slot_mode             VARCHAR(30) NOT NULL DEFAULT 'single'  -- 'single' | 'scale_down' | 'scale_up'
   parameters            JSONB NOT NULL            -- full config snapshot at test time
-  test_start            TIMESTAMPTZ               -- backtest date range start
-  test_end              TIMESTAMPTZ               -- backtest date range end
-  n_slots               SMALLINT NOT NULL         -- 1 or 2
-  initial_capital       NUMERIC(10,2) NOT NULL    -- starting $ (n_slots × $10)
+  initial_capital       NUMERIC(10,2) NOT NULL    -- starting $ (lot_size_usd × slot_count)
   ending_balance        NUMERIC(10,4)             -- final $ after all trades
   total_trades          INTEGER
   win_rate              NUMERIC(5,4)              -- 0.0 to 1.0
@@ -90,6 +121,8 @@ Stores the full parameter config and all key performance metrics for comparison.
 
 No per-trade detail here — just summary metrics. Designed for fast iteration and comparison.
 A full pkl payload is stored at `src/app/runs/{test_id}.pkl` for chart rendering in the stream tester.
+
+**`timeframe_label`** is computed at query time via `COALESCE(tp.name, formatted_custom_dates)` — not stored.
 
 ---
 
@@ -116,9 +149,10 @@ Streams locked into a model after validation. One row per stream per model.
   stream_version  VARCHAR(10) NOT NULL    -- "v1", "v2"
   strategy_type   VARCHAR(50) NOT NULL
   parameters      JSONB NOT NULL          -- all tunable thresholds
-  slot_count      SMALLINT DEFAULT 2      -- max concurrent positions for this stream
-  lot_size_usd    NUMERIC(10,2) DEFAULT 10.00  -- $ per position; stream capital = slot_count × lot_size_usd
-  locked_test_id  INTEGER REFERENCES backtest.stream_tests  -- winning run
+  slot_count      SMALLINT NOT NULL DEFAULT 1   -- max concurrent positions
+  slot_mode       VARCHAR(30) NOT NULL DEFAULT 'single'  -- 'single' | 'scale_down' | 'scale_up'
+  lot_size_usd    NUMERIC(10,2) DEFAULT 10.00   -- $ per position; CHECK >= 10
+  locked_test_id  INTEGER REFERENCES backtest.stream_tests  -- winning Primary window run
   grade           SMALLINT               -- 1–5
   locked_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
   description     TEXT                   -- plain-English explanation shown in Stream Tester sidebar
@@ -128,28 +162,33 @@ Streams locked into a model after validation. One row per stream per model.
 **Capital allocation:** Each stream owns its slice of model capital independently.
 Total model capital = Σ(lot_size_usd × slot_count) across all streams.
 A model can have 3–5 streams — not necessarily 5. High-conviction streams can get more capital or more slots.
-**Minimum lot_size_usd: $10.** Below this, Kraken's minimum order size and the 0.50% round-trip fee make positions impractical. Enforced via CHECK constraint.
+**Minimum lot_size_usd: $10.** Enforced via CHECK constraint.
 Allocation is decided at model assembly, not during stream tuning — locked streams get placeholder defaults until model-level testing finalizes weights.
+
+**Slot modes:**
+- `single` — only slot 1 runs; slot_count ignored for dispatch purposes
+- `scale_down` — slot 2 enters when slot 1 is open and price drops `slot2_trigger_pct` below entry (DH pattern: average down)
+- `scale_up` — slot 2 enters when slot 1 is open, price is up `slot2_trigger_pct`, and the original signal fires again (MR pattern: pyramid up)
 
 ### backtest.model_tests
 
 A full model backtest run — all streams running together as a unit.
 Used to validate the complete model before live deployment.
 
-`run_number` groups runs with the same allocation config (same streams + weights, different date windows). `window_name` labels the date range: Primary / Full History / Recent / custom.
+`run_number` groups runs with the same allocation config (same streams + weights, different date windows). Date range follows the same preset/custom FK pattern as stream_tests.
 
 ```sql
   model_test_id            SERIAL PRIMARY KEY
   model_id                 INTEGER NOT NULL REFERENCES backtest.models
   run_type                 VARCHAR(20) NOT NULL   -- 'historical' | 'paper'
   run_number               INTEGER                -- groups same-allocation runs
-  window_name              VARCHAR(50)            -- "Primary", "Full History", "Recent"
+  preset_id                INTEGER REFERENCES timeframe_presets
+  custom_start             TIMESTAMPTZ
+  custom_end               TIMESTAMPTZ
   simulation_start         TIMESTAMPTZ NOT NULL
   simulation_end           TIMESTAMPTZ            -- null if paper test still running
-  went_live_at             TIMESTAMPTZ            -- paper only: when real-time feed began
   status                   VARCHAR(20) NOT NULL   -- 'running' | 'completed'
-  selected_for_deployment  BOOLEAN DEFAULT FALSE  -- marks the paper test that earned live deployment
-  configuration            JSONB NOT NULL         -- full allocation config snapshot: {allocations: {stream: {lot_size_usd, slot_count}}}
+  configuration            JSONB NOT NULL         -- {allocations: {stream: {lot_size_usd, slot_count, slot_mode}}}
   total_capital            NUMERIC(10,2)          -- Σ(lot_size_usd × slot_count) across all streams
   ending_balance           NUMERIC(10,4)
   total_trades             INTEGER
@@ -173,7 +212,7 @@ Every unit of capital moving through a slot in a model test. The full trade-leve
   model_test_id    INTEGER NOT NULL REFERENCES backtest.model_tests
   model_id         INTEGER NOT NULL REFERENCES backtest.models
   stream_id        INTEGER NOT NULL REFERENCES backtest.streams
-  slot_number      SMALLINT NOT NULL              -- 1 or 2
+  slot_number      SMALLINT NOT NULL              -- 1, 2, ...
   lot_sequence     INTEGER NOT NULL               -- 1st lot this slot ever had, 2nd, etc.
   status           VARCHAR(10) NOT NULL           -- 'CASH' | 'OPEN' | 'CLOSED'
   opening_capital  NUMERIC(12,2) NOT NULL         -- $ at start of this lot
@@ -194,6 +233,7 @@ Every unit of capital moving through a slot in a model test. The full trade-leve
 CASH → OPEN → CLOSED → (new CASH lot, opening_capital = previous closing_capital)
 ```
 
+Each slot has an independent `high_water_mark` — trailing stops fire independently per lot.
 Capital compounds within the slot.
 
 ---
@@ -202,7 +242,8 @@ Capital compounds within the slot.
 
 Real money. Real Kraken orders. Precious — never touched carelessly.
 **Not yet built** — will mirror backtest structure with Kraken order IDs added.
-`live.models.based_on_model_test_id` will link every live deployment to the paper test that earned it.
+
+**Safety rule:** `reset_backtest.sql` explicitly excludes all `live.*` tables. Any live schema change requires a dedicated, explicitly reviewed migration — never casual DDL.
 
 ---
 
@@ -218,7 +259,8 @@ Unions `backtest.lots` and `live.lots` with a source tag. This is the only view 
 
 ## Key Design Decisions
 
+- **`timeframe_presets` FK over free-text window names** — consistent window definitions across all test runs; `timeframe_label` is computed at query time via COALESCE
+- **`slot_mode` per stream** — slot 2 entry behavior is intentional and stream-specific, not accidental
 - **Two test levels** — `stream_tests` for individual stream tuning (summary only), `model_tests` + `lots` for full model validation (per-trade detail)
 - **Capital compounds within a slot** — opening_capital of each new lot = closing_capital of the previous one
 - **Parameters are snapshotted** — both `stream_tests.parameters` and `model_tests.configuration` store a full JSONB copy of the config at test time. Historical runs are never affected by later parameter changes
-- **`selected_for_deployment`** — marks which paper test earned live deployment, creating a full audit chain from experiment to production

@@ -1,7 +1,7 @@
 # Surge Rider v1
 
 **Type:** Volume momentum  
-**Status:** Candidate — Model 1  
+**Status:** Placeholder — never built or tested. Not in Model 1.  
 
 ## Concept
 
