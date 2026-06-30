@@ -20,7 +20,9 @@ from src.app.dashboard import render_dashboard
 
 KNOWN_STREAMS = [
     "Breakout Scout v1",
+    "Breakout Scout v2",
     "Dip Hunter v1",
+    "Dip Hunter v2",
     "Momentum Rider v1",
     "Momentum Rider v2",
     "Steady Climber v1",

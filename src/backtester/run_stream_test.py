@@ -24,25 +24,34 @@ from src.app.db import get_engine, LAST_RUN_PATH
 
 # ── Configure this block for each test ────────────────────────────────────────
 
-STREAM_NAME = "Momentum Rider v2"
+STREAM_NAME = "Dip Hunter v2"
 LOT_SIZE    = 10.0
 SLOT_COUNT  = 1
 SLOT_MODE   = "single"
-PRESET_NAME = "Primary v2"   # must match timeframe_presets.name
+PRESET_NAME = "Full History"   # must match timeframe_presets.name
 
 PARAMS = {
-    "primary_timeframe": "4h",
-    "core_signal": "ema_crossover",
-    "core_params": {"ema_short": 20, "ema_long": 50},
-    "filters": {
-        "trend_context": {"sma_period": 200, "require": "above"},
-        "rsi": {"period": 14, "min": 55, "max": None},
+    "primary_timeframe": "1h",
+    "core_signal": "rsi_recovery",
+    "core_params": {
+        "rsi_period": 14,
+        "rsi_threshold": 30,
+        "require_bullish_candle": True,
     },
-    "sentiment": {"fear_greed": {"min": 25, "max": None}},
+    "filters": {
+        "drawdown_from_high": {
+            "min_drop_pct": 25.0,
+            "lookback_days": 90,
+        },
+        "rsi": {"min": 35},
+    },
+    "sentiment": {"fear_greed": {"max": 20}},
     "position": {
-        "trailing_stop_pct": 7.0,
+        "trailing_stop_pct": 10.0,
         "entry_order_type": "limit",
-        "entry_expiry_candles": 2,
+        "entry_expiry_candles": 1,
+        "min_hold_candles": 48,
+        "max_hold_candles": 240,
     },
 }
 

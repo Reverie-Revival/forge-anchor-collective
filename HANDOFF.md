@@ -2,19 +2,65 @@
 
 ## Done
 
-### Model Tester bug fixes
-- **run_number grouping bug** — model_tests 5–8 (MR v2 assembly) were all saved as `run_number=1`, collapsing them into the same sidebar entry as the stale MR v1 results. Root cause: `next_model_run_number()` relied on a passed `history` DataFrame that was empty when those tests were saved.
-  - Fixed: `next_model_run_number` now queries the DB directly — no history parameter, can't go stale again
-  - DB patched: ids 5–8 updated to `run_number=2`
-  - Sidebar run label now shows stream config inline (e.g. `#2  MR v2 · DH v1 · BS v1  ·  +16.0%  ·  4 windows`)
-  - Stream alloc summary now shows full stream name including version (was truncating to first word)
-- **Wrong 4th preset** — Run #2 had Primary v1 (2019–2023) as the 4th window instead of 2026 YTD. Deleted model_test_id=8, re-ran on 2026 YTD (preset_id=4), saved as model_test_id=10.
-- **MR v2 color** — added `"Momentum Rider v2": "#22c55e"` to `STREAM_COLORS` in model_dashboard.py
+### Dip Hunter v2 — Designed, Tested, Locked
 
-### Stream Tester bug fixes
-- **KNOWN_STREAMS** — updated from "Momentum Rider v1" to include "Momentum Rider v2", sorted alphabetically: BS v1, DH v1, MR v1, MR v2, SC v1, SR v1
-- **Stale stream_name in pkls** — `.last_run.pkl` and run pkls 24–28 all had `stream_name = "Momentum Rider v1"` despite being v2 runs. Patched all 6 in place.
-- **run_stream_test.py defaults** — updated `STREAM_NAME` to "Momentum Rider v2" and `PRESET_NAME` to "Primary v2"
+Full parameter exploration on DH starting from v1 baseline (+0.1% Primary v2).
+
+**What worked:**
+- **RSI filter min=35** — stack a filter on top of the RSI recovery signal. Signal fires when RSI crosses from below 30 to above 30, but filter requires current RSI ≥ 35. This screens "first flicker" recoveries that are still in downtrends; only entries with real momentum recovery pass through. WR jumped 38% → 55%.
+- **max_hold_candles=240 (10 days on 1h)** — force-exit any trade that hasn't resolved in 10 days. Cuts stale/losing positions before DD compounds. DD dropped -32% → -20%.
+- **10% trailing stop** — slightly wider than v1's 7.5%. Lets the real recoveries run.
+
+**What was ruled out:**
+- 4h timeframe — worse than 1h for DH. Fear bounces need hourly granularity to catch RSI signals cleanly.
+- Wider trailing stops (12.5%, 15%) — hurt across the board when combined with scale_down or removed max_hold.
+- Scale_down (2 slots) — tested exhaustively across all trigger percentages (2–15%), with/without max_hold, with looser RSI filter. Never beat single slot. The RSI filter already does the selection work scale_down was meant to accomplish through averaging.
+- SMA 200 below filter — negligible effect, not worth the complexity.
+- F&G threshold relaxation (25–30) — more trades, not better returns.
+
+**Locked config — Dip Hunter v2 (stream_id=2, locked_test_id=34):**
+```json
+{
+  "primary_timeframe": "1h",
+  "core_signal": "rsi_recovery",
+  "core_params": {"rsi_period": 14, "rsi_threshold": 30, "require_bullish_candle": true},
+  "filters": {
+    "drawdown_from_high": {"min_drop_pct": 25.0, "lookback_days": 90},
+    "rsi": {"min": 35}
+  },
+  "sentiment": {"fear_greed": {"max": 20}},
+  "position": {
+    "trailing_stop_pct": 10.0,
+    "entry_order_type": "limit",
+    "entry_expiry_candles": 1,
+    "min_hold_candles": 48,
+    "max_hold_candles": 240
+  }
+}
+```
+
+**DH v2 results (1 slot, $10 lot):**
+| Window | Ann% | Trades | WR | DD | PF |
+|---|---|---|---|---|---|
+| Primary v2 (2022–) | +11.7% | 20 | 55% | -20.6% | 2.03 |
+| Full History (2018–) | +12.1% | 51 | 53% | -26.0% | 1.86 |
+| Recent (2024–) | +10.5% | 11 | 55% | -18.6% | 2.10 |
+| 2026 YTD | +53.0% | 7 | 57% | -2.2% | 2.91 |
+
+---
+
+### Model 1 Re-assembled with DH v2 (Run #3)
+
+Equal $33.33/lot × 1 slot × 3 streams = $99.99 total capital.
+
+| Window | Run #2 (MR v2 + DH v1) | Run #3 (MR v2 + DH v2) |
+|---|---|---|
+| Primary v2 | +8.5% | **+11.9%** |
+| Full History | +16.0% | **+17.0%** |
+| Recent | +9.1% | **+9.6%** |
+| 2026 YTD | -6.6% | **+16.4%** |
+
+2026 YTD swing from -6.6% → +16.4% is the headline. DH v2 now contributing where v1 was bleeding.
 
 ---
 
@@ -22,58 +68,48 @@
 
 **backtest.streams:**
 - stream_id=1: Momentum Rider v2 — LOCKED (locked_test_id=26)
-- stream_id=2: Dip Hunter v1 — locked, undertested on Primary v2
-- stream_id=3: Breakout Scout v1 — locked, undertested on Primary v2
+- stream_id=2: Dip Hunter v2 — LOCKED (locked_test_id=34)
+- stream_id=3: Breakout Scout v1 — locked but **undertested on Primary v2 — next session**
 
 **backtest.model_tests:**
-| model_test_id | run_number | preset | ann% |
-|---|---|---|---|
-| 1 | 1 (MR v1) | Full History | +5.6% |
-| 2 | 1 (MR v1) | Primary Window (v1) | +12.7% |
-| 3 | 1 (MR v1) | Recent | +3.6% |
-| 4 | 1 (MR v1) | 2026 YTD | -16.2% |
-| 5 | 2 (MR v2) | Primary v2 | +8.5% |
-| 6 | 2 (MR v2) | Full History | +16.0% |
-| 7 | 2 (MR v2) | Recent | +9.1% |
-| 10 | 2 (MR v2) | 2026 YTD | -6.6% |
+| run | config | PV2 | FH | Recent | 2026 YTD |
+|---|---|---|---|---|---|
+| #1 | MR v1 + DH v1 + BS v1 | — | +5.6% | +3.6% | -16.2% |
+| #2 | MR v2 + DH v1 + BS v1 | +8.5% | +16.0% | +9.1% | -6.6% |
+| #3 | MR v2 + DH v2 + BS v1 | +11.9% | +17.0% | +9.6% | +16.4% |
 
-**What the numbers tell us:**
-MR v2 alone hits +21.5% on Primary v2. Combined model only gets +8.5% — DH (11 trades, -19.1% annualized on 2026 YTD) is dragging badly. BS fired zero times on 2026 YTD.
+**Stream Tester — DH v2 saved runs:**
+- run#1: DH v1 baseline (old locked config, 5 presets)
+- run#2: DH v2 candidate (locked config, all 5 presets including Primary Window for cross-ref)
 
 ---
 
 ## Next Up
 
-### Priority: Tune Dip Hunter for Primary v2
+### Priority: Tune Breakout Scout v2 for Primary v2
 
-DH v1 was locked against Primary v1 (2019–2023) and never stress-tested on the 2022-present regime. The model assembly result exposes this.
+BS v1 was locked against Primary v1 (2019–2023) and has never been stress-tested on Primary v2. Same process as DH.
 
 **Start here:**
-1. Baseline run — DH v1 on Primary v2 (preset_id=5):
+1. Baseline run — BS v1 config on Primary v2:
 ```python
 # In run_stream_test.py, set:
-STREAM_NAME = "Dip Hunter v1"
+STREAM_NAME = "Breakout Scout v2"
 PRESET_NAME = "Primary v2"
-# Use DH's locked config from DB (stream_id=2)
+# Pull BS v1 locked config from DB:
+# SELECT parameters FROM backtest.streams WHERE stream_id=3
 ```
 
-Or pull the locked config directly:
-```python
-from src.app.db import get_engine
-from sqlalchemy import text
-with get_engine().connect() as conn:
-    print(conn.execute(text("SELECT parameters FROM backtest.streams WHERE stream_id=2")).fetchone())
-```
+2. BS uses: ATR low-vol filter + Bollinger squeeze + F&G > 50. Check if the squeeze and vol conditions fire in the 2022+ regime.
+3. If trade count is low: relax entry conditions (ATR threshold, squeeze threshold)
+4. If trades are there but returns low: widen stop, adjust F&G floor
+5. Scale_down tested for DH and didn't help — worth trying for BS (breakout continuation is a better fit for pyramiding)
+6. Run any improvements across Full History + Recent to verify generalization
+7. Save to DB, review in Stream Tester, lock
 
-2. Check trade count on PV2. DH fires on fear bounces (F&G < 20, RSI recovery through 30, price 25%+ below 90d high). The 2022-2023 bear had these; 2024-2025 bull had fewer.
-3. If trade count is very low: relax F&G threshold or % below high requirement
-4. If trades are there but returns are poor: widen/tighten trailing stop, adjust RSI entry threshold
-5. Run any improvements across Full History + Recent to verify generalization
-6. Save to DB via `save_stream_test()`, review in Stream Tester
+**Batch exploration template:** copy `src/backtester/explore_dh_v2b.py` — same structure, adapt signal/filter keys for BS
 
-**Batch exploration template:** copy `src/backtester/explore_mr_v2b.py` — structure is identical for DH
-
-**Target:** DH and BS strong enough on PV2 that combined model clears 15%+ on that window.
+**Target:** BS v2 strong enough that combined model clears 15%+ on Primary v2 and 18%+ on Full History.
 
 ---
 
@@ -82,13 +118,16 @@ with get_engine().connect() as conn:
 | File | Purpose |
 |---|---|
 | `src/backtester/engine.py` | Core backtest engine — `_run_slot()`, slot_mode dispatch, `_warmup_days()` |
+| `src/backtester/signals.py` | `generate_signals()` + `_check_filters()` — all signal/filter logic lives here |
 | `src/backtester/model_runner.py` | `run_model()` — loads locked streams from DB, applies allocations |
-| `src/backtester/model_engine.py` | Low-level multi-stream runner called by model_runner |
 | `src/backtester/run_stream_test.py` | Quick single-config runner → writes .last_run.pkl for Stream Tester |
-| `src/backtester/explore_mr_v2b.py` | Template for batch exploration — copy and adapt for DH/BS |
+| `src/backtester/explore_dh_v2.py` | DH v2 Round 1 exploration (timeframe × stop × F&G × hold) |
+| `src/backtester/explore_dh_v2b.py` | DH v2 Round 2 exploration (RSI filter, max_hold, SMA regime) |
 | `src/app/db.py` | All DB ops — `save_stream_test()`, `save_model_test()`, `get_engine()` |
-| `src/app/dashboard.py` | Stream Tester renderer |
 | `src/app/pages/model_tester.py` | Model Tester page |
 | `src/app/model_dashboard.py` | Model dashboard renderer |
 
 **Run Streamlit:** `streamlit run src/app/app.py`
+
+**Available signals in engine:** `ema_crossover`, `rsi_recovery`, `rsi_dip`, `range_breakout`, `volume_surge`, `fear_dip`, `sma_pullback`
+**Available filters:** `trend_context` (SMA above/below), `rsi` (min/max), `drawdown_from_high`, `sentiment.fear_greed`, `volume`, `atr_regime`, `bollinger`, `breakout_candle`
