@@ -1,7 +1,7 @@
 # Steady Climber v1
 
 **Type:** Trend-filtered pullback  
-**Status:** Candidate — Model 1  
+**Status:** Placeholder — never built or tested. Not in Model 1.  
 
 ## Concept
 

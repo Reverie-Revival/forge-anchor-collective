@@ -1,8 +1,8 @@
 # Model 1
 
-**Status:** Design phase — streams under selection  
-**Capital:** $100 (10 slots × $10)  
-**Architecture:** 5 streams × 2 slots each  
+**Status:** Locked — 3 streams validated, ready for deployment decision  
+**Capital:** $100 (3 streams × $33.33/lot × 1 slot)  
+**Architecture:** 3 streams, single-slot baseline (slot behavior to be refined pre-deployment)
 
 ## Purpose
 
@@ -10,38 +10,39 @@ Model 1 is the first live deployment of the Forge Anchor tournament architecture
 
 Being Model 1, it is as much a systems test as a strategy test. The results are data regardless of grade.
 
-## Stream Selection
+## Locked Streams
 
-Five streams are chosen for diversity across market conditions — no two streams should depend on the same signal type. The goal is that in any given market regime (trending, ranging, volatile, quiet), at least some streams are active.
+Three streams cover three distinct market regimes with zero signal overlap confirmed in testing:
 
-### Candidate Streams
+| Stream | Type | Trail | Active In | Grade | stream_id |
+|---|---|---|---|---|---|
+| [Momentum Rider v1](../streams/momentum-rider-v1.md) | Trend-following | 5% | Bull market, F&G > 25, RSI > 55 | 4 — Strong | 1 |
+| [Dip Hunter v1](../streams/dip-hunter-v1.md) | Fear bounce (mean reversion) | 7.5% | Extreme fear, F&G < 20, 25%+ drawdown | 4 — Strong | 2 |
+| [Breakout Scout v1](../streams/breakout-scout-v1.md) | Consolidation breakout | 5% | Low-vol squeeze + bullish sentiment | 4 — Strong | 3 |
 
-| Stream | Type | Trail | Active In |
+Surge Rider v1 and Steady Climber v1 were considered during design but never built or tested. Model 1 does not need 5 streams — 3 well-differentiated streams beat 5 redundant ones.
+
+## Capital Allocation (v2 baseline)
+
+| Stream | Lot Size | Slots | Stream Capital |
 |---|---|---|---|
-| [Momentum Rider v1](../streams/momentum-rider-v1.md) | Trend-following | 3% | Uptrending markets |
-| [Dip Hunter v1](../streams/dip-hunter-v1.md) | Mean reversion | 2.5% | Any market with dips |
-| [Breakout Scout v1](../streams/breakout-scout-v1.md) | Consolidation breakout | 4% | Post-consolidation moves |
-| [Surge Rider v1](../streams/surge-rider-v1.md) | Volume momentum | 2% | High-participation moves |
-| [Steady Climber v1](../streams/steady-climber-v1.md) | Trend-filtered pullback | 3.5% | Established uptrends only |
+| Momentum Rider v1 | $33.33 | 1 | $33.33 |
+| Dip Hunter v1 | $33.33 | 1 | $33.33 |
+| Breakout Scout v1 | $33.33 | 1 | $33.33 |
+| **Total** | | | **$99.99** |
 
-> Final 5 selections are confirmed after backtesting. Additional candidates may be added before lock-in.
+Slot behavior (`slot_mode`) is currently `single` — baseline configuration. Before deployment, slot modes may be refined per stream (DH: scale_down to average; MR: scale_up to pyramid; BS: stays single).
 
-## Capital Allocation
+## Validation Results (v2 baseline, Run #1)
 
-| Slot | Stream | Capital |
-|---|---|---|
-| Slot 1 | TBD | $10 |
-| Slot 2 | TBD | $10 |
-| Slot 3 | TBD | $10 |
-| Slot 4 | TBD | $10 |
-| Slot 5 | TBD | $10 |
-| Slot 6 | TBD | $10 |
-| Slot 7 | TBD | $10 |
-| Slot 8 | TBD | $10 |
-| Slot 9 | TBD | $10 |
-| Slot 10 | TBD | $10 |
+| Window | Period | Ann. Return | Trades | Max DD | vs S&P |
+|---|---|---|---|---|---|
+| Primary | 2019–2023 | **+12.7%** | 157 | -21.2% | Beats (~10% avg) |
+| Full History | 2018– | +5.6% | 264 | -23.4% | Below |
+| Recent | 2024– | +3.6% | 66 | -19.6% | Below |
+| 2026 YTD | 2026 | -16.2% | 15 | -8.6% | Above (BTC -54%) |
 
-Each stream runs 2 slots independently — same strategy, same parameters, different capital pools. Slots compound individually: closing capital becomes the next lot's opening capital.
+Primary window (2019–2023) is the primary gate: varied regimes (2019 grind, 2020 crash+bull, 2021 peak, 2022 bear, 2023 recovery). +12.7% Grade 4 — Strong.
 
 ## Constraints
 
@@ -51,22 +52,21 @@ Each stream runs 2 slots independently — same strategy, same parameters, diffe
 - Trailing stops only — no fixed targets
 - Long-only (no shorting)
 
-## Testing Plan
+## Deployment Gate
 
-1. **Historical backtest** — full dataset Jan 2017 → present across all 5 streams
-2. **Paper test** — live price feed, simulated execution, configurable start date
-3. **Live deployment gate** — backtest confidence is the trigger, not calendar time
-
-Multiple paper tests may run in parallel. The one selected for deployment is recorded in `backtest.model_tests.selected_for_deployment` and linked from `live.models.based_on_model_test_id`.
+- Primary window annualized return > 10% ✓
+- All 3 streams validated with complementary regimes ✓
+- Model-level test complete across 4 windows ✓
+- Slot behavior finalized (pending) — current single-slot baseline is deployable
 
 ## Benchmarks
 
-Model 1 performance will be compared against:
+Model 1 performance compared against:
 - S&P 500 return for the same period
 - BTC buy-and-hold for the same period
 - Cash (doing nothing)
 
-Since there are no prior models, there is no head-to-head comparison for Model 1. All future models will compare against it.
+Since there are no prior models, there is no head-to-head comparison for Model 1. All future models compare against it.
 
 ## Grading Criteria
 

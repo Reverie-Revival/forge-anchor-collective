@@ -200,7 +200,7 @@ with st.sidebar:
         st.divider()
 
         for row in rows:
-            win = row.get("window_name") or label_window(row["simulation_start"], row["simulation_end"])
+            win = row.get("timeframe_label") or label_window(row["simulation_start"], row["simulation_end"])
             ann = row["annualized_return_pct"]
             pf  = row.get("profit_factor")
             _, gl, gc = grade_info(ann if pd.notna(ann) else None)
@@ -255,10 +255,13 @@ elif selected_run is not None and selected_run in run_groups:
     saved_rows   = run_groups[selected_run]
     pending_runs = load_pending_model_runs(saved_rows)
 
-    tab_entries = []
+    saved_entries = []
     for row in saved_rows:
-        lbl = row.get("window_name") or label_window(row["simulation_start"], row["simulation_end"])
-        tab_entries.append({"label": lbl, "type": "saved", "data": row})
+        lbl = row.get("timeframe_label") or label_window(row["simulation_start"], row["simulation_end"])
+        saved_entries.append({"label": lbl, "type": "saved", "data": row})
+    saved_entries.sort(key=lambda e: e["label"])
+
+    tab_entries = saved_entries
     for pr in pending_runs:
         lbl = label_window(pr["start"], pr["end"])
         tab_entries.append({"label": f"⏳ {lbl}", "type": "pending", "data": pr})
@@ -292,10 +295,10 @@ elif selected_run is not None and selected_run in run_groups:
                         f'border:1px solid {gc}66;font-size:1rem;">{gl}</span>',
                         unsafe_allow_html=True,
                     )
-                    st.caption(
-                        f"Model 1  ·  "
+                    win = row.get("timeframe_label") or (
                         f"{str(row['simulation_start'])[:10]} → {str(row['simulation_end'])[:10]}"
                     )
+                    st.caption(f"Model 1  ·  {win}")
                     st.divider()
                     c1, c2, c3 = st.columns(3)
                     c1.metric("Annualized Return", f"{ann:+.1f}%" if pd.notna(ann) else "—")

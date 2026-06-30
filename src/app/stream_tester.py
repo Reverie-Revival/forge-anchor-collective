@@ -55,8 +55,9 @@ GLOSSARY = {
         "Total $ won ÷ total $ lost. Above 1.0 = profitable overall. 1.5 means $1.50 earned "
         "for every $1 lost, regardless of win rate.",
     "Slot":
-        "Each stream runs in 2 independent $10 slots — same strategy, separate capital. "
-        "One can be in a trade while the other waits for the next signal.",
+        "Each stream can run in 1–2 slots with stream-specific behavior. "
+        "'single' = one position at a time. 'scale_down' = slot 2 adds if price drops further (DH). "
+        "'scale_up' = slot 2 adds to a winning position when trend confirms (MR).",
 }
 
 with st.expander("📖 Glossary"):
@@ -290,7 +291,10 @@ with st.sidebar:
         st.divider()
 
         for row in rows:
-            win = row.get("window_name") or label_window(row["test_start"], row["test_end"])
+            win = row.get("timeframe_label") or label_window(
+                row.get("simulation_start") or row.get("custom_start"),
+                row.get("simulation_end") or row.get("custom_end"),
+            )
             ann = row["annualized_return_pct"]
             pf  = row["profit_factor"]
             _, gl, gc = grade_info(ann if pd.notna(ann) else None)
@@ -336,10 +340,16 @@ elif selected_run is not None and selected_run in stream_runs:
     saved_rows   = stream_runs[selected_run]
     pending_runs = load_pending_runs(saved_rows)
 
-    tab_entries = []
+    saved_entries = []
     for row in saved_rows:
-        lbl = row.get("window_name") or label_window(row["test_start"], row["test_end"])
-        tab_entries.append({"label": lbl, "type": "saved", "data": row})
+        lbl = row.get("timeframe_label") or label_window(
+            row.get("simulation_start") or row.get("custom_start"),
+            row.get("simulation_end") or row.get("custom_end"),
+        )
+        saved_entries.append({"label": lbl, "type": "saved", "data": row})
+    saved_entries.sort(key=lambda e: e["label"])
+
+    tab_entries = saved_entries
     for pr in pending_runs:
         lbl = label_window(pr["start"], pr["end"])
         tab_entries.append({"label": f"⏳ {lbl}", "type": "pending", "data": pr})
@@ -363,7 +373,7 @@ elif selected_run is not None and selected_run in stream_runs:
                 if payload is not None:
                     render_dashboard(payload, show_save=False, key_prefix=f"run_{test_id}")
                 else:
-                    # Saved before per-test pkl storage — show summary from DB
+                    # No pkl — show DB summary only
                     ann = row["annualized_return_pct"]
                     pf  = row["profit_factor"]
                     dd  = row["max_drawdown_pct"]
@@ -374,9 +384,10 @@ elif selected_run is not None and selected_run in stream_runs:
                         f'border:1px solid {gc}66;font-size:1rem;">{gl}</span>',
                         unsafe_allow_html=True,
                     )
+                    sim_s = str(row.get("simulation_start") or "")[:10]
+                    sim_e = str(row.get("simulation_end") or "")[:10]
                     st.caption(
-                        f"{row['stream_name']} {row['stream_version']}  ·  "
-                        f"{str(row['test_start'])[:10]} → {str(row['test_end'])[:10]}"
+                        f"{row['stream_name']} {row['stream_version']}  ·  {sim_s} → {sim_e}"
                     )
                     st.divider()
                     c1, c2, c3, c4 = st.columns(4)

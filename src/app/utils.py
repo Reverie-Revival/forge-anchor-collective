@@ -62,15 +62,12 @@ def params_hash(params: dict) -> str:
 
 
 def label_window(start_date, end_date) -> str:
+    """Date-range label for pending (unsaved) runs. Saved runs use their preset name."""
     import pandas as pd
     s = pd.Timestamp(start_date)
     e = pd.Timestamp(end_date)
-    if s.year <= 2018 and s.month <= 3:
-        return "Full History"
-    if s.year >= 2026 and s.month == 1 and s.day == 1:
-        return "Recent"
-    if s.year == 2019 and e.year <= 2023:
-        return "Primary"
+    if s.year == e.year:
+        return f"{s.strftime('%b %d')} → {e.strftime('%b %d, %Y')}"
     return f"{s.strftime('%b %Y')} → {e.strftime('%b %Y')}"
 
 

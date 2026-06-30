@@ -6,8 +6,8 @@ import streamlit as st
 import plotly.graph_objects as go
 import pandas as pd
 
-from .utils import SP500_HISTORICAL_AVG, fetch_sp500, grade_info, label_window
-from .db import load_model_history, save_model_test
+from .utils import SP500_HISTORICAL_AVG, fetch_sp500, grade_info
+from .db import load_model_history, load_timeframe_presets, save_model_test
 
 # Stream colors — consistent across all charts
 STREAM_COLORS = {
@@ -25,24 +25,70 @@ def _stream_color(name: str, idx: int = 0) -> str:
 def _render_model_save(payload, key_prefix):
     st.divider()
     st.subheader("💾 Save This Run")
-    auto_window = label_window(payload["start"], payload["end"])
+
+    presets   = load_timeframe_presets()
+    run_start = pd.Timestamp(payload["start"]).date()
+    run_end   = pd.Timestamp(payload["end"]).date()
+
+    def _matches(preset) -> bool:
+        ps = pd.Timestamp(preset["start_date"]).date()
+        pe = preset["end_date"]
+        if abs((run_start - ps).days) > 5:
+            return False
+        if pe is None:
+            return True
+        pe = pd.Timestamp(pe).date()
+        return abs((run_end - pe).days) <= 5
+
+    matched_preset_id = None
+    for p in presets:
+        if _matches(p):
+            matched_preset_id = p["preset_id"]
+            break
+
+    options     = [p["name"] for p in presets] + ["Custom"]
+    default_idx = next((i for i, p in enumerate(presets) if p["preset_id"] == matched_preset_id),
+                       len(options) - 1)
+
     sc1, sc2 = st.columns([1, 2])
-    save_window = sc1.text_input("Window name", value=auto_window,
-                                 key=f"{key_prefix}_window")
-    save_notes  = sc2.text_input("Notes (optional)", key=f"{key_prefix}_notes",
-                                 placeholder="e.g. equal allocation baseline")
+    selected_label = sc1.selectbox("Timeframe", options, index=default_idx,
+                                   key=f"{key_prefix}_preset_sel")
+    save_notes     = sc2.text_input("Notes (optional)", key=f"{key_prefix}_notes",
+                                    placeholder="e.g. equal allocation baseline")
+
+    save_preset_id    = None
+    save_custom_start = None
+    save_custom_end   = None
+
+    if selected_label == "Custom":
+        d1, d2 = st.columns(2)
+        save_custom_start = d1.date_input("Start date", value=run_start,
+                                          key=f"{key_prefix}_cstart")
+        open_ended = d2.checkbox("Open-ended (no end date)", key=f"{key_prefix}_open")
+        if not open_ended:
+            save_custom_end = d2.date_input("End date", value=run_end,
+                                            key=f"{key_prefix}_cend")
+    else:
+        save_preset_id = next(p["preset_id"] for p in presets if p["name"] == selected_label)
+
     if st.button("Save to Database", type="secondary", key=f"{key_prefix}_save"):
         try:
             history_df = load_model_history()
-            model_test_id, run_num, win_nm = save_model_test(
-                payload=payload, window_name=save_window,
+            model_test_id, run_num = save_model_test(
+                payload=payload,
+                preset_id=save_preset_id,
+                custom_start=save_custom_start,
+                custom_end=save_custom_end,
                 notes=save_notes, history=history_df,
             )
             cm  = payload["combined_metrics"]
             ann = cm["annualized_return_pct"]
             ann_str = f"{ann:+.1f}% annualized" if ann is not None else "no trades"
+            timeframe_label = selected_label if selected_label != "Custom" else (
+                f"{save_custom_start} → {save_custom_end or 'present'}"
+            )
             st.success(
-                f"Saved — Run #{run_num} · {win_nm} · "
+                f"Saved — Run #{run_num} · {timeframe_label} · "
                 f"{cm['total_trades']} trades · {ann_str}."
             )
             st.cache_data.clear()

@@ -1,143 +1,112 @@
-# Handoff
+# Handoff — 2026-06-30
 
-## Last session: 2026-06-29 (session 3)
+## Done This Session
 
----
+### v2 Architecture Rebuild (merged to main)
 
-## What was completed
+Full from-scratch rebuild on `v2-rebuild` branch, now merged. Every layer changed:
 
-### Model Tester — built end to end
+**Database:**
+- `timeframe_presets` table replaces free-text `window_name`. 4 standard presets seeded (Primary Window, Full History, Recent, 2026 YTD).
+- `backtest.stream_tests`: `preset_id` FK + `slot_count` + `slot_mode` + `simulation_start/end`
+- `backtest.streams`: `slot_mode` column added (`single` / `scale_down` / `scale_up`)
+- `reset_backtest.sql`: safely wipes all backtest data — `live.*` explicitly excluded with policy comment
+- `reseed_model1.py`: script to fully restore DB from scratch if needed
 
-Full model-level testing infrastructure added:
+**Engine:**
+- `slot_mode` dispatch — `scale_down` averages down, `scale_up` pyramids up, `single` is one slot only
+- Slot 2 entry is derived from slot 1's actual trade history (not a duplicate signal)
+- Independent trailing stops per lot (already worked via `high_water_mark` — now documented)
 
-**New files:**
-- `src/backtester/model_engine.py` — runs all locked streams simultaneously, aggregates combined metrics
-- `src/backtester/model_runner.py` — programmatic entry point; call from Claude Code to trigger a run and write pkl to model_runs/
-- `src/app/model_dashboard.py` — full dashboard: combined KPIs, benchmark tiles, stream breakdown, racing lines (balance over time), combined equity curve with solo-stream overlays, drawdown chart, trade log, save button
-- `src/app/app.py` — multi-page Streamlit app entry point (Stream Tester + Model Tester)
-- `src/app/pages/model_tester.py` — Model Tester page: glossary, stream reference expander, sidebar run selector, main dashboard area
+**App:**
+- Preset dropdown save UI (replaces free-text window name input)
+- Tabs always sorted alphabetically by timeframe label
+- `slot_mode` and `slot_count` shown in stream/allocation display
+- DB connection fixed: `app.py` now calls `load_dotenv()` at startup; `get_engine()` reads individual env vars
+- `next_run_number()` hardened against empty DataFrames
 
-**Key dashboard features:**
-- Racing lines chart — per-stream balance over time (not % return), each stream in its own color
-- Combined Account Balance chart — combined equity curve with toggleable solo-stream overlays (click legend); shows "what if $100 went into just one stream" vs. combined
-- Benchmark tiles — vs. S&P 500 historical avg, S&P 500 actual for the period, BTC buy-and-hold
-- Save to DB — saves run to `backtest.model_tests`; run_number groups same-allocation configs across windows
-- Pending pkl system — unsaved runs appear immediately in UI without saving; saved runs load from pkl + DB
+**Docs/specs:**
+- `database-schema.md`: fully updated to v2 schema
+- `dip-hunter-v1.md`: rewritten to match actual locked config (`rsi_recovery`, not early `rsi_dip` iteration)
+- `model-1.md`: updated to reflect 3 locked streams, actual allocation, v2 results
+- `steady-climber-v1.md`, `surge-rider-v1.md`: flagged as placeholder — never built
+- `src/backtester/runner.py`: deleted (v1 entry point, replaced by `model_runner.py`)
 
-**Dollar sign LaTeX fix:** Streamlit treats `$...$` as LaTeX. All currency values in `st.caption()` now use `\$` escape.
+### Model 1 v2 Baseline — Clean Data in DB
 
-### Model 1 assembled and tested
+Stream tests (test_id 1–12, 3 streams × 4 presets, 1 slot × $10):
 
-Allocation: **$16.67/lot × 2 slots × 3 streams = $100.02 total** (equal-split across 3 streams).
+| Stream | Primary | Full History | Recent | 2026 YTD |
+|---|---|---|---|---|
+| Momentum Rider v1 | +11.4% / 100 trades | +2.9% | +1.0% | -28.1% |
+| Dip Hunter v1 | +13.8% / 39 trades | +7.0% | +9.2% | -19.1% |
+| Breakout Scout v1 | +13.0% / 18 trades | +6.4% | +0.4% | 0 trades |
 
-To re-run any window:
-```python
-from src.backtester.model_runner import run_model
+Model tests (model_test_id 1–4, equal $33.33/slot × 1 slot × 3 streams = $100):
 
-result = run_model(
-    allocations={
-        'Momentum Rider v1': {'lot_size_usd': 16.67, 'slot_count': 2},
-        'Dip Hunter v1':     {'lot_size_usd': 16.67, 'slot_count': 2},
-        'Breakout Scout v1': {'lot_size_usd': 16.67, 'slot_count': 2},
-    },
-    start='YYYY-MM-DD',
-    end='YYYY-MM-DD',
-)
-```
-
-**Results saved to DB (Run #1):**
-
-| Window | Period | Trades | Ann. Return | Win Rate | Max DD |
-|---|---|---|---|---|---|
-| Primary | 2019–2023 | — | +12.75% | — | — |
-| Full History | 2018–2026 | — | +5.57% | — | — |
-| Recent | 2026 YTD | 30 | -16.0% | 26.7% | -9.3% |
-
-2026 context: BTC -54% YTD. Model at -16% — significantly outperforms buy-and-hold.
-
----
-
-## Previous sessions
-
-### Session 2 (2026-06-29): Breakout Scout v1 — locked
-
-`stream_id=3, locked_test_id=14`
-
-```python
-params = {
-    'primary_timeframe': '1h',
-    'core_signal': 'range_breakout',
-    'core_params': {'breakout_lookback': 48},
-    'filters': {
-        'atr_regime': {'period': 14, 'avg_period': 30, 'max_pct_of_avg': 90},
-        'bollinger': {'period': 20, 'std_dev': 2.0, 'squeeze': {'max_bandwidth_pct': 6.0}},
-        'breakout_candle': {'body_ratio_min': 0.4, 'close_position_min': 0.6},
-    },
-    'sentiment': {'fear_greed': {'min': 50}},
-    'position': {'trailing_stop_pct': 5.0, 'entry_order_type': 'limit', 'entry_expiry_candles': 2},
-}
-```
-
-| Window | Trades | Ann. Return | Win Rate | PF | Max DD |
-|---|---|---|---|---|---|
-| Primary (2019–2023) | 36 | +13.0% | 61.1% | 2.51 | -14.1% |
-| Full History (2018–2026) | 60 | +6.4% | 56.7% | 1.83 | -18.7% |
-| Recent (2026 YTD) | 0 | — | — | — | — |
-
-### Session 1 (2026-06-29): Dip Hunter v1 — locked
-
-`stream_id=2, locked_test_id=10`
-
-| Window | Trades | Ann. Return | Win Rate | PF | Max DD |
-|---|---|---|---|---|---|
-| Primary (2019–2023) | 78 | +17.5% | 46.2% | 1.43 | -32.1% |
-| Full History (2018–2026) | 150 | +8.9% | 44.0% | 1.34 | -32.1% |
-| 2026 YTD | 22 | -18.5% | 36.4% | 0.67 | -20.4% |
-
----
-
-## Current state
-
-**Model 1 — complete, results in DB**
-
-| # | Stream | Grade | Status |
+| Window | Ann. Return | Trades | Max DD |
 |---|---|---|---|
-| 1 | Momentum Rider v1 | 4 — Strong | Locked ✓ (stream_id=1) |
-| 2 | Dip Hunter v1 | 4 — Strong | Locked ✓ (stream_id=2) |
-| 3 | Breakout Scout v1 | 4 — Strong | Locked ✓ (stream_id=3) |
+| Primary (2019–2023) | **+12.7%** | 157 | -21.2% |
+| Full History (2018–) | +5.6% | 264 | -23.4% |
+| Recent (2024–) | +3.6% | 66 | -19.6% |
+| 2026 YTD | -16.2% | 15 | -8.6% |
 
-`backtest.stream_tests` — 16 rows. `backtest.model_tests` — 3 rows (Run #1, all windows).
-
----
-
-## What's next
-
-### 1. Discuss Model 1 results
-- Primary window: +12.75% — beats S&P historical avg (~10%)
-- Full History: +5.57% — below S&P, but 2026 bear is dragging it down
-- 2026 YTD: -16% vs. BTC buy-and-hold -54%
-- Decision: is this deployment-ready? Or try an allocation adjustment first?
-
-### 2. If deploying Model 1
-- Update `backtest.model_tests` `selected_for_deployment = TRUE` on the Primary window row
-- Begin Kraken API integration (live schema not yet built)
-
-### 3. Model 2 overlap phase
-- While Model 1 runs live, begin designing Model 2
-- Consider stronger bear-market coverage — DH underperformed in 2026's grinding bear
+**Note on v2 vs v1 numbers:** MR Primary +11.4% vs v1's +17.8%. This is the v2 baseline — end-date boundary handling changed (now inclusive), engine is correct. Do not compare to v1 figures.
 
 ---
 
-## Key files
+## Current DB State
+
+- `backtest.models`: model_id=1
+- `backtest.streams`: stream_id=1 (MR), 2 (DH), 3 (BS) — all slot_count=1, slot_mode='single'
+- `backtest.stream_tests`: test_id 1–12, all with pkl in `src/app/runs/`
+- `backtest.model_tests`: model_test_id 1–4, all with pkl in `src/app/model_runs/`
+
+To fully restore DB from scratch: `source .venv/bin/activate && python -m src.data.reseed_model1`
+
+---
+
+## What's Next
+
+### 1. Stream re-testing with slot modes (first priority)
+
+The current baseline uses `slot_mode='single'` (1 slot each). The next step is to test each stream with its intended slot behavior:
+
+- **Dip Hunter**: `slot_mode='scale_down'` — slot 2 enters when price drops X% from slot 1's entry. Tune `slot2_trigger_pct` in `params["position"]`. Could improve avg entry price in oversold conditions.
+- **Momentum Rider**: `slot_mode='scale_up'` — slot 2 adds when trade is up X% and original signal fires again. Pyramid into winners.
+- **Breakout Scout**: stays `slot_count=1` — a failed breakout is the worst time to add.
+
+Run each in Stream Tester, compare against the single-slot baseline (test_id 2, 6, 10 = Primary Window locked tests). If an improved config earns a lock, update `backtest.streams`:
+```sql
+UPDATE backtest.streams
+SET parameters = '...', locked_test_id = <new_test_id>, slot_mode = 'scale_down', slot_count = 2
+WHERE stream_id = 2;  -- DH
+```
+Then re-run model via `run_model()` and compare.
+
+### 2. MR trailing stop experiment (optional)
+
+MR got only +1.0% in the 2024 bull run — the 5% trailing stop got shaken out early. Worth testing 7% or 8% trail on MR Primary to see if it captures longer trend moves without sacrificing too much of the current result.
+
+### 3. Model deployment decision
+
+When streams feel locked at their best config, decide whether Model 1 is ready for live deployment:
+- Primary +12.7% beats S&P (~10%) ✓
+- All 3 streams validated with confirmed regime complementarity ✓
+- Live schema not yet built — Kraken API integration needed before any real money moves
+
+---
+
+## Architecture Reference
 
 | File | Purpose |
 |---|---|
-| `src/backtester/model_engine.py` | Run all streams simultaneously |
-| `src/backtester/model_runner.py` | Entry point — call this from Claude Code |
-| `src/app/app.py` | Multi-page Streamlit entry point |
-| `src/app/model_dashboard.py` | All dashboard charts and save logic |
-| `src/app/pages/model_tester.py` | Model Tester page |
-| `src/app/db.py` | All DB ops (stream tests + model tests) |
-| `src/backtester/engine.py` | Single-stream backtest engine |
-| `docs/architecture/database-schema.md` | Full schema reference |
-| `docs/architecture/stream-attributes.md` | All configurable stream params |
+| `src/backtester/engine.py` | `_run_slot()`, `_derive_slot2_signals()`, slot_mode dispatch |
+| `src/backtester/model_runner.py` | `run_model()` — always pass explicit allocations |
+| `src/data/reseed_model1.py` | Full DB restore from scratch |
+| `src/data/reset_backtest.sql` | Wipe backtest schema (excludes live.*) |
+| `src/data/schema.sql` | Full v2 schema definition |
+| `src/data/seed_presets.sql` | Standard preset definitions |
+| `src/app/db.py` | All DB ops — save/load stream tests, model tests, presets |
+| `src/app/dashboard.py` | Stream Tester charts and preset save UI |
+| `src/app/model_dashboard.py` | Model Tester charts, racing lines, allocation display |
