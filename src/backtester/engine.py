@@ -206,6 +206,7 @@ def run_backtest(
     end: str = None,
     n_slots: int = 2,
     stream_name: str = "unnamed",
+    lot_size_usd: float = 10.0,
 ) -> dict:
     """
     Run a full backtest for a single stream configuration.
@@ -244,7 +245,7 @@ def run_backtest(
 
     signals = generate_signals(df, params)
 
-    capital_per_slot = 10.0
+    capital_per_slot = lot_size_usd
     all_trades = []
     for slot in range(1, n_slots + 1):
         slot_trades = _run_slot(df, signals, params, slot, initial_capital=capital_per_slot)

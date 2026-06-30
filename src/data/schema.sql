@@ -101,16 +101,28 @@ CREATE TABLE IF NOT EXISTS backtest.stream_tests (
 
 -- Full model-level backtest runs (historical and paper).
 -- Used to validate a complete model before live deployment.
+-- run_number groups runs with the same allocation config (same config, different date windows).
+-- window_name labels the date range: Primary Window / Full History / Recent / custom.
 CREATE TABLE IF NOT EXISTS backtest.model_tests (
     model_test_id            SERIAL PRIMARY KEY,
     model_id                 INTEGER NOT NULL REFERENCES backtest.models(model_id),
     run_type                 VARCHAR(20) NOT NULL CHECK (run_type IN ('historical', 'paper')),
+    run_number               INTEGER,
+    window_name              VARCHAR(50),
     simulation_start         TIMESTAMPTZ NOT NULL,
     simulation_end           TIMESTAMPTZ,
     went_live_at             TIMESTAMPTZ,
-    status                   VARCHAR(20) NOT NULL DEFAULT 'running' CHECK (status IN ('running', 'completed')),
+    status                   VARCHAR(20) NOT NULL DEFAULT 'completed' CHECK (status IN ('running', 'completed')),
     selected_for_deployment  BOOLEAN NOT NULL DEFAULT FALSE,
     configuration            JSONB NOT NULL,
+    total_capital            NUMERIC(10,2),
+    ending_balance           NUMERIC(10,4),
+    total_trades             INTEGER,
+    win_rate                 NUMERIC(5,4),
+    total_pnl                NUMERIC(10,4),
+    total_return_pct         NUMERIC(8,2),
+    annualized_return_pct    NUMERIC(8,2),
+    max_drawdown_pct         NUMERIC(8,2),
     notes                    TEXT,
     created_at               TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );

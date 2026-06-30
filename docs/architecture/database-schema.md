@@ -136,19 +136,33 @@ Allocation is decided at model assembly, not during stream tuning — locked str
 A full model backtest run — all streams running together as a unit.
 Used to validate the complete model before live deployment.
 
+`run_number` groups runs with the same allocation config (same streams + weights, different date windows). `window_name` labels the date range: Primary / Full History / Recent / custom.
+
 ```sql
   model_test_id            SERIAL PRIMARY KEY
   model_id                 INTEGER NOT NULL REFERENCES backtest.models
   run_type                 VARCHAR(20) NOT NULL   -- 'historical' | 'paper'
+  run_number               INTEGER                -- groups same-allocation runs
+  window_name              VARCHAR(50)            -- "Primary", "Full History", "Recent"
   simulation_start         TIMESTAMPTZ NOT NULL
   simulation_end           TIMESTAMPTZ            -- null if paper test still running
   went_live_at             TIMESTAMPTZ            -- paper only: when real-time feed began
   status                   VARCHAR(20) NOT NULL   -- 'running' | 'completed'
   selected_for_deployment  BOOLEAN DEFAULT FALSE  -- marks the paper test that earned live deployment
-  configuration            JSONB NOT NULL         -- full model config snapshot at run start
+  configuration            JSONB NOT NULL         -- full allocation config snapshot: {allocations: {stream: {lot_size_usd, slot_count}}}
+  total_capital            NUMERIC(10,2)          -- Σ(lot_size_usd × slot_count) across all streams
+  ending_balance           NUMERIC(10,4)
+  total_trades             INTEGER
+  win_rate                 NUMERIC(5,4)
+  total_pnl                NUMERIC(10,4)
+  total_return_pct         NUMERIC(8,2)
+  annualized_return_pct    NUMERIC(8,2)
+  max_drawdown_pct         NUMERIC(8,2)
   notes                    TEXT
   created_at               TIMESTAMPTZ DEFAULT NOW()
 ```
+
+A full pkl payload is stored at `src/app/model_runs/{model_test_id}.pkl` for chart rendering in the Model Tester.
 
 ### backtest.lots
 
@@ -198,13 +212,7 @@ Views that union backtest and live data for cross-environment comparison.
 Analytics only queries reporting — never backtest or live directly.
 
 ### reporting.all_lots (view)
-Unions `backtest.lots` and `live.lots` with a source tag.
-
-### reporting.model_performance (view)
-Aggregated metrics per model test: total return, annualized return, max drawdown, win rate, grade.
-
-### reporting.stream_performance (view)
-Aggregated metrics per stream across all runs — which stream lineages consistently perform best?
+Unions `backtest.lots` and `live.lots` with a source tag. This is the only view currently built.
 
 ---
 
