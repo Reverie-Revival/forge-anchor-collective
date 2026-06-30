@@ -38,8 +38,16 @@ MODEL_RUNS_DIR      = Path(__file__).parent.parent / "app" / "model_runs"
 
 
 def _get_engine():
-    db_url = os.getenv("DATABASE_URL", "postgresql://localhost/forge_anchor")
-    if db_url.startswith("postgresql://") and "+psycopg2" not in db_url:
+    db_url = os.getenv("DATABASE_URL")
+    if not db_url:
+        host = os.getenv("DB_HOST", "localhost")
+        port = os.getenv("DB_PORT", "5432")
+        name = os.getenv("DB_NAME", "forge_anchor")
+        user = os.getenv("DB_USER", "")
+        pwd  = os.getenv("DB_PASSWORD", "")
+        auth = f"{user}:{pwd}@" if user else ""
+        db_url = f"postgresql+psycopg2://{auth}{host}:{port}/{name}"
+    elif db_url.startswith("postgresql://") and "+psycopg2" not in db_url:
         db_url = db_url.replace("postgresql://", "postgresql+psycopg2://", 1)
     return create_engine(db_url)
 
