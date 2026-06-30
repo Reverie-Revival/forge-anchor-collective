@@ -26,8 +26,16 @@ MODEL_RUNS_DIR.mkdir(exist_ok=True)
 
 
 def get_engine():
-    db_url = os.getenv("DATABASE_URL", "postgresql://localhost/forge_anchor")
-    if db_url.startswith("postgresql://") and "+psycopg2" not in db_url:
+    db_url = os.getenv("DATABASE_URL")
+    if not db_url:
+        host = os.getenv("DB_HOST", "localhost")
+        port = os.getenv("DB_PORT", "5432")
+        name = os.getenv("DB_NAME", "forge_anchor")
+        user = os.getenv("DB_USER", "")
+        pwd  = os.getenv("DB_PASSWORD", "")
+        auth = f"{user}:{pwd}@" if user else ""
+        db_url = f"postgresql+psycopg2://{auth}{host}:{port}/{name}"
+    elif db_url.startswith("postgresql://") and "+psycopg2" not in db_url:
         db_url = db_url.replace("postgresql://", "postgresql+psycopg2://", 1)
     return create_engine(db_url)
 
@@ -189,7 +197,7 @@ def next_run_number(stream_nm: str, params_h: str, history: pd.DataFrame) -> int
                     return int(row["run_number"])
             except Exception:
                 pass
-    existing = stream_rows["run_number"].dropna()
+    existing = stream_rows["run_number"].dropna() if (not stream_rows.empty and "run_number" in stream_rows.columns) else pd.Series(dtype=float)
     return int(existing.max()) + 1 if not existing.empty else 1
 
 
