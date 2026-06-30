@@ -5,18 +5,15 @@ Run from Claude Code — results are written to model_runs/ for Model Tester to 
 Usage:
     from src.backtester.model_runner import run_model
 
-    # Equal allocation across 3 streams ($10/lot × 2 slots each = $60 total)
-    result = run_model(
-        start="2019-01-01",
-        end="2023-12-31",
-    )
+    # Equal allocation across locked streams
+    result = run_model(start="2019-01-01", end="2023-12-31")
 
-    # Custom allocation — more weight on Momentum Rider
+    # Custom allocation
     result = run_model(
         allocations={
-            "Momentum Rider v1": {"lot_size_usd": 20.0, "slot_count": 2},
-            "Dip Hunter v1":     {"lot_size_usd": 10.0, "slot_count": 2},
-            "Breakout Scout v1": {"lot_size_usd": 10.0, "slot_count": 2},
+            "Momentum Rider v1": {"lot_size_usd": 20.0, "slot_count": 2, "slot_mode": "scale_up"},
+            "Dip Hunter v1":     {"lot_size_usd": 10.0, "slot_count": 2, "slot_mode": "scale_down"},
+            "Breakout Scout v1": {"lot_size_usd": 20.0, "slot_count": 1, "slot_mode": "single"},
         },
         start="2019-01-01",
         end="2023-12-31",
@@ -58,7 +55,7 @@ def _load_locked_streams(model_id: int = 1) -> list:
     with engine.connect() as conn:
         rows = pd.read_sql(text("""
             SELECT stream_id, stream_name, stream_version, parameters,
-                   lot_size_usd, slot_count
+                   lot_size_usd, slot_count, slot_mode
             FROM backtest.streams
             WHERE model_id = :model_id
             ORDER BY stream_id
@@ -73,6 +70,7 @@ def _load_locked_streams(model_id: int = 1) -> list:
             "params":       params,
             "lot_size_usd": float(row["lot_size_usd"]),
             "slot_count":   int(row["slot_count"]),
+            "slot_mode":    str(row["slot_mode"]),
         })
     return configs
 
@@ -86,8 +84,10 @@ def run_model(
     """
     Run a model-level backtest. Loads locked streams from DB and applies allocations.
 
-    allocations: {stream_full_name: {lot_size_usd: float, slot_count: int}}
-        If None or a stream is missing from the dict, the default from backtest.streams is used.
+    allocations: {stream_full_name: {lot_size_usd, slot_count, slot_mode}}
+        Keys are stream full names (e.g. "Momentum Rider v1").
+        Any key missing from the dict uses the value locked in backtest.streams.
+        slot_mode can also be overridden per-stream here for experimentation.
     """
     stream_configs = _load_locked_streams(model_id)
 
@@ -96,10 +96,15 @@ def run_model(
             if sc["stream_name"] in allocations:
                 alloc = allocations[sc["stream_name"]]
                 sc["lot_size_usd"] = float(alloc.get("lot_size_usd", sc["lot_size_usd"]))
-                sc["slot_count"]   = int(alloc.get("slot_count",   sc["slot_count"]))
+                sc["slot_count"]   = int(alloc.get("slot_count",     sc["slot_count"]))
+                sc["slot_mode"]    = str(alloc.get("slot_mode",      sc["slot_mode"]))
 
     effective_alloc = {
-        sc["stream_name"]: {"lot_size_usd": sc["lot_size_usd"], "slot_count": sc["slot_count"]}
+        sc["stream_name"]: {
+            "lot_size_usd": sc["lot_size_usd"],
+            "slot_count":   sc["slot_count"],
+            "slot_mode":    sc["slot_mode"],
+        }
         for sc in stream_configs
     }
 
@@ -133,7 +138,7 @@ def run_model(
         "btc_bh_annualized": f"{bh['annualized_return_pct']:+.1f}%" if bh.get("annualized_return_pct") else "—",
         "streams": {
             sr["stream_name"]: {
-                "allocation":  f"${sr['lot_size_usd']:.0f}/lot × {sr['slot_count']} slots = ${sr['initial_capital']:.0f}",
+                "allocation":  f"${sr['lot_size_usd']:.0f}/lot × {sr['slot_count']} slots ({sr['slot_mode']}) = ${sr['initial_capital']:.0f}",
                 "trades":      sr["metrics"]["total_trades"],
                 "ending":      f"${sr['ending_balance']:.2f}",
                 "annualized":  f"{sr['metrics']['annualized_return_pct']:+.1f}%" if sr["metrics"]["annualized_return_pct"] is not None else "—",

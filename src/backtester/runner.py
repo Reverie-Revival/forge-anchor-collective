@@ -1,5 +1,5 @@
 """
-Programmatic entry point for conversation-driven backtesting.
+Programmatic entry point for stream-level backtesting.
 Run from Claude Code — results are written to a file the Streamlit app watches.
 """
 import pickle
@@ -8,7 +8,7 @@ import json
 import hashlib
 from pathlib import Path
 
-from .engine import run_backtest
+from .engine import run_backtest, SLOT_MODES
 from .metrics import compute_metrics, btc_buy_and_hold
 
 LAST_RUN_PATH = Path(__file__).parent.parent / "app" / ".last_run.pkl"
@@ -27,14 +27,33 @@ def _params_hash(params: dict) -> str:
     return hashlib.md5(json.dumps(_strip_none(params), sort_keys=True).encode()).hexdigest()[:10]
 
 
-def run(params: dict, stream_name: str, start: str = None, end: str = None, n_slots: int = 2) -> dict:
+def run(
+    params: dict,
+    stream_name: str,
+    start: str = None,
+    end: str = None,
+    slot_count: int = 1,
+    slot_mode: str = 'single',
+    lot_size_usd: float = 10.0,
+) -> dict:
     """
-    Run a backtest and push results to the Streamlit app.
+    Run a stream backtest and push results to the Streamlit app.
     Returns a summary dict for display in the conversation.
-    """
-    initial_capital = n_slots * 10.0
 
-    result  = run_backtest(params, start=start, end=end, n_slots=n_slots, stream_name=stream_name)
+    slot_mode: 'single' | 'scale_down' | 'scale_up'
+    lot_size_usd: capital per slot (total = lot_size_usd × slot_count)
+    """
+    initial_capital = lot_size_usd * slot_count
+
+    result  = run_backtest(
+        params,
+        start=start,
+        end=end,
+        slot_count=slot_count,
+        slot_mode=slot_mode,
+        stream_name=stream_name,
+        lot_size_usd=lot_size_usd,
+    )
     trades  = result["trades"]
     df      = result["df"]
     metrics = compute_metrics(trades, initial_capital, result["start"], result["end"])
@@ -43,22 +62,23 @@ def run(params: dict, stream_name: str, start: str = None, end: str = None, n_sl
     ending_balance = initial_capital + (trades["pnl"].sum() if not trades.empty else 0)
 
     payload = {
-        "stream_name":    stream_name,
-        "params":         params,
-        "result":         result,
-        "trades":         trades,
-        "df":             df,
-        "metrics":        metrics,
-        "bh":             bh,
+        "stream_name":     stream_name,
+        "params":          params,
+        "result":          result,
+        "trades":          trades,
+        "df":              df,
+        "metrics":         metrics,
+        "bh":              bh,
         "initial_capital": initial_capital,
-        "ending_balance": ending_balance,
+        "ending_balance":  ending_balance,
+        "slot_count":      slot_count,
+        "slot_mode":       slot_mode,
+        "lot_size_usd":    lot_size_usd,
     }
 
     with open(LAST_RUN_PATH, "wb") as f:
         pickle.dump(payload, f)
 
-    # Also write a pending file so multiple windows of the same config
-    # all show as unsaved tabs simultaneously in the Stream Tester.
     RUNS_DIR.mkdir(exist_ok=True)
     ph        = _params_hash(params)
     start_str = str(result["start"])[:10]
@@ -71,9 +91,12 @@ def run(params: dict, stream_name: str, start: str = None, end: str = None, n_sl
     return {
         "stream":             stream_name,
         "period":             f"{result['start'].date()} → {result['end'].date()}",
+        "slot_count":         slot_count,
+        "slot_mode":          slot_mode,
+        "lot_size_usd":       f"${lot_size_usd:.2f}",
+        "initial_capital":    f"${initial_capital:.2f}",
         "signals":            int(result["signals"].sum()),
         "trades":             metrics["total_trades"],
-        "starting_balance":   f"${initial_capital:.2f}",
         "ending_balance":     f"${ending_balance:.2f}",
         "total_pnl":          f"${metrics['total_pnl']:+.2f}",
         "total_return":       f"{metrics['total_return_pct']:.1f}%",

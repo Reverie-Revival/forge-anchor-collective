@@ -1,35 +1,91 @@
 """
-Dashboard renderer for a single backtest run.
+Dashboard renderer for a single stream backtest run.
 """
 import streamlit as st
 import plotly.graph_objects as go
+import pandas as pd
 
 from .utils import SP500_HISTORICAL_AVG, fetch_sp500, candle_hours, grade_info, label_window
-from .db import load_stream_history, save_stream_test
+from .db import load_stream_history, load_timeframe_presets, save_stream_test
 
 
-def _render_save(payload, result, display_name, params, metrics, initial_capital, ending_capital, key_prefix):
-    st.divider()
-    st.subheader("💾 Save This Run")
-    auto_window = label_window(result["start"], result["end"])
+def _preset_save_ui(payload, result, display_name, params, metrics,
+                    initial_capital, ending_capital, key_prefix):
+    """Preset-based save UI — replaces free-text window name field."""
+    presets = load_timeframe_presets()
+
+    # Auto-detect which preset matches this run's actual simulation dates
+    run_start = pd.Timestamp(result["start"]).date()
+    run_end   = pd.Timestamp(result["end"]).date()
+
+    def _matches(preset) -> bool:
+        ps = preset["start_date"]
+        pe = preset["end_date"]
+        # start must be within 5 days (warmup clip can shift it slightly)
+        if hasattr(ps, "date"):
+            ps = ps
+        else:
+            ps = pd.Timestamp(ps).date()
+        if abs((run_start - ps).days) > 5:
+            return False
+        # open-ended preset: run_end just needs to be past preset start
+        if pe is None:
+            return True
+        pe = pe if not hasattr(pe, "date") else pe
+        if isinstance(pe, str):
+            pe = pd.Timestamp(pe).date()
+        return abs((run_end - pe).days) <= 5
+
+    matched_preset_id = None
+    for p in presets:
+        if _matches(p):
+            matched_preset_id = p["preset_id"]
+            break
+
+    options       = [f"{p['name']}" for p in presets] + ["Custom"]
+    default_idx   = next((i for i, p in enumerate(presets) if p["preset_id"] == matched_preset_id),
+                         len(options) - 1)
+
     sc1, sc2 = st.columns([1, 2])
-    save_window = sc1.text_input("Window name", value=auto_window,
-                                 key=f"{key_prefix}_window")
-    save_notes  = sc2.text_input("Notes (optional)", key=f"{key_prefix}_notes",
-                                 placeholder="e.g. bullish candle filter adds +0.8% annualized")
+    selected_label = sc1.selectbox("Timeframe", options, index=default_idx,
+                                   key=f"{key_prefix}_preset_sel")
+    save_notes     = sc2.text_input("Notes (optional)", key=f"{key_prefix}_notes",
+                                    placeholder="e.g. tighter stop improves by +0.8%")
+
+    save_preset_id   = None
+    save_custom_start = None
+    save_custom_end   = None
+
+    if selected_label == "Custom":
+        d1, d2 = st.columns(2)
+        save_custom_start = d1.date_input("Start date", value=run_start,
+                                          key=f"{key_prefix}_cstart")
+        open_ended = d2.checkbox("Open-ended (no end date)", key=f"{key_prefix}_open")
+        if not open_ended:
+            save_custom_end = d2.date_input("End date", value=run_end,
+                                            key=f"{key_prefix}_cend")
+    else:
+        save_preset_id = next(p["preset_id"] for p in presets if p["name"] == selected_label)
+
     if st.button("Save to Database", type="secondary", key=f"{key_prefix}_save"):
         try:
             history_df = load_stream_history()
-            test_id, run_num, win_nm = save_stream_test(
+            test_id, run_num = save_stream_test(
                 stream_name=display_name, params=params, result=result,
                 metrics=metrics, initial_capital=initial_capital,
                 ending_balance=ending_capital, payload=payload,
-                window_name=save_window, notes=save_notes, history=history_df,
+                preset_id=save_preset_id,
+                custom_start=save_custom_start,
+                custom_end=save_custom_end,
+                notes=save_notes, history=history_df,
             )
             ann_pct = metrics["annualized_return_pct"]
             ann_str = f"{ann_pct:+.1f}% annualized" if ann_pct is not None else "no trades"
+            timeframe_label = selected_label if selected_label != "Custom" else (
+                f"{save_custom_start} → {save_custom_end or 'present'}"
+            )
             st.success(
-                f"Saved — Run #{run_num} · {win_nm} · **{display_name}** · "
+                f"Saved — Run #{run_num} · {timeframe_label} · **{display_name}** · "
                 f"{metrics['total_trades']} trades · {ann_str}."
             )
             st.cache_data.clear()
@@ -47,6 +103,8 @@ def render_dashboard(payload: dict, show_save: bool = True, key_prefix: str = "d
     initial_capital = payload["initial_capital"]
     ending_capital  = payload["ending_balance"]
     display_name    = payload["stream_name"]
+    slot_count      = payload.get("slot_count", 1)
+    slot_mode       = payload.get("slot_mode", "single")
     period_str      = f"{result['start'].date()} → {result['end'].date()}"
     tf              = params.get("primary_timeframe") or "15m"
     c_hrs           = candle_hours(params)
@@ -68,8 +126,11 @@ def render_dashboard(payload: dict, show_save: bool = True, key_prefix: str = "d
     col_title, col_grade = st.columns([3, 1])
     with col_title:
         st.subheader(display_name)
+        slot_desc = f"{slot_count} slot{'s' if slot_count > 1 else ''}" + (
+            f" · {slot_mode}" if slot_mode != "single" else ""
+        )
         st.caption(
-            f"{period_str}  ·  {tf} candles  ·  "
+            f"{period_str}  ·  {tf} candles  ·  {slot_desc}  ·  "
             f"{result['signals'].sum()} signals  ·  {metrics['total_trades']} trades"
         )
     with col_grade:
@@ -91,10 +152,9 @@ def render_dashboard(payload: dict, show_save: bool = True, key_prefix: str = "d
 
     h1, h2, h3, h4 = st.columns(4)
     h1.metric("Starting Balance", f"${initial_capital:.2f}",
-              help=f"{result.get('n_slots', 2)} slots × $10 each.")
+              help=f"{slot_count} slot{'s' if slot_count > 1 else ''} · ${initial_capital/slot_count:.2f}/lot")
     h2.metric("Ending Balance", f"${ending_capital:.2f}",
-              delta=f"{ending_capital - initial_capital:+.2f}", delta_color="normal",
-              help="Total value after all trades and fees.")
+              delta=f"{ending_capital - initial_capital:+.2f}", delta_color="normal")
     h3.metric(
         "Annualized Return",
         f"{ann:+.1f}%" if ann is not None else "—",
@@ -130,7 +190,10 @@ def render_dashboard(payload: dict, show_save: bool = True, key_prefix: str = "d
 
     if not has_trades:
         if show_save:
-            _render_save(payload, result, display_name, params, metrics, initial_capital, ending_capital, key_prefix)
+            st.divider()
+            st.subheader("💾 Save This Run")
+            _preset_save_ui(payload, result, display_name, params, metrics,
+                            initial_capital, ending_capital, key_prefix)
         return
 
     # Trade stats
@@ -283,4 +346,7 @@ def render_dashboard(payload: dict, show_save: bool = True, key_prefix: str = "d
         )
 
     if show_save:
-        _render_save(payload, result, display_name, params, metrics, initial_capital, ending_capital, key_prefix)
+        st.divider()
+        st.subheader("💾 Save This Run")
+        _preset_save_ui(payload, result, display_name, params, metrics,
+                        initial_capital, ending_capital, key_prefix)

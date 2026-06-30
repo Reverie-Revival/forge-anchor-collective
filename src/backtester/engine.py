@@ -13,6 +13,11 @@ load_dotenv()
 
 MAKER_FEE = 0.0025  # 0.25% per side
 
+# Valid slot modes. 'single' = one slot only.
+# 'scale_down' = slot 2 adds when price drops below slot 1's entry (DH pattern).
+# 'scale_up'   = slot 2 adds when price rises above slot 1's entry + original signal fires (MR pattern).
+SLOT_MODES = ('single', 'scale_down', 'scale_up')
+
 
 def _warmup_days(params: dict) -> int:
     """
@@ -63,7 +68,6 @@ def _warmup_days(params: dict) -> int:
 
 def load_market_data(start: str = None, end: str = None) -> pd.DataFrame:
     db_url = os.getenv("DATABASE_URL", "postgresql://localhost/forge_anchor")
-    # SQLAlchemy expects postgresql+psycopg2://
     if db_url.startswith("postgresql://") and "+psycopg2" not in db_url:
         db_url = db_url.replace("postgresql://", "postgresql+psycopg2://", 1)
     engine = create_engine(db_url)
@@ -72,7 +76,7 @@ def load_market_data(start: str = None, end: str = None) -> pd.DataFrame:
     if start:
         conditions.append(f"timestamp >= '{start}'")
     if end:
-        conditions.append(f"timestamp < '{end}'")
+        conditions.append(f"timestamp <= '{end} 23:59:59'")
     where = (" WHERE " + " AND ".join(conditions)) if conditions else ""
     query = f"SELECT timestamp AT TIME ZONE 'UTC' AS ts, open, high, low, close, volume FROM market_data{where} ORDER BY timestamp"
 
@@ -128,7 +132,6 @@ def _run_slot(df: pd.DataFrame, signals: pd.Series, params: dict, slot: int,
             if partial and not open_trade["partial_done"]:
                 gain = (row["close"] - open_trade["entry_price"]) / open_trade["entry_price"]
                 if gain >= partial["at_gain_pct"] / 100.0:
-                    # record partial close (treated as a separate trade record)
                     exit_pct = partial["exit_pct"] / 100.0
                     partial_capital = open_trade["capital"] * exit_pct
                     pnl = partial_capital * gain - partial_capital * fee * 2
@@ -200,25 +203,72 @@ def _run_slot(df: pd.DataFrame, signals: pd.Series, params: dict, slot: int,
     return trades
 
 
+def _build_slot1_state(df: pd.DataFrame, slot1_trades: list) -> tuple[pd.Series, pd.Series]:
+    """
+    From completed slot 1 trades, build vectorized state series.
+    Returns (open_mask, entry_prices):
+      open_mask    — bool Series, True during any slot 1 open position
+      entry_prices — float Series, slot 1's entry price during open positions, NaN otherwise
+    """
+    open_mask    = pd.Series(False,         index=df.index)
+    entry_prices = pd.Series(float('nan'),  index=df.index)
+
+    for trade in slot1_trades:
+        mask = (df.index >= trade["entry_ts"]) & (df.index <= trade["exit_ts"])
+        open_mask.loc[mask]    = True
+        entry_prices.loc[mask] = trade["entry_price"]
+
+    return open_mask, entry_prices
+
+
+def _derive_slot2_signals(
+    df: pd.DataFrame,
+    slot1_trades: list,
+    slot_mode: str,
+    params: dict,
+    base_signals: pd.Series,
+) -> pd.Series:
+    """
+    Derive slot 2 entry signals from slot 1's trade history.
+
+    scale_down: enter when slot 1 is open AND price drops >= slot2_trigger_pct below entry.
+    scale_up:   enter when slot 1 is open AND price rises >= slot2_trigger_pct above entry
+                AND the original signal also fires (confirm trend, not chase).
+    """
+    trigger_pct = params.get("position", {}).get("slot2_trigger_pct", 3.0) / 100.0
+    open_mask, entry_prices = _build_slot1_state(df, slot1_trades)
+
+    if slot_mode == 'scale_down':
+        return open_mask & (df["close"] <= entry_prices * (1 - trigger_pct))
+
+    if slot_mode == 'scale_up':
+        return open_mask & (df["close"] >= entry_prices * (1 + trigger_pct)) & base_signals
+
+    return pd.Series(False, index=df.index)
+
+
 def run_backtest(
     params: dict,
     start: str = None,
     end: str = None,
-    n_slots: int = 2,
+    slot_count: int = 1,
+    slot_mode: str = 'single',
     stream_name: str = "unnamed",
     lot_size_usd: float = 10.0,
 ) -> dict:
     """
     Run a full backtest for a single stream configuration.
 
-    Returns a dict with:
-      - trades: DataFrame of all closed trades
-      - df: market data with indicators and signals
-      - params: the stream config used
-      - stream_name: label for display
+    slot_mode controls how multiple slots enter:
+      'single'     — one slot, lot_size_usd capital
+      'scale_down' — slot 2 adds when price drops X% below slot 1's entry (see slot2_trigger_pct in params.position)
+      'scale_up'   — slot 2 adds when price rises X% above slot 1's entry AND signal fires
+
+    Returns a dict with trades DataFrame, market data, params, and metadata.
     """
-    # Load extra warmup data so every indicator has a full lookback window on day 1.
-    # Indicators are computed on the full dataset; signals are clipped to [start, end].
+    if slot_mode not in SLOT_MODES:
+        raise ValueError(f"slot_mode must be one of {SLOT_MODES}, got '{slot_mode}'")
+
     primary_tf = params.get("primary_timeframe")
     warmup     = _warmup_days(params)
     load_start = (
@@ -230,7 +280,6 @@ def run_backtest(
     if primary_tf:
         df = resample_ohlcv(df, primary_tf)
 
-    # Join F&G sentiment if the stream uses it
     if params.get("sentiment"):
         fng_map = load_sentiment(load_start, end)
         df["fng_value"] = df.index.date
@@ -238,18 +287,20 @@ def run_backtest(
 
     df = add_indicators(df, params)
 
-    # Clip to original start — warmup rows are dropped after indicators are computed
     if start:
         clip_ts = pd.Timestamp(start)
         df = df[df.index >= clip_ts]
 
     signals = generate_signals(df, params)
 
-    capital_per_slot = lot_size_usd
-    all_trades = []
-    for slot in range(1, n_slots + 1):
-        slot_trades = _run_slot(df, signals, params, slot, initial_capital=capital_per_slot)
-        all_trades.extend(slot_trades)
+    # --- Slot dispatch ---
+    slot1_trades = _run_slot(df, signals, params, slot=1, initial_capital=lot_size_usd)
+    all_trades = slot1_trades
+
+    if slot_count >= 2 and slot_mode in ('scale_down', 'scale_up'):
+        slot2_signals = _derive_slot2_signals(df, slot1_trades, slot_mode, params, signals)
+        slot2_trades  = _run_slot(df, slot2_signals, params, slot=2, initial_capital=lot_size_usd)
+        all_trades    = slot1_trades + slot2_trades
 
     trades_df = pd.DataFrame(all_trades)
     if not trades_df.empty:
@@ -257,11 +308,12 @@ def run_backtest(
 
     return {
         "stream_name": stream_name,
-        "params": params,
-        "df": df,
-        "signals": signals,
-        "trades": trades_df,
-        "start": df.index[0] if len(df) else start,
-        "end": df.index[-1] if len(df) else end,
-        "n_slots": n_slots,
+        "params":      params,
+        "df":          df,
+        "signals":     signals,
+        "trades":      trades_df,
+        "start":       df.index[0] if len(df) else start,
+        "end":         df.index[-1] if len(df) else end,
+        "slot_count":  slot_count,
+        "slot_mode":   slot_mode,
     }

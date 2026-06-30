@@ -14,10 +14,11 @@ def run_model_backtest(stream_configs: list, start: str = None, end: str = None)
 
     stream_configs: list of dicts, each with:
         stream_id    (int)
-        stream_name  (str)  — full name including version, e.g. "Momentum Rider v1"
-        params       (dict) — backtest params from backtest.streams
-        lot_size_usd (float)
-        slot_count   (int)
+        stream_name  (str)   — full name including version, e.g. "Momentum Rider v1"
+        params       (dict)  — backtest params from backtest.streams
+        lot_size_usd (float) — capital per slot
+        slot_count   (int)   — max concurrent positions for this stream
+        slot_mode    (str)   — 'single' | 'scale_down' | 'scale_up'
 
     Returns a combined payload dict with per-stream results and aggregated metrics.
     """
@@ -31,7 +32,8 @@ def run_model_backtest(stream_configs: list, start: str = None, end: str = None)
             sc["params"],
             start=start,
             end=end,
-            n_slots=sc["slot_count"],
+            slot_count=sc["slot_count"],
+            slot_mode=sc.get("slot_mode", "single"),
             stream_name=sc["stream_name"],
             lot_size_usd=sc["lot_size_usd"],
         )
@@ -53,6 +55,7 @@ def run_model_backtest(stream_configs: list, start: str = None, end: str = None)
             "stream_name":     sc["stream_name"],
             "lot_size_usd":    sc["lot_size_usd"],
             "slot_count":      sc["slot_count"],
+            "slot_mode":       sc.get("slot_mode", "single"),
             "initial_capital": initial_capital,
             "ending_balance":  ending_balance,
             "result":          result,
