@@ -1,29 +1,48 @@
 # Handoff — 2026-06-30
 
-## Done
+## Done This Session
 
-### v2-rebuild branch — full architecture overhaul committed
+### v2 Architecture Rebuild (merged to main)
 
-Complete from-scratch rebuild on the `v2-rebuild` branch:
-- **New schema:** `timeframe_presets` table replaces free-text `window_name`. Preset-based timeframes with FK reference. 4 standard presets seeded.
-- **Slot redesign:** `slot_mode` per stream (`single` / `scale_down` / `scale_up`). Slot 2 entry is now intentional and stream-specific, not redundant. Independent trailing stops per lot.
-- **`reset_backtest.sql`:** Safely resets all backtest data. `live.*` tables are explicitly excluded with a comment — protected by design.
-- All app modules rebuilt: `db.py`, `dashboard.py`, `stream_tester.py`, `model_dashboard.py`, `pages/model_tester.py`.
+Full from-scratch rebuild on `v2-rebuild` branch, now merged. Every layer changed:
 
-### Model 1 — clean v2 baseline established
+**Database:**
+- `timeframe_presets` table replaces free-text `window_name`. 4 standard presets seeded (Primary Window, Full History, Recent, 2026 YTD).
+- `backtest.stream_tests`: `preset_id` FK + `slot_count` + `slot_mode` + `simulation_start/end`
+- `backtest.streams`: `slot_mode` column added (`single` / `scale_down` / `scale_up`)
+- `reset_backtest.sql`: safely wipes all backtest data — `live.*` explicitly excluded with policy comment
+- `reseed_model1.py`: script to fully restore DB from scratch if needed
 
-All 3 streams re-locked and all 12 stream tests saved (3 streams × 4 presets).
-Model-level tests run and saved for all 4 presets.
+**Engine:**
+- `slot_mode` dispatch — `scale_down` averages down, `scale_up` pyramids up, `single` is one slot only
+- Slot 2 entry is derived from slot 1's actual trade history (not a duplicate signal)
+- Independent trailing stops per lot (already worked via `high_water_mark` — now documented)
 
-**Stream test results (v2 baseline, 1 slot × $10):**
+**App:**
+- Preset dropdown save UI (replaces free-text window name input)
+- Tabs always sorted alphabetically by timeframe label
+- `slot_mode` and `slot_count` shown in stream/allocation display
+- DB connection fixed: `app.py` now calls `load_dotenv()` at startup; `get_engine()` reads individual env vars
+- `next_run_number()` hardened against empty DataFrames
+
+**Docs/specs:**
+- `database-schema.md`: fully updated to v2 schema
+- `dip-hunter-v1.md`: rewritten to match actual locked config (`rsi_recovery`, not early `rsi_dip` iteration)
+- `model-1.md`: updated to reflect 3 locked streams, actual allocation, v2 results
+- `steady-climber-v1.md`, `surge-rider-v1.md`: flagged as placeholder — never built
+- `src/backtester/runner.py`: deleted (v1 entry point, replaced by `model_runner.py`)
+
+### Model 1 v2 Baseline — Clean Data in DB
+
+Stream tests (test_id 1–12, 3 streams × 4 presets, 1 slot × $10):
 
 | Stream | Primary | Full History | Recent | 2026 YTD |
 |---|---|---|---|---|
-| Momentum Rider v1 | +11.4% / 100 trades | +2.9% / 154 trades | +1.0% / 41 trades | -28.1% / 4 trades |
-| Dip Hunter v1 | +13.8% / 39 trades | +7.0% / 80 trades | +9.2% / 17 trades | -19.1% / 11 trades |
-| Breakout Scout v1 | +13.0% / 18 trades | +6.4% / 30 trades | +0.4% / 8 trades | — / 0 trades |
+| Momentum Rider v1 | +11.4% / 100 trades | +2.9% | +1.0% | -28.1% |
+| Dip Hunter v1 | +13.8% / 39 trades | +7.0% | +9.2% | -19.1% |
+| Breakout Scout v1 | +13.0% / 18 trades | +6.4% | +0.4% | 0 trades |
 
-**Model-level results (equal allocation $33.33/lot × 1 slot × 3 streams = $99.99):**
+Model tests (model_test_id 1–4, equal $33.33/slot × 1 slot × 3 streams = $100):
 
 | Window | Ann. Return | Trades | Max DD |
 |---|---|---|---|
@@ -32,45 +51,62 @@ Model-level tests run and saved for all 4 presets.
 | Recent (2024–) | +3.6% | 66 | -19.6% |
 | 2026 YTD | -16.2% | 15 | -8.6% |
 
-**Note on v2 vs v1 numbers:** MR v1 Primary was +17.8% in v1, now +11.4%. Not a param change — v2 engine has slightly different candle boundary handling (end date now inclusive via `timestamp <= '2023-12-31 23:59:59'` vs v1's exclusive `timestamp < '2023-12-31'`). These are the correct v2 baselines. Do not compare to v1 numbers.
-
-**DH params correction:** The spec file showed an early iteration (`rsi_dip`). The actual locked config is `rsi_recovery` with F&G < 20 and 90-day drawdown filter. This is confirmed from the lock commit (`e499c72`).
+**Note on v2 vs v1 numbers:** MR Primary +11.4% vs v1's +17.8%. This is the v2 baseline — end-date boundary handling changed (now inclusive), engine is correct. Do not compare to v1 figures.
 
 ---
 
-## Key DB state
+## Current DB State
 
-- `backtest.models` — model_id=1 (Model 1)
-- `backtest.streams` — stream_id=1 (MR), 2 (DH), 3 (BS), all locked with slot_count=1 / slot_mode=single
-- `backtest.stream_tests` — test_ids 1–12 (3 streams × 4 presets), all with pkl files in `src/app/runs/`
-- `backtest.model_tests` — model_test_ids 1–4 (4 presets, run #1), all with pkl files in `src/app/model_runs/`
+- `backtest.models`: model_id=1
+- `backtest.streams`: stream_id=1 (MR), 2 (DH), 3 (BS) — all slot_count=1, slot_mode='single'
+- `backtest.stream_tests`: test_id 1–12, all with pkl in `src/app/runs/`
+- `backtest.model_tests`: model_test_id 1–4, all with pkl in `src/app/model_runs/`
+
+To fully restore DB from scratch: `source .venv/bin/activate && python -m src.data.reseed_model1`
 
 ---
 
 ## What's Next
 
-### 1. Experiment with slot behavior per stream (ready to start)
-Now that clean baseline data is in and the engine supports `slot_mode`, test each stream with its natural slot behavior:
-- **DH:** `slot_mode='scale_down'` — slot 2 averages down when price drops X% from slot 1 entry
-- **MR:** `slot_mode='scale_up'` — slot 2 pyramids up when trade is winning and signal re-fires
-- **BS:** Keep `slot_count=1` — confirmed: a failed breakout is a bad place to double down
+### 1. Stream re-testing with slot modes (first priority)
 
-### 2. Consider adjusting MR trailing stop
-MR got +1.0% in the 2024 bull year. The 5% trailing stop is good for trend-riding but got shaken out in the aggressive 2024 bounce. Could test 7-8% trail on MR in isolation before the next model assembly.
+The current baseline uses `slot_mode='single'` (1 slot each). The next step is to test each stream with its intended slot behavior:
 
-### 3. Streams 4 and 5 (optional for Model 2 design)
-Current 3-stream model may be complete enough for Model 1. Decision point when user returns.
+- **Dip Hunter**: `slot_mode='scale_down'` — slot 2 enters when price drops X% from slot 1's entry. Tune `slot2_trigger_pct` in `params["position"]`. Could improve avg entry price in oversold conditions.
+- **Momentum Rider**: `slot_mode='scale_up'` — slot 2 adds when trade is up X% and original signal fires again. Pyramid into winners.
+- **Breakout Scout**: stays `slot_count=1` — a failed breakout is the worst time to add.
+
+Run each in Stream Tester, compare against the single-slot baseline (test_id 2, 6, 10 = Primary Window locked tests). If an improved config earns a lock, update `backtest.streams`:
+```sql
+UPDATE backtest.streams
+SET parameters = '...', locked_test_id = <new_test_id>, slot_mode = 'scale_down', slot_count = 2
+WHERE stream_id = 2;  -- DH
+```
+Then re-run model via `run_model()` and compare.
+
+### 2. MR trailing stop experiment (optional)
+
+MR got only +1.0% in the 2024 bull run — the 5% trailing stop got shaken out early. Worth testing 7% or 8% trail on MR Primary to see if it captures longer trend moves without sacrificing too much of the current result.
+
+### 3. Model deployment decision
+
+When streams feel locked at their best config, decide whether Model 1 is ready for live deployment:
+- Primary +12.7% beats S&P (~10%) ✓
+- All 3 streams validated with confirmed regime complementarity ✓
+- Live schema not yet built — Kraken API integration needed before any real money moves
 
 ---
 
-## Key files
+## Architecture Reference
 
 | File | Purpose |
 |---|---|
-| `src/backtester/engine.py` | Slot logic: `_run_slot()`, `_derive_slot2_signals()`, `slot_mode` dispatch |
-| `src/backtester/model_runner.py` | Entry point — pass explicit allocations |
-| `src/data/reseed_model1.py` | Reseed script — run to restore DB from scratch |
-| `src/data/reset_backtest.sql` | Wipe backtest schema (excludes `live.*`) |
-| `src/app/db.py` | All DB ops including `save_stream_test`, `save_model_test` |
-| `src/app/dashboard.py` | Stream Tester charts and save UI |
-| `src/app/model_dashboard.py` | Model Tester charts including racing lines |
+| `src/backtester/engine.py` | `_run_slot()`, `_derive_slot2_signals()`, slot_mode dispatch |
+| `src/backtester/model_runner.py` | `run_model()` — always pass explicit allocations |
+| `src/data/reseed_model1.py` | Full DB restore from scratch |
+| `src/data/reset_backtest.sql` | Wipe backtest schema (excludes live.*) |
+| `src/data/schema.sql` | Full v2 schema definition |
+| `src/data/seed_presets.sql` | Standard preset definitions |
+| `src/app/db.py` | All DB ops — save/load stream tests, model tests, presets |
+| `src/app/dashboard.py` | Stream Tester charts and preset save UI |
+| `src/app/model_dashboard.py` | Model Tester charts, racing lines, allocation display |
