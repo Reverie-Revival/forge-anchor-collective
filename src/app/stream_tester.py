@@ -19,9 +19,10 @@ from src.app.db import (
 from src.app.dashboard import render_dashboard
 
 KNOWN_STREAMS = [
-    "Momentum Rider v1",
-    "Dip Hunter v1",
     "Breakout Scout v1",
+    "Dip Hunter v1",
+    "Momentum Rider v1",
+    "Momentum Rider v2",
     "Steady Climber v1",
     "Surge Rider v1",
 ]
@@ -171,7 +172,7 @@ if not history.empty:
         run_groups.setdefault(skey, {}).setdefault(rnum, []).append(row)
 
 all_streams = list(dict.fromkeys(
-    KNOWN_STREAMS + [s for s in run_groups if s not in KNOWN_STREAMS]
+    KNOWN_STREAMS + sorted(s for s in run_groups if s not in KNOWN_STREAMS)
 ))
 
 # ── Sidebar ────────────────────────────────────────────────────────────────────

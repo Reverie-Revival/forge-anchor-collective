@@ -12,6 +12,7 @@ from .db import load_model_history, load_timeframe_presets, save_model_test
 # Stream colors — consistent across all charts
 STREAM_COLORS = {
     "Momentum Rider v1": "#4ade80",   # green  — bull trending
+    "Momentum Rider v2": "#22c55e",   # green (deeper) — MR upgraded
     "Dip Hunter v1":     "#f59e0b",   # amber  — bear recovery
     "Breakout Scout v1": "#60a5fa",   # blue   — breakout
 }

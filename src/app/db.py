@@ -418,22 +418,27 @@ def _pending_model_for_hash(ah: str, exclude: set = None) -> list:
     return pending
 
 
-def next_model_run_number(model_id: int, alloc_h: str, history: pd.DataFrame) -> int:
-    model_rows = history[history["model_id"] == model_id] if not history.empty else pd.DataFrame()
-    if not model_rows.empty:
-        for _, row in model_rows.iterrows():
-            try:
-                cfg = row["configuration"]
-                if isinstance(cfg, str):
-                    cfg = json.loads(cfg)
-                if _alloc_hash(cfg.get("allocations", {})) == alloc_h:
-                    return int(row["run_number"])
-            except Exception:
-                pass
-    if model_rows.empty:
+def next_model_run_number(model_id: int, alloc_h: str) -> int:
+    """Query DB fresh — never rely on a passed DataFrame to avoid stale-history bugs."""
+    engine = get_engine()
+    with engine.connect() as conn:
+        rows = conn.execute(text("""
+            SELECT run_number, configuration
+            FROM backtest.model_tests
+            WHERE model_id = :m
+            ORDER BY run_number ASC
+        """), {"m": model_id}).fetchall()
+    if not rows:
         return 1
-    existing = model_rows["run_number"].dropna()
-    return int(existing.max()) + 1 if not existing.empty else 1
+    for run_num, cfg in rows:
+        try:
+            if isinstance(cfg, str):
+                cfg = json.loads(cfg)
+            if _alloc_hash(cfg.get("allocations", {})) == alloc_h:
+                return int(run_num)
+        except Exception:
+            pass
+    return max(int(r[0]) for r in rows) + 1
 
 
 def save_model_test(
@@ -442,7 +447,7 @@ def save_model_test(
     custom_start=None,
     custom_end=None,
     notes: str = "",
-    history: pd.DataFrame = None,
+    history: pd.DataFrame = None,  # kept for backwards-compat, ignored
 ) -> tuple:
     """
     Save a model test result to the database.
@@ -452,10 +457,9 @@ def save_model_test(
     cm       = payload["combined_metrics"]
     alloc    = payload["allocations"]
     ah       = _alloc_hash(alloc)
-    hist     = history if history is not None else pd.DataFrame()
     model_id = payload.get("model_id", 1)
 
-    run_num = next_model_run_number(model_id, ah, hist)
+    run_num = next_model_run_number(model_id, ah)
     configuration = json.dumps({"allocations": alloc})
 
     with engine.connect() as conn:

@@ -113,7 +113,23 @@ with st.sidebar:
             (r["annualized_return_pct"] for r in rows if pd.notna(r["annualized_return_pct"])),
             default=None,
         )
+        # Build a short stream-version tag from the alloc config (e.g. "MR v2 · DH v1 · BS v1")
+        try:
+            cfg = rows[0]["configuration"]
+            if isinstance(cfg, str):
+                cfg = json.loads(cfg)
+            alloc_keys = list(cfg.get("allocations", {}).keys())
+            def _abbrev(name):
+                parts = name.split()
+                # e.g. "Momentum Rider v2" → "MR v2", "Dip Hunter v1" → "DH v1"
+                initials = "".join(w[0] for w in parts[:-1])
+                return f"{initials} {parts[-1]}"
+            stream_tag = " · ".join(_abbrev(k) for k in alloc_keys)
+        except Exception:
+            stream_tag = ""
         lbl = f"#{rnum}"
+        if stream_tag:
+            lbl += f"  {stream_tag}"
         if best is not None:
             lbl += f"  ·  {best:+.1f}%"
         if len(rows) > 1:
@@ -146,7 +162,7 @@ with st.sidebar:
         if latest_matches_run is None:
             latest_is_new  = True
             new_run_num    = next_model_run_number(
-                latest_run.get("model_id", 1), lr_ah, history
+                latest_run.get("model_id", 1), lr_ah
             )
             run_options.append("__new__")
             run_labels["__new__"] = f"⏳ Run #{new_run_num} — unsaved"
@@ -189,9 +205,8 @@ with st.sidebar:
             lot      = a.get("lot_size_usd", 10)
             slots    = a.get("slot_count", 2)
             subtotal = lot * slots
-            short    = stream_name.rsplit(" ", 1)[0]
             st.markdown(
-                f'<span style="color:{color};font-size:0.8rem;">{short}</span>  '
+                f'<span style="color:{color};font-size:0.8rem;">{stream_name}</span>  '
                 f'<span style="color:#888;font-size:0.8rem;">'
                 f'\\${lot:.2f}/lot × {slots} = <b>\\${subtotal:.2f}</b></span>',
                 unsafe_allow_html=True,
