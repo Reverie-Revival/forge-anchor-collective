@@ -340,13 +340,16 @@ elif selected_run is not None and selected_run in stream_runs:
     saved_rows   = stream_runs[selected_run]
     pending_runs = load_pending_runs(saved_rows)
 
-    tab_entries = []
+    saved_entries = []
     for row in saved_rows:
         lbl = row.get("timeframe_label") or label_window(
             row.get("simulation_start") or row.get("custom_start"),
             row.get("simulation_end") or row.get("custom_end"),
         )
-        tab_entries.append({"label": lbl, "type": "saved", "data": row})
+        saved_entries.append({"label": lbl, "type": "saved", "data": row})
+    saved_entries.sort(key=lambda e: e["label"])
+
+    tab_entries = saved_entries
     for pr in pending_runs:
         lbl = label_window(pr["start"], pr["end"])
         tab_entries.append({"label": f"⏳ {lbl}", "type": "pending", "data": pr})
