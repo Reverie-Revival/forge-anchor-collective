@@ -1,4 +1,4 @@
-# Handoff — 2026-06-30
+# Handoff — 2026-06-30 (updated)
 
 ## Done
 
@@ -119,24 +119,63 @@ This is an engine-level change that requires a feature branch before touching `e
 
 ---
 
-## Next Up
+## Roadmap
 
-### Priority: Deployment Decision
+| Priority | Path | Notes |
+|---|---|---|
+| **1** | **Deploy Model 1 Live** | Kraken API integration, `live.*` schema, execution engine. Model 1 has passed all gates — this is the mission. |
+| **2** | **Architecture & Database Remodel** | Third full remodel — DB schema + code restructure. Scope after seeing live operation pain points. |
+| **2** | **Live Dashboard** | Streamlit monitoring for the live model — P&L, trade log, stream breakdown, benchmarks. Depends on live deployment; likely runs concurrently with architecture work. |
+| — | **Stream/Model Tester Fixes** | Known UI issues in Stream Tester and Model Tester. Address opportunistically or bundle into architecture remodel. |
+| — | **Staggered Slot Redesign** | Engine-level feature branch. Makes multi-slot streams actually useful (sequential entries vs. duplicate). Benefits DH + BS most. |
+| — | **Build Model 2** | Overlap phase — start once live is stable and running. |
 
-Model 1 passes all backtesting gates:
-- +15.3% annualized on Primary v2 (beats S&P 500 10% target)
-- All 5 windows positive
-- Max DD -12.8% on Primary v2
-- Zero signal overlap between streams confirmed
+---
 
-**Before going live:**
-1. Review Kraken API integration — fee structure, order placement, WebSocket for live prices
-2. Build `live.models`, `live.streams`, `live.lots` schema and execution engine
-3. Staggered slot redesign (can be done before or after live deployment — single slot is deployable as-is)
-4. Connect live reporting to `reporting.all_lots` view
+## Deploy Model 1 Live — Status
 
-### Secondary: Staggered Slot Engine Redesign
-Open a feature branch. Change is in `src/backtester/engine.py` → `_run_slot()`. Will require updating stream params schema and stream spec docs.
+### Code complete (on `live-model-1` branch)
+
+| File | Purpose |
+|---|---|
+| `src/live/kraken_client.py` | Authenticated REST wrapper — place_order, cancel_order, get_order_status, get_balance, get_ticker_price |
+| `src/live/deploy.py` | One-time script — creates live.models row + copies streams at $33.33/lot |
+| `src/live/signal_engine.py` | Runs locked signal logic on latest market_data; returns True/False per stream |
+| `src/live/order_manager.py` | CASH→PENDING→OPEN→CLOSED state machine; entry limit orders + market exit |
+| `src/live/position_monitor.py` | Trailing stop monitor; fires on candle close per stream's timeframe |
+| `src/live/executor.py` | Main loop (60s tick); `--dry-run` flag for safe testing |
+| `tests/live/test_signal_parity.py` | Layer 1 parity tests — 3/3 passing; reads locked configs from DB |
+
+### Schema changes applied (schema.sql)
+- `live.lots.status`: added `PENDING` state (CASH → PENDING → OPEN → CLOSED)
+- `live.lots.entry_expiry_at`: new column — timestamp when limit order should be cancelled if unfilled
+
+### What still needs to happen before real money
+
+**Infrastructure (user actions):**
+1. Create Oracle Cloud account → provision ARM A1 VM (Ubuntu, 4 OCPU / 24GB RAM, free forever)
+2. Install PostgreSQL on VM — run schema.sql for `public`, `live`, `reporting` schemas only
+3. Seed `market_data` on server: run `python -m src.data.downloader` once to bootstrap
+4. Set up 15-min cron on server: `*/15 * * * * cd /path/to/repo && .venv/bin/python -m src.data.downloader`
+5. Create Kraken Pro account → generate API key (Create Order permission only, NO withdrawal)
+6. Set `KRAKEN_API_KEY`, `KRAKEN_API_SECRET`, `DATABASE_URL` in server `.env`
+7. Create `systemd` service for executor (auto-restart, survives reboots)
+
+**Code steps:**
+8. Push `live-model-1` branch to remote; clone on server
+9. Run `python -m src.live.deploy` on server — creates live.models + live.streams rows
+10. Run `python -m src.live.executor --dry-run` for 24h — verify signal detection and DB state machine
+11. (Optional but recommended) Layer 3 test: fund with extra $5-10, run executor live with reduced lot_size_usd=5 on one stream, verify full Kraken order flow
+12. Deploy full $100 — `python -m src.live.executor` managed by systemd
+
+### Fee note
+Round trip live = 0.65% (0.25% limit entry + 0.40% market exit) vs. 0.50% assumed in backtest. ~$0.80 total delta over all trades. Known and acceptable.
+
+### Branch strategy
+- `main` — all development (testers, arch remodel, Model 2). Never deployed directly.
+- `live-model-1` — frozen at this deployment. Lives on the server.
+- Bug fixes: patch `live-model-1`, cherry-pick to `main`.
+- Model 2: new `live-model-2` branch from `main` when it passes its backtest gate.
 
 ---
 

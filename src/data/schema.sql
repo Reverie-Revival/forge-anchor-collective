@@ -255,12 +255,15 @@ CREATE TABLE IF NOT EXISTS live.lots (
     stream_id        INTEGER      NOT NULL REFERENCES live.streams(stream_id),
     slot_number      SMALLINT     NOT NULL CHECK (slot_number >= 1),
     lot_sequence     INTEGER      NOT NULL,
+    -- CASH: slot available; PENDING: limit order placed, awaiting fill;
+    -- OPEN: position held; CLOSED: exited, P&L realized
     status           VARCHAR(10)  NOT NULL DEFAULT 'CASH'
-                         CHECK (status IN ('CASH', 'OPEN', 'CLOSED')),
+                         CHECK (status IN ('CASH', 'PENDING', 'OPEN', 'CLOSED')),
     opening_capital  NUMERIC(12,2) NOT NULL,
     btc_quantity     NUMERIC(20,8),
     entry_price      NUMERIC(12,2),
     entry_order_id   VARCHAR(50),
+    entry_expiry_at  TIMESTAMPTZ,              -- cancel limit order if unfilled after this time
     high_water_mark  NUMERIC(12,2),
     exit_price       NUMERIC(12,2),
     exit_order_id    VARCHAR(50),
