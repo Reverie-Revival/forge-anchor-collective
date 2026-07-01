@@ -24,34 +24,43 @@ from src.app.db import get_engine, LAST_RUN_PATH
 
 # ── Configure this block for each test ────────────────────────────────────────
 
-STREAM_NAME = "Dip Hunter v2"
+STREAM_NAME = "Breakout Scout v2"
 LOT_SIZE    = 10.0
 SLOT_COUNT  = 1
 SLOT_MODE   = "single"
-PRESET_NAME = "Full History"   # must match timeframe_presets.name
+PRESET_NAME = "Primary v2"
 
 PARAMS = {
     "primary_timeframe": "1h",
-    "core_signal": "rsi_recovery",
+    "core_signal": "range_breakout",
     "core_params": {
-        "rsi_period": 14,
-        "rsi_threshold": 30,
-        "require_bullish_candle": True,
+        "breakout_lookback": 24,
     },
     "filters": {
-        "drawdown_from_high": {
-            "min_drop_pct": 25.0,
-            "lookback_days": 90,
+        "bollinger": {
+            "period": 20,
+            "std_dev": 2.0,
+            "squeeze": {"max_bandwidth_pct": 6.0},
         },
-        "rsi": {"min": 35},
+        "atr_regime": {
+            "period": 14,
+            "avg_period": 30,
+            "max_pct_of_avg": 90,
+        },
+        "breakout_candle": {
+            "body_ratio_min": 0.4,
+            "close_position_min": 0.6,
+        },
+        "trend_context": {
+            "sma_period": 200,
+            "require": "above",
+        },
     },
-    "sentiment": {"fear_greed": {"max": 20}},
+    "sentiment": {"fear_greed": {"min": 55}},
     "position": {
         "trailing_stop_pct": 10.0,
         "entry_order_type": "limit",
-        "entry_expiry_candles": 1,
-        "min_hold_candles": 48,
-        "max_hold_candles": 240,
+        "entry_expiry_candles": 2,
     },
 }
 
@@ -105,11 +114,11 @@ def main():
     with open(LAST_RUN_PATH, "wb") as f:
         pickle.dump(payload, f)
 
-    ann  = metrics.get("annualized_return_pct", 0)
+    ann  = metrics.get("annualized_return_pct") or 0
     tot  = metrics.get("total_trades", 0)
-    wr   = metrics.get("win_rate", 0)
-    dd   = metrics.get("max_drawdown_pct", 0)
-    pf   = metrics.get("profit_factor", 0)
+    wr   = metrics.get("win_rate") or 0
+    dd   = metrics.get("max_drawdown_pct") or 0
+    pf   = metrics.get("profit_factor") or 0
 
     print(f"\n  Ann. return : {ann:+.1f}%")
     print(f"  Trades      : {tot}")

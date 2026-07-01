@@ -1,8 +1,8 @@
 # Model 1
 
-**Status:** Locked — 3 streams validated, ready for deployment decision  
+**Status:** Locked — all 3 streams at v2, ready for deployment decision  
 **Capital:** $100 (3 streams × $33.33/lot × 1 slot)  
-**Architecture:** 3 streams, single-slot baseline (slot behavior to be refined pre-deployment)
+**Architecture:** 3 streams, single-slot baseline
 
 ## Purpose
 
@@ -12,37 +12,57 @@ Being Model 1, it is as much a systems test as a strategy test. The results are 
 
 ## Locked Streams
 
-Three streams cover three distinct market regimes with zero signal overlap confirmed in testing:
+Three streams cover three distinct market regimes with zero signal overlap:
 
-| Stream | Type | Trail | Active In | Grade | stream_id |
+| Stream | Type | Timeframe | Trail | Active In | stream_id |
 |---|---|---|---|---|---|
-| [Momentum Rider v1](../streams/momentum-rider-v1.md) | Trend-following | 5% | Bull market, F&G > 25, RSI > 55 | 4 — Strong | 1 |
-| [Dip Hunter v1](../streams/dip-hunter-v1.md) | Fear bounce (mean reversion) | 7.5% | Extreme fear, F&G < 20, 25%+ drawdown | 4 — Strong | 2 |
-| [Breakout Scout v1](../streams/breakout-scout-v1.md) | Consolidation breakout | 5% | Low-vol squeeze + bullish sentiment | 4 — Strong | 3 |
+| [Momentum Rider v2](../streams/momentum-rider-v1.md) | Trend-following | 4h | 7% | Bull market, EMA momentum | 1 |
+| [Dip Hunter v2](../streams/dip-hunter-v1.md) | Fear bounce | 1h | 10% | Extreme fear, F&G ≤ 20, 25%+ drawdown | 2 |
+| [Breakout Scout v2](../streams/breakout-scout-v2.md) | Consolidation breakout | 1h | 10% | Greedy sentiment, SMA 200 above, squeeze | 3 |
 
 Surge Rider v1 and Steady Climber v1 were considered during design but never built or tested. Model 1 does not need 5 streams — 3 well-differentiated streams beat 5 redundant ones.
 
-## Capital Allocation (v2 baseline)
+## Capital Allocation
 
 | Stream | Lot Size | Slots | Stream Capital |
 |---|---|---|---|
-| Momentum Rider v1 | $33.33 | 1 | $33.33 |
-| Dip Hunter v1 | $33.33 | 1 | $33.33 |
-| Breakout Scout v1 | $33.33 | 1 | $33.33 |
+| Momentum Rider v2 | $33.33 | 1 | $33.33 |
+| Dip Hunter v2 | $33.33 | 1 | $33.33 |
+| Breakout Scout v2 | $33.33 | 1 | $33.33 |
 | **Total** | | | **$99.99** |
 
-Slot behavior (`slot_mode`) is currently `single` — baseline configuration. Before deployment, slot modes may be refined per stream (DH: scale_down to average; MR: scale_up to pyramid; BS: stays single).
+Allocation tested: weighting MR heavier (up to $60/$25/$15) increases PV2 returns by +2–3% but costs 2026 YTD performance significantly (DH is the active stream in the current fear regime). Equal allocation preserves regime responsiveness.
 
-## Validation Results (v2 baseline, Run #1)
+## Model-Level Backtest Results
 
-| Window | Period | Ann. Return | Trades | Max DD | vs S&P |
+### Run #4 — MR v2 + DH v2 + BS v2 (current, locked)
+
+| Window | Period | Ann. Return | Trades | Max DD |
+|---|---|---|---|---|
+| Primary v2 | 2022–now | **+15.3%** | 66 | -12.8% |
+| Full History | 2018–now | **+22.2%** | 148 | -15.8% |
+| Recent | 2024–now | **+14.7%** | 40 | -13.6% |
+| 2026 YTD | 2026–now | **+16.4%** | 8 | -2.8% |
+| Primary Window | 2019–2023 | **+30.7%** | 80 | -13.9% |
+
+### Run History (all use equal $33.33 allocation unless noted)
+
+| Run | Streams | PV2 | Full History | Recent | 2026 YTD |
 |---|---|---|---|---|---|
-| Primary | 2019–2023 | **+12.7%** | 157 | -21.2% | Beats (~10% avg) |
-| Full History | 2018– | +5.6% | 264 | -23.4% | Below |
-| Recent | 2024– | +3.6% | 66 | -19.6% | Below |
-| 2026 YTD | 2026 | -16.2% | 15 | -8.6% | Above (BTC -54%) |
+| #1 | MR v1 + DH v1 + BS v1 | — | +5.6% | +3.6% | -16.2% |
+| #2 | MR v2 + DH v1 + BS v1 | +8.5% | +16.0% | +9.1% | -6.6% |
+| #3 | MR v2 + DH v2 + BS v1 | +11.9% | +17.0% | +9.6% | +16.4% |
+| **#4** | **MR v2 + DH v2 + BS v2** | **+15.3%** | **+22.2%** | **+14.7%** | **+16.4%** |
 
-Primary window (2019–2023) is the primary gate: varied regimes (2019 grind, 2020 crash+bull, 2021 peak, 2022 bear, 2023 recovery). +12.7% Grade 4 — Strong.
+Each stream upgrade contributed meaningfully. MR v2 was the largest single lift (+8.5% → baseline). DH v2 fixed the 2026 YTD (-6.6% → +16.4%). BS v2 lifted the floor across all windows and compressed model DD.
+
+## Individual Stream Results (locked configs, $10 lot × 1 slot)
+
+| Stream | Primary v2 | Full History | Recent | 2026 YTD |
+|---|---|---|---|---|
+| Momentum Rider v2 | +21.5% | +25.9% | +16.9% | — |
+| Dip Hunter v2 | +11.7% | +12.1% | +10.5% | +53.0% |
+| Breakout Scout v2 | +11.6% | +25.1% | +16.6% | 0 trades |
 
 ## Constraints
 
@@ -54,10 +74,12 @@ Primary window (2019–2023) is the primary gate: varied regimes (2019 grind, 20
 
 ## Deployment Gate
 
-- Primary window annualized return > 10% ✓
-- All 3 streams validated with complementary regimes ✓
-- Model-level test complete across 4 windows ✓
-- Slot behavior finalized (pending) — current single-slot baseline is deployable
+- [x] All 3 streams tuned and locked at v2
+- [x] Model-level backtest Run #4 complete across 5 windows
+- [x] Primary v2 annualized return +15.3% — beats S&P 500 target (10%)
+- [x] All windows positive
+- [x] Equal $33.33 allocation confirmed vs weighted alternatives
+- [ ] Deployment decision — pending
 
 ## Benchmarks
 
@@ -81,3 +103,12 @@ Since there are no prior models, there is no head-to-head comparison for Model 1
 ## Model Commitment Rule
 
 Once deployed, Model 1 runs for the full duration of its experiment regardless of performance. It stops only if capital is exhausted or there is a critical system failure. The long-term data is worth more than the $100.
+
+## Future Slot Design (pre-deployment)
+
+Current slot mode is `single` across all streams. A staggered-slot redesign is planned before deployment:
+- Two independent capital buckets per stream
+- Slot 2 cannot enter the same signal as Slot 1 — must wait for the next signal
+- Allows catching consecutive signals when one slot is already occupied
+- Best fit for DH (sequential fear dips) and BS (consecutive squeeze breakouts)
+- MR less likely to benefit (sustained trends don't repeat entry signals quickly)
