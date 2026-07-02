@@ -241,9 +241,88 @@ Capital compounds within the slot.
 ## live schema
 
 Real money. Real Kraken orders. Precious — never touched carelessly.
-**Not yet built** — will mirror backtest structure with Kraken order IDs added.
 
 **Safety rule:** `reset_backtest.sql` explicitly excludes all `live.*` tables. Any live schema change requires a dedicated, explicitly reviewed migration — never casual DDL.
+
+**Hosted on:** Supabase (free PostgreSQL). Contains only `live.*` + `public.market_data` (60 days only) + `public.sentiment_data`. No backtest data.
+
+---
+
+### live.models
+
+One row per deployed model.
+
+```sql
+live.models
+  model_id       SERIAL PRIMARY KEY
+  model_version  INTEGER NOT NULL
+  description    TEXT
+  status         VARCHAR(20) NOT NULL DEFAULT 'active'   -- 'active' | 'stopped'
+  deployed_at    TIMESTAMPTZ DEFAULT NOW()
+```
+
+### live.streams
+
+Stream configs for the deployed model. Copied from `backtest.streams` at deploy time.
+
+```sql
+live.streams
+  stream_id       SERIAL PRIMARY KEY
+  model_id        INTEGER NOT NULL REFERENCES live.models
+  stream_name     VARCHAR(100) NOT NULL
+  stream_version  VARCHAR(10) NOT NULL
+  strategy_type   VARCHAR(50) NOT NULL
+  parameters      JSONB NOT NULL
+  slot_count      SMALLINT NOT NULL DEFAULT 1
+  slot_mode       VARCHAR(30) NOT NULL DEFAULT 'single'
+  lot_size_usd    NUMERIC(10,2) NOT NULL
+```
+
+### live.lots
+
+Every unit of capital in the live system. Mirrors `backtest.lots` with Kraken order IDs added.
+
+```sql
+live.lots
+  lot_id             BIGSERIAL PRIMARY KEY
+  model_id           INTEGER NOT NULL REFERENCES live.models
+  stream_id          INTEGER NOT NULL REFERENCES live.streams
+  slot_number        SMALLINT NOT NULL
+  lot_sequence       INTEGER NOT NULL
+  status             VARCHAR(10) NOT NULL   -- 'CASH' | 'PENDING' | 'OPEN' | 'CLOSED'
+  opening_capital    NUMERIC(12,2) NOT NULL
+  btc_quantity       NUMERIC(20,8)
+  entry_price        NUMERIC(12,2)
+  high_water_mark    NUMERIC(12,2)
+  exit_price         NUMERIC(12,2)
+  closing_capital    NUMERIC(12,2)
+  realized_pnl       NUMERIC(12,2)
+  entry_reason       TEXT
+  exit_reason        TEXT
+  kraken_entry_txid  VARCHAR(100)         -- Kraken order ID for entry
+  kraken_exit_txid   VARCHAR(100)         -- Kraken order ID for exit
+  entry_expiry_at    TIMESTAMPTZ          -- when limit order auto-cancels if unfilled
+  opened_at          TIMESTAMPTZ
+  closed_at          TIMESTAMPTZ
+```
+
+**Lot state machine (live — extends backtest):**
+```
+CASH → PENDING → OPEN → CLOSED → (new CASH lot)
+```
+`PENDING` is the new live-only state: limit order placed but not yet filled. `entry_expiry_at` defines when it auto-cancels.
+
+### live.executor_state
+
+Single-row table tracking when the executor last ran. Replaces the in-memory `last_tick` variable — required because the GitHub Actions executor is stateless (single-invocation, not a persistent loop).
+
+```sql
+live.executor_state
+  id           INTEGER PRIMARY KEY DEFAULT 1
+  last_run_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+```
+
+Always has exactly one row (id=1). Updated at the end of each executor tick.
 
 ---
 

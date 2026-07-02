@@ -279,6 +279,14 @@ CREATE INDEX IF NOT EXISTS idx_live_lots_model  ON live.lots (model_id);
 CREATE INDEX IF NOT EXISTS idx_live_lots_stream ON live.lots (stream_id);
 CREATE INDEX IF NOT EXISTS idx_live_lots_status ON live.lots (status);
 
+CREATE TABLE IF NOT EXISTS live.executor_state (
+    id          INTEGER      PRIMARY KEY DEFAULT 1,
+    last_run_at TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+INSERT INTO live.executor_state (id, last_run_at)
+VALUES (1, NOW())
+ON CONFLICT (id) DO NOTHING;
+
 -- ============================================================
 -- REPORTING SCHEMA — views only, never raw data
 -- ============================================================

@@ -1,5 +1,13 @@
 # Handoff — 2026-06-30 (updated)
 
+---
+## ⚠️ ACTION REQUIRED BY AUG 1, 2026 — ORACLE ACCOUNT
+A tenancy deletion was submitted on an Oracle Cloud account (personal Gmail). Deletion takes 30 days.
+**Before Aug 1:** Log into your credit card and confirm zero Oracle charges ever appeared. The account should be fully deleted by then — verify it's gone and no recurring relationship exists.
+This reminder must stay at the top of every handoff until confirmed complete.
+---
+
+
 ## Done
 
 ### Breakout Scout v2 — Tuned, Tested, Locked
@@ -143,8 +151,11 @@ This is an engine-level change that requires a feature branch before touching `e
 | `src/live/signal_engine.py` | Runs locked signal logic on latest market_data; returns True/False per stream |
 | `src/live/order_manager.py` | CASH→PENDING→OPEN→CLOSED state machine; entry limit orders + market exit |
 | `src/live/position_monitor.py` | Trailing stop monitor; fires on candle close per stream's timeframe |
-| `src/live/executor.py` | Main loop (60s tick); `--dry-run` flag for safe testing |
+| `src/live/executor.py` | Single-invocation tick (GitHub Actions); `--dry-run` flag skips Kraken orders but writes DB |
+| `src/live/market_data_updater.py` | GitHub Actions cron: fetches last 2h of 15-min candles from Kraken public OHLC API, upserts to Supabase |
 | `tests/live/test_signal_parity.py` | Layer 1 parity tests — 3/3 passing; reads locked configs from DB |
+| `.github/workflows/executor.yml` | Runs executor every 30 min via GitHub Actions |
+| `.github/workflows/market_data.yml` | Fetches market data every 15 min via GitHub Actions |
 
 ### Schema changes applied (schema.sql)
 - `live.lots.status`: added `PENDING` state (CASH → PENDING → OPEN → CLOSED)
@@ -152,28 +163,29 @@ This is an engine-level change that requires a feature branch before touching `e
 
 ### What still needs to happen before real money
 
-**Infrastructure (user actions):**
-1. Create Oracle Cloud account → provision ARM A1 VM (Ubuntu, 4 OCPU / 24GB RAM, free forever)
-2. Install PostgreSQL on VM — run schema.sql for `public`, `live`, `reporting` schemas only
-3. Seed `market_data` on server: run `python -m src.data.downloader` once to bootstrap
-4. Set up 15-min cron on server: `*/15 * * * * cd /path/to/repo && .venv/bin/python -m src.data.downloader`
-5. Create Kraken Pro account → generate API key (Create Order permission only, NO withdrawal)
-6. Set `KRAKEN_API_KEY`, `KRAKEN_API_SECRET`, `DATABASE_URL` in server `.env`
-7. Create `systemd` service for executor (auto-restart, survives reboots)
+**Hosting architecture: GitHub Actions + Supabase ($0/month)**
+- GitHub Actions runs two workflows: executor every 30 min, market data updater every 15 min
+- Supabase free PostgreSQL holds live schema + 60 days of market_data only
+- Minimum candle timeframe: 30 minutes (15m streams would miss closes at 30-min executor interval)
 
-**Code steps:**
-8. Push `live-model-1` branch to remote; clone on server
-9. Run `python -m src.live.deploy` on server — creates live.models + live.streams rows
-10. Run `python -m src.live.executor --dry-run` for 24h — verify signal detection and DB state machine
-11. (Optional but recommended) Layer 3 test: fund with extra $5-10, run executor live with reduced lot_size_usd=5 on one stream, verify full Kraken order flow
-12. Deploy full $100 — `python -m src.live.executor` managed by systemd
+**User actions required:**
+1. Set GitHub $0 spending cap — Settings → Billing → Spending limits → Actions → $0
+2. Create Supabase account at supabase.com with personal email
+3. Come back for help: apply live schema to Supabase, seed 60 days market_data + sentiment_data, add GitHub Secrets
+4. Create Kraken Pro account → generate API key (Create Order permission only, NO withdrawal)
+
+**Code steps (after infrastructure):**
+5. Push `live-model-1` branch — workflows activate automatically on schedule
+6. Run `python -m src.live.deploy` pointed at Supabase — creates live.models + live.streams rows
+7. Set `DRY_RUN=true` GitHub Secret → monitor Actions logs 24h — verify signal detection and DB state machine
+8. Remove dry-run secret → deploy full $100
 
 ### Fee note
 Round trip live = 0.65% (0.25% limit entry + 0.40% market exit) vs. 0.50% assumed in backtest. ~$0.80 total delta over all trades. Known and acceptable.
 
 ### Branch strategy
 - `main` — all development (testers, arch remodel, Model 2). Never deployed directly.
-- `live-model-1` — frozen at this deployment. Lives on the server.
+- `live-model-1` — frozen at this deployment. Runs via GitHub Actions.
 - Bug fixes: patch `live-model-1`, cherry-pick to `main`.
 - Model 2: new `live-model-2` branch from `main` when it passes its backtest gate.
 

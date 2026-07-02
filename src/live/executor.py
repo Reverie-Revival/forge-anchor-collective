@@ -1,11 +1,13 @@
 """
-Live trading executor — main loop for Model 1.
+Live trading executor — single-invocation tick for GitHub Actions.
 
-Runs every 60 seconds. On each tick:
-  1. Detect which candle timeframes (1h, 4h) closed since last tick
-  2. For streams whose timeframe closed: check for new signals → place entry orders
-  3. Poll all PENDING lots for fills / expiry
-  4. Check trailing stops on all OPEN lots
+Invoked every 30 minutes by a GitHub Actions cron workflow. On each run:
+  1. Read last_run_at from live.executor_state
+  2. Detect which candle timeframes (1h, 4h) closed since last run
+  3. For streams whose timeframe closed: check for new signals → place entry orders
+  4. Poll all PENDING lots for fills / expiry
+  5. Check trailing stops on all OPEN lots
+  6. Write last_run_at back to DB
 
 Usage:
     python -m src.live.executor              # live mode — real Kraken orders
@@ -15,7 +17,6 @@ import argparse
 import logging
 import os
 import sys
-import time
 from datetime import datetime, timezone
 
 import pandas as pd
@@ -31,14 +32,10 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-7s  %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler("live_executor.log"),
-    ],
+    handlers=[logging.StreamHandler(sys.stdout)],
 )
 log = logging.getLogger(__name__)
 
-TICK_INTERVAL_SECONDS = 60
 LIVE_MODEL_VERSION = 1
 
 
@@ -50,7 +47,6 @@ def _get_engine():
 
 
 def _candle_closed_between(last: datetime, now: datetime, tf_hours: int) -> bool:
-    """Return True if at least one candle boundary for tf_hours crossed between last and now."""
     last_period = int(last.timestamp()) // (tf_hours * 3600)
     now_period = int(now.timestamp()) // (tf_hours * 3600)
     return now_period > last_period
@@ -66,7 +62,6 @@ def _detect_closed_timeframes(last_tick: datetime, now: datetime) -> set:
 
 
 def _load_streams(conn) -> dict:
-    """Load all live streams for Model 1. Returns {stream_id: stream_dict}."""
     rows = conn.execute(
         text("""
             SELECT ls.stream_id, ls.model_id, ls.stream_name, ls.stream_version,
@@ -81,14 +76,9 @@ def _load_streams(conn) -> dict:
 
 
 def _latest_candle_for_stream(stream: dict) -> dict | None:
-    """
-    Fetch the most recently completed candle for a stream's timeframe from market_data.
-    Returns {'close': float, 'low': float} or None.
-    """
     tf = stream["parameters"].get("primary_timeframe", "1h")
     tf_minutes = {"15m": 15, "1h": 60, "4h": 240}.get(tf, 60)
 
-    # Load recent data and resample
     from src.backtester.engine import load_market_data
     from src.backtester.indicators import resample_ohlcv
 
@@ -100,7 +90,6 @@ def _latest_candle_for_stream(stream: dict) -> dict | None:
 
     df = resample_ohlcv(df_raw, tf) if tf != "15m" else df_raw
 
-    # Drop in-progress candle
     candle_duration = pd.Timedelta(minutes=tf_minutes)
     df = df[df.index + candle_duration <= now]
 
@@ -111,18 +100,35 @@ def _latest_candle_for_stream(stream: dict) -> dict | None:
     return {"close": float(last["close"]), "low": float(last["low"])}
 
 
+def _read_last_run(conn) -> datetime:
+    row = conn.execute(text("SELECT last_run_at FROM live.executor_state WHERE id = 1")).fetchone()
+    if row is None:
+        return datetime.now(timezone.utc)
+    ts = row.last_run_at
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return ts
+
+
+def _write_last_run(conn, now: datetime) -> None:
+    conn.execute(
+        text("UPDATE live.executor_state SET last_run_at = :now WHERE id = 1"),
+        {"now": now},
+    )
+
+
 def tick(conn, streams: dict, kraken: KrakenClient, last_tick: datetime,
          now: datetime, dry_run: bool) -> None:
     closed_tfs = _detect_closed_timeframes(last_tick, now)
     open_count = conn.execute(text("SELECT COUNT(*) FROM live.lots WHERE status = 'OPEN'")).scalar()
     pending_count = conn.execute(text("SELECT COUNT(*) FROM live.lots WHERE status = 'PENDING'")).scalar()
     log.info(
-        f"Tick — closed_tfs={closed_tfs or 'none'} "
+        f"Tick — last_run={last_tick.strftime('%Y-%m-%d %H:%M')} "
+        f"closed_tfs={closed_tfs or 'none'} "
         f"open={open_count} pending={pending_count}"
         f"{' [DRY RUN]' if dry_run else ''}"
     )
 
-    # Build candle data for all streams whose timeframe closed
     candle_row = {}
     for stream_id, stream in streams.items():
         tf = stream["parameters"].get("primary_timeframe", "1h")
@@ -131,7 +137,6 @@ def tick(conn, streams: dict, kraken: KrakenClient, last_tick: datetime,
             if candle:
                 candle_row[stream_id] = candle
 
-    # Signal check → entry orders
     if closed_tfs:
         for stream_id, stream in streams.items():
             tf = stream["parameters"].get("primary_timeframe", "1h")
@@ -151,10 +156,8 @@ def tick(conn, streams: dict, kraken: KrakenClient, last_tick: datetime,
             else:
                 log.debug(f"{stream['stream_name']}: no signal")
 
-    # Poll pending orders
     order_manager.check_pending(conn, kraken, dry_run)
 
-    # Check trailing stops
     if closed_tfs and candle_row:
         position_monitor.check_all(conn, streams, candle_row, closed_tfs, kraken, dry_run)
 
@@ -176,25 +179,20 @@ def run(dry_run: bool = False) -> None:
             log.error(f"Kraken connection failed: {e}")
             sys.exit(1)
 
-    with engine.connect() as conn:
+    now = datetime.now(timezone.utc)
+
+    with engine.begin() as conn:
         streams = _load_streams(conn)
         if not streams:
             log.error(f"No active streams found for Model {LIVE_MODEL_VERSION}. Run deploy.py first.")
             sys.exit(1)
         log.info(f"Loaded {len(streams)} streams: {[s['stream_name'] for s in streams.values()]}")
 
-    last_tick = datetime.now(timezone.utc)
+        last_tick = _read_last_run(conn)
+        tick(conn, streams, kraken, last_tick, now, dry_run)
+        _write_last_run(conn, now)
 
-    while True:
-        time.sleep(TICK_INTERVAL_SECONDS)
-        now = datetime.now(timezone.utc)
-        try:
-            with engine.begin() as conn:
-                streams = _load_streams(conn)
-                tick(conn, streams, kraken, last_tick, now, dry_run)
-        except Exception as e:
-            log.error(f"Tick error (continuing): {e}", exc_info=True)
-        last_tick = now
+    log.info("=== Tick complete ===")
 
 
 def main():
