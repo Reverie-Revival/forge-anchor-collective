@@ -276,6 +276,33 @@ CREATE INDEX IF NOT EXISTS idx_live_lots_model  ON live.lots (model_id);
 CREATE INDEX IF NOT EXISTS idx_live_lots_stream ON live.lots (stream_id);
 CREATE INDEX IF NOT EXISTS idx_live_lots_status ON live.lots (status);
 
+CREATE TABLE IF NOT EXISTS live.executor_runs (
+    run_id          SERIAL       PRIMARY KEY,
+    ran_at          TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    last_tick_at    TIMESTAMPTZ,
+    closed_tfs      TEXT[],
+    open_lots       INT,
+    pending_lots    INT,
+    signals_fired   TEXT[],
+    entries_placed  INT,
+    fills           INT,
+    expirations     INT,
+    stops_triggered INT,
+    error           TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_executor_runs_ran_at ON live.executor_runs (ran_at);
+
+CREATE TABLE IF NOT EXISTS live.market_data_runs (
+    run_id          SERIAL       PRIMARY KEY,
+    ran_at          TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    candles_fetched INT,
+    latest_candle   TIMESTAMPTZ,
+    error           TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_market_data_runs_ran_at ON live.market_data_runs (ran_at);
+
 -- ============================================================
 -- REPORTING SCHEMA — views only, never raw data
 -- ============================================================
