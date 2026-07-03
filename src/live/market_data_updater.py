@@ -105,17 +105,35 @@ def upsert_candles(engine, candles: list[dict]) -> int:
     return result.rowcount
 
 
+def _log_run(engine, candles_fetched: int, latest_candle, error: str = None) -> None:
+    with engine.begin() as conn:
+        conn.execute(text(
+            "DELETE FROM live.market_data_runs WHERE ran_at < now() - interval '90 days'"
+        ))
+        conn.execute(text("""
+            INSERT INTO live.market_data_runs (candles_fetched, latest_candle, error)
+            VALUES (:fetched, :latest, :error)
+        """), {"fetched": candles_fetched, "latest": latest_candle, "error": error})
+
+
 def run():
     log.info("=== Market Data Updater ===")
     engine = _get_engine()
 
     since = _latest_timestamp(engine)
     log.info(f"Fetching candles since {since.strftime('%Y-%m-%d %H:%M')} UTC")
-    candles = fetch_recent_candles(since)
-    log.info(f"Fetched {len(candles)} completed candles from Kraken")
 
-    inserted = upsert_candles(engine, candles)
-    log.info(f"Upserted {inserted} rows into market_data")
+    try:
+        candles = fetch_recent_candles(since)
+        log.info(f"Fetched {len(candles)} completed candles from Kraken")
+        inserted = upsert_candles(engine, candles)
+        log.info(f"Upserted {inserted} rows into market_data")
+        latest = candles[-1]["timestamp"] if candles else since
+        _log_run(engine, len(candles), latest)
+    except Exception as e:
+        log.error(f"Market data update failed: {e}")
+        _log_run(engine, 0, None, error=str(e))
+        raise
 
     log.info("=== Done ===")
 

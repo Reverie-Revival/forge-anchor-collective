@@ -24,7 +24,7 @@ def check_all(
     closed_timeframes: set,
     kraken: KrakenClient,
     dry_run: bool = False,
-) -> None:
+) -> int:
     """
     Check trailing stops for all OPEN lots whose stream's timeframe just closed.
 
@@ -33,7 +33,7 @@ def check_all(
     closed_timeframes: set of timeframe strings that closed this tick (e.g. {'1h'} or {'1h', '4h'})
     """
     if not closed_timeframes:
-        return
+        return 0
 
     open_lots = conn.execute(
         text("""
@@ -44,7 +44,9 @@ def check_all(
     ).fetchall()
 
     if not open_lots:
-        return
+        return 0
+
+    stops_triggered = 0
 
     for lot in open_lots:
         stream = streams_by_id.get(lot.stream_id)
@@ -84,8 +86,11 @@ def check_all(
                 f"low={low:.2f} <= stop={stop_price:.2f} (hwm={new_hwm:.2f}, trail={trail_pct*100:.1f}%)"
             )
             order_manager.place_exit(conn, lot, stop_price, kraken, dry_run)
+            stops_triggered += 1
         else:
             log.debug(
                 f"Lot {lot.lot_id} ({stream['stream_name']}): "
                 f"hwm={new_hwm:.2f} stop={stop_price:.2f} low={low:.2f} — holding"
             )
+
+    return stops_triggered

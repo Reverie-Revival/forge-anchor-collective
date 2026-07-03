@@ -106,10 +106,11 @@ def place_entry(
     )
 
 
-def check_pending(conn, kraken: KrakenClient, dry_run: bool = False) -> None:
+def check_pending(conn, kraken: KrakenClient, dry_run: bool = False) -> tuple[int, int]:
     """
     Poll Kraken for all PENDING lots.
     Flip to OPEN on fill, or cancel + reset to CASH on expiry.
+    Returns (fills, expirations).
     """
     now = datetime.now(timezone.utc)
     pending = conn.execute(
@@ -118,6 +119,9 @@ def check_pending(conn, kraken: KrakenClient, dry_run: bool = False) -> None:
             FROM live.lots WHERE status = 'PENDING'
         """)
     ).fetchall()
+
+    fills = 0
+    expirations = 0
 
     for lot in pending:
         if dry_run:
@@ -145,6 +149,7 @@ def check_pending(conn, kraken: KrakenClient, dry_run: bool = False) -> None:
                 """),
                 {"price": fill_price, "qty": vol_exec, "lid": lot.lot_id},
             )
+            fills += 1
 
         elif status in ("canceled", "expired") or (
             lot.entry_expiry_at and now > lot.entry_expiry_at.replace(tzinfo=timezone.utc)
@@ -158,6 +163,9 @@ def check_pending(conn, kraken: KrakenClient, dry_run: bool = False) -> None:
                 text("DELETE FROM live.lots WHERE lot_id = :lid"),
                 {"lid": lot.lot_id},
             )
+            expirations += 1
+
+    return fills, expirations
 
 
 def place_exit(conn, lot, current_price: float, kraken: KrakenClient, dry_run: bool = False) -> None:

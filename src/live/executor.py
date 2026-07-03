@@ -75,7 +75,7 @@ def _load_streams(conn) -> dict:
     return {r.stream_id: dict(r._mapping) for r in rows}
 
 
-def _latest_candle_for_stream(stream: dict) -> dict | None:
+def _latest_candle_for_stream(stream: dict):
     tf = stream["parameters"].get("primary_timeframe", "1h")
     tf_minutes = {"15m": 15, "1h": 60, "4h": 240}.get(tf, 60)
 
@@ -117,6 +117,34 @@ def _write_last_run(conn, now: datetime) -> None:
     )
 
 
+def _log_tick(conn, last_tick: datetime, closed_tfs: set, open_count: int,
+              pending_count: int, signals_fired: list, entries_placed: int,
+              fills: int, expirations: int, stops_triggered: int,
+              error: str = None) -> None:
+    conn.execute(text(
+        "DELETE FROM live.executor_runs WHERE ran_at < now() - interval '90 days'"
+    ))
+    conn.execute(text("""
+        INSERT INTO live.executor_runs
+            (last_tick_at, closed_tfs, open_lots, pending_lots, signals_fired,
+             entries_placed, fills, expirations, stops_triggered, error)
+        VALUES
+            (:last_tick, :closed_tfs, :open, :pending, :signals,
+             :entries, :fills, :expirations, :stops, :error)
+    """), {
+        "last_tick":   last_tick,
+        "closed_tfs":  list(closed_tfs) if closed_tfs else [],
+        "open":        open_count,
+        "pending":     pending_count,
+        "signals":     signals_fired,
+        "entries":     entries_placed,
+        "fills":       fills,
+        "expirations": expirations,
+        "stops":       stops_triggered,
+        "error":       error,
+    })
+
+
 def tick(conn, streams: dict, kraken: KrakenClient, last_tick: datetime,
          now: datetime, dry_run: bool) -> None:
     closed_tfs = _detect_closed_timeframes(last_tick, now)
@@ -128,6 +156,9 @@ def tick(conn, streams: dict, kraken: KrakenClient, last_tick: datetime,
         f"open={open_count} pending={pending_count}"
         f"{' [DRY RUN]' if dry_run else ''}"
     )
+
+    signals_fired = []
+    entries_placed = 0
 
     candle_row = {}
     for stream_id, stream in streams.items():
@@ -152,14 +183,22 @@ def tick(conn, streams: dict, kraken: KrakenClient, last_tick: datetime,
                 continue
             if fired:
                 log.info(f"Signal fired: {stream['stream_name']} — placing entry order")
+                signals_fired.append(stream["stream_name"])
                 order_manager.place_entry(conn, stream, kraken, dry_run)
+                entries_placed += 1
             else:
                 log.debug(f"{stream['stream_name']}: no signal")
 
-    order_manager.check_pending(conn, kraken, dry_run)
+    fills, expirations = order_manager.check_pending(conn, kraken, dry_run)
 
+    stops_triggered = 0
     if closed_tfs and candle_row:
-        position_monitor.check_all(conn, streams, candle_row, closed_tfs, kraken, dry_run)
+        stops_triggered = position_monitor.check_all(
+            conn, streams, candle_row, closed_tfs, kraken, dry_run
+        )
+
+    _log_tick(conn, last_tick, closed_tfs, open_count, pending_count,
+              signals_fired, entries_placed, fills, expirations, stops_triggered)
 
 
 def run(dry_run: bool = False) -> None:
