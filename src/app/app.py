@@ -51,5 +51,6 @@ st.markdown("""
 pg = st.navigation([
     st.Page("stream_tester.py", title="Stream Tester", icon="📡"),
     st.Page("pages/model_tester.py", title="Model Tester", icon="🏆"),
+    st.Page("pages/live_monitor.py", title="Live Monitor", icon="🔴"),
 ])
 pg.run()
