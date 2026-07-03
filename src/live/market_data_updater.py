@@ -30,7 +30,7 @@ log = logging.getLogger(__name__)
 KRAKEN_URL = "https://api.kraken.com/0/public/OHLC"
 KRAKEN_PAIR = "XBTUSD"
 KRAKEN_INTERVAL = 15  # minutes
-FETCH_LOOKBACK_HOURS = 2  # fetch last 2 hours to ensure no gaps
+FALLBACK_LOOKBACK_HOURS = 2  # used only if DB has no data yet
 
 
 def _get_engine():
@@ -40,20 +40,31 @@ def _get_engine():
     return create_engine(url)
 
 
-def fetch_recent_candles() -> list[dict]:
-    since = datetime.now(timezone.utc) - timedelta(hours=FETCH_LOOKBACK_HOURS)
+def _latest_timestamp(engine) -> datetime:
+    with engine.connect() as conn:
+        row = conn.execute(text("SELECT MAX(timestamp) FROM market_data")).fetchone()
+    if row and row[0]:
+        ts = row[0]
+        return ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
+    return datetime.now(timezone.utc) - timedelta(hours=FALLBACK_LOOKBACK_HOURS)
+
+
+def fetch_recent_candles(since: datetime) -> list[dict]:
     response = requests.get(
         KRAKEN_URL,
         params={"pair": KRAKEN_PAIR, "interval": KRAKEN_INTERVAL, "since": int(since.timestamp())},
         timeout=30,
     )
+
     response.raise_for_status()
     data = response.json()
 
     if data.get("error"):
         raise RuntimeError(f"Kraken API error: {data['error']}")
 
-    raw = data["result"].get(KRAKEN_PAIR, [])
+    # Kraken normalizes pair name in response (XBTUSD → XXBTZUSD)
+    result = data["result"]
+    raw = result.get(KRAKEN_PAIR) or result.get("XXBTZUSD", [])
     now_ts = datetime.now(timezone.utc).timestamp()
 
     candles = []
@@ -63,7 +74,7 @@ def fetch_recent_candles() -> list[dict]:
         if ts + KRAKEN_INTERVAL * 60 > now_ts:
             continue
         candles.append({
-            "ts": datetime.fromtimestamp(ts, tz=timezone.utc),
+            "timestamp": datetime.fromtimestamp(ts, tz=timezone.utc),
             "open": float(row[1]),
             "high": float(row[2]),
             "low": float(row[3]),
@@ -80,9 +91,9 @@ def upsert_candles(engine, candles: list[dict]) -> int:
     with engine.begin() as conn:
         result = conn.execute(
             text("""
-                INSERT INTO market_data (ts, open, high, low, close, volume)
-                VALUES (:ts, :open, :high, :low, :close, :volume)
-                ON CONFLICT (ts) DO UPDATE SET
+                INSERT INTO market_data (timestamp, open, high, low, close, volume)
+                VALUES (:timestamp, :open, :high, :low, :close, :volume)
+                ON CONFLICT (timestamp) DO UPDATE SET
                     open   = EXCLUDED.open,
                     high   = EXCLUDED.high,
                     low    = EXCLUDED.low,
@@ -98,7 +109,9 @@ def run():
     log.info("=== Market Data Updater ===")
     engine = _get_engine()
 
-    candles = fetch_recent_candles()
+    since = _latest_timestamp(engine)
+    log.info(f"Fetching candles since {since.strftime('%Y-%m-%d %H:%M')} UTC")
+    candles = fetch_recent_candles(since)
     log.info(f"Fetched {len(candles)} completed candles from Kraken")
 
     inserted = upsert_candles(engine, candles)
