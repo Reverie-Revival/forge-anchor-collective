@@ -1,4 +1,4 @@
-# Handoff — 2026-07-03
+# Handoff — 2026-07-03 (end of session)
 
 ---
 ## ⚠️ ACTION REQUIRED BY AUG 1, 2026 — ORACLE ACCOUNT
@@ -9,23 +9,22 @@ This reminder must stay at the top of every handoff until confirmed complete.
 
 ## Current State
 
-**Model 1 is deployed in dry-run mode.** GitHub Actions workflows are live and running. Everything works. The only step remaining before real money is setting `DRY_RUN` to `false` in GitHub Secrets.
+**Model 1 is deployed in dry-run mode. Repo is public. Workflows firing automatically overnight.**
 
-### What's running on GitHub Actions
-- **Market Data Updater** — every 15 min. Fetches from Kraken public OHLC since latest DB timestamp (self-heals gaps up to 7.5 days), upserts into Supabase `market_data`.
-- **Live Executor** — every 30 min. Checks signals for streams whose candle timeframe closed, manages PENDING/OPEN lots, updates trailing stops, writes `last_run_at` to `live.executor_state`. With `DRY_RUN=false`, places real Kraken orders.
+### First thing tomorrow
+Check **GitHub Actions tab** — you should see a run history of both workflows firing on schedule overnight. If they ran clean, flip `DRY_RUN` to `false` in GitHub Secrets and you're live.
 
-### Verified working this session
-- Supabase connection via session pooler (IPv4 — direct connection is IPv6, incompatible with GitHub Actions)
-- Schema applied, `live.models` + `live.streams` seeded (3 streams at $33.33/lot)
-- `market_data` seeded and current through 2026-07-03
-- `sentiment_data` seeded through 2026-07-03
-- Signal checks clean for all 3 streams (no errors, no false signals)
-- Dry-run executor tick logs cleanly: streams loaded, timeframe detection working
+### What's running on GitHub Actions (automatic, no action needed)
+- **Market Data Updater** — every 15 min. Fetches from Kraken public OHLC since latest DB timestamp, upserts into Supabase `market_data`.
+- **Live Executor** — every 30 min. Checks signals, manages lots, updates trailing stops. Currently in dry-run — no real Kraken orders.
 
 ### To go live
-1. GitHub repo → Settings → Secrets → set `DRY_RUN` to `false`
-2. Confirm Kraken account has $100 USD balance (verified: $100.00 at deploy time)
+1. Check overnight Actions run history — confirm no errors
+2. GitHub repo → Settings → Secrets → set `DRY_RUN` to `false`
+3. Kraken account has $100 USD ready (verified at deploy time)
+
+### Why repo is public
+Unlimited free GitHub Actions minutes. No credentials in the repo — `.env` is gitignored and has never been committed (verified). Secrets are in GitHub Secrets only.
 
 ---
 
