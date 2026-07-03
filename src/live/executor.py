@@ -82,7 +82,7 @@ def _latest_candle_for_stream(stream: dict) -> dict | None:
     from src.backtester.engine import load_market_data
     from src.backtester.indicators import resample_ohlcv
 
-    now = pd.Timestamp.utcnow()
+    now = pd.Timestamp.utcnow().replace(tzinfo=None)
     load_start = (now - pd.Timedelta(hours=tf_minutes / 60 * 10)).strftime("%Y-%m-%d")
     df_raw = load_market_data(load_start)
     if df_raw.empty:
