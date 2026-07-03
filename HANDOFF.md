@@ -1,4 +1,4 @@
-# Handoff — 2026-06-30 (updated)
+# Handoff — 2026-07-03
 
 ---
 ## ⚠️ ACTION REQUIRED BY AUG 1, 2026 — ORACLE ACCOUNT
@@ -7,100 +7,72 @@ A tenancy deletion was submitted on an Oracle Cloud account (personal Gmail). De
 This reminder must stay at the top of every handoff until confirmed complete.
 ---
 
+## Current State
 
-## Done
+**Model 1 is deployed in dry-run mode.** GitHub Actions workflows are live and running. Everything works. The only step remaining before real money is setting `DRY_RUN` to `false` in GitHub Secrets.
 
-### Breakout Scout v2 — Tuned, Tested, Locked
+### What's running on GitHub Actions
+- **Market Data Updater** — every 15 min. Fetches from Kraken public OHLC since latest DB timestamp (self-heals gaps up to 7.5 days), upserts into Supabase `market_data`.
+- **Live Executor** — every 30 min. Checks signals for streams whose candle timeframe closed, manages PENDING/OPEN lots, updates trailing stops, writes `last_run_at` to `live.executor_state`. With `DRY_RUN=false`, places real Kraken orders.
 
-Full parameter exploration on BS starting from v1 baseline (-1.8% Primary v2, PF 0.64).
+### Verified working this session
+- Supabase connection via session pooler (IPv4 — direct connection is IPv6, incompatible with GitHub Actions)
+- Schema applied, `live.models` + `live.streams` seeded (3 streams at $33.33/lot)
+- `market_data` seeded and current through 2026-07-03
+- `sentiment_data` seeded through 2026-07-03
+- Signal checks clean for all 3 streams (no errors, no false signals)
+- Dry-run executor tick logs cleanly: streams loaded, timeframe detection working
 
-**What worked:**
-- **Breakout lookback 24h (from 48h)** — the primary unlock. 48h required breaking a 2-day range; 24h catches breakouts earlier with better reward/risk. Went from 11 to 23 trades on Primary v2.
-- **10% trailing stop (from 5%)** — lets genuine breakout continuation run. 5% was cutting winners before they realized.
-- **SMA 200 above filter** — breakouts only in macro uptrend. Added +0.7% return AND reduced DD simultaneously (counterintuitive). Gives BS a distinct identity: bull-regime breakout play, the opposite of DH's bear-regime role.
-- **F&G ≥ 55 (raised from 50)** — with the 24h lookback doing more work, tightening sentiment to greedy-only improved PF and Recent performance.
-
-**What was ruled out:**
-- `max_hold` — unlike DH, BS winners need to run. Force-exiting at 5–14 days consistently destroyed returns.
-- Loosening ATR filter — ATR at 90% is the real quality gate. Removing it flooded bad trades (75 trades, 33% WR, -11.7%).
-- Bollinger squeeze threshold tuning — irrelevant. Removing the squeeze filter entirely produced identical results. ATR does all the gating.
-- scale_up (2 slots at current engine behavior) — current implementation enters both slots on same signal. Deferred to staggered-slot redesign.
-
-**Locked config — Breakout Scout v2 (stream_id=3, locked_test_id=35):**
-```json
-{
-  "primary_timeframe": "1h",
-  "core_signal": "range_breakout",
-  "core_params": {"breakout_lookback": 24},
-  "filters": {
-    "bollinger": {"period": 20, "std_dev": 2.0, "squeeze": {"max_bandwidth_pct": 6.0}},
-    "atr_regime": {"period": 14, "avg_period": 30, "max_pct_of_avg": 90},
-    "breakout_candle": {"body_ratio_min": 0.4, "close_position_min": 0.6},
-    "trend_context": {"sma_period": 200, "require": "above"}
-  },
-  "sentiment": {"fear_greed": {"min": 55}},
-  "position": {
-    "trailing_stop_pct": 10.0,
-    "entry_order_type": "limit",
-    "entry_expiry_candles": 2
-  }
-}
-```
-
-**BS v2 results (1 slot, $10 lot):**
-| Window | Ann% | Trades | WR | DD | PF |
-|---|---|---|---|---|---|
-| Primary v2 (2022–) | +11.6% | 16 | 31% | -25.3% | 1.78 |
-| Full History (2018–) | +25.1% | 41 | 39% | -27.8% | 2.11 |
-| Recent (2024–) | +16.6% | 12 | 33% | -25.3% | 1.84 |
-| 2026 YTD | 0 trades | — | — | — | — |
-| Primary Window (2019–2023) | +36.2% | 26 | 42% | -27.8% | 2.54 |
-
-2026 YTD = 0 trades is correct — BS needs F&G ≥ 55 + price above SMA 200. 2026 is a fear-dominated market; DH covers that regime.
+### To go live
+1. GitHub repo → Settings → Secrets → set `DRY_RUN` to `false`
+2. Confirm Kraken account has $100 USD balance (verified: $100.00 at deploy time)
 
 ---
 
-### Model 1 Re-assembled — Run #4 (all v2 streams)
+## Bugs Fixed This Session
 
-Equal $33.33/lot × 1 slot × 3 streams = $99.99 total capital.
-
-| Window | Run #3 (MR v2 + DH v2 + BS v1) | Run #4 (all v2) |
+| File | Bug | Fix |
 |---|---|---|
-| Primary v2 | +11.9% | **+15.3%** |
-| Full History | +17.0% | **+22.2%** |
-| Recent | +9.6% | **+14.7%** |
-| 2026 YTD | +16.4% | **+16.4%** |
-| Max DD (PV2) | — | **-12.8%** |
-
-Model DD of -12.8% on Primary v2 is tighter than any individual stream's standalone DD — diversification compressing risk as intended.
+| `signal_engine.py` | `pd.Timestamp.utcnow()` is tz-aware in pandas 2.x; `market_data` index is tz-naive → crash on comparison | `.replace(tzinfo=None)` |
+| `signal_engine.py` | Sentiment mapping used wrong pattern — broke key lookup vs `fng_map` | Match `engine.py`: `df.index.date` + `.map(fng_map)` |
+| `market_data_updater.py` | Insert column named `ts` instead of `timestamp` | Renamed |
+| `market_data_updater.py` | Kraken returns pair as `XXBTZUSD` not `XBTUSD` in response body | Fallback key lookup |
+| `market_data_updater.py` | Fixed 2h lookback; gaps > 2h never self-healed | Fetch from latest DB timestamp |
 
 ---
 
-### Allocation Exploration
+## Prior Work — Streams + Model Assembly
 
-Tested 10 allocation splits from equal $33 to MR $60 / BS $25 / DH $15.
+### Streams (all v2, all locked)
 
-**Finding:** Returns climb linearly with MR weight, but every dollar shifted from DH costs 2026 YTD performance (DH is the active stream in the current fear regime). MR $60 / DH $10 reaches +17.9% PV2 but drops to +4.9% YTD.
+**Momentum Rider v2** (stream_id=1, locked_test_id=26) — 4h | EMA 30/120 crossover | min_hold 48h | 7% trail
+- Primary v2: +21.5% | Full History: +25.9% | Recent: +16.9%
 
-**Decision:** Keep equal $33.33 allocation for Run #4 deployment. Preserves regime responsiveness across all market conditions.
+**Dip Hunter v2** (stream_id=2, locked_test_id=34) — 1h | fear_dip | RSI min=35 | max_hold 240 candles | 10% trail
+- Primary v2: +11.7% | Full History: +12.1% | Recent: +10.5%
+
+**Breakout Scout v2** (stream_id=3, locked_test_id=35) — 1h | range_breakout lookback 24h | SMA 200 above | F&G ≥ 55 | 10% trail
+- Primary v2: +11.6% | Full History: +25.1% | Recent: +16.6% | 2026 YTD: 0 trades (fear regime)
+
+### Model Run #4 (all v2, equal $33.33/stream, $99.99 total)
+| Window | Ann% | DD |
+|---|---|---|
+| Primary v2 (2022–) | +15.3% | -12.8% |
+| Full History (2018–) | +22.2% | -15.8% |
+| Recent (2024–) | +14.7% | -13.6% |
+| 2026 YTD | +16.4% | -2.8% |
+| Primary Window (2019–2023) | +30.7% | -13.9% |
 
 ---
 
-## Current DB State
+## DB State
 
-**backtest.streams:**
+**backtest.streams (local Postgres only):**
 - stream_id=1: Momentum Rider v2 — LOCKED (locked_test_id=26)
 - stream_id=2: Dip Hunter v2 — LOCKED (locked_test_id=34)
 - stream_id=3: Breakout Scout v2 — LOCKED (locked_test_id=35)
 
-**backtest.stream_tests (BS v2 saves):**
-- test_id=35: BS v2 | Primary v2 | +11.6% (locked)
-- test_id=36: BS v2 | Full History | +25.1%
-- test_id=37: BS v2 | Recent | +16.6%
-- test_id=38: BS v2 | 2026 YTD | 0 trades
-- test_id=39: BS v2 | Primary Window | +36.2%
-
-**backtest.model_tests (Run #4):**
+**backtest.model_tests (local Postgres only):**
 | model_test_id | preset | ann% | DD |
 |---|---|---|---|
 | 15 | Primary v2 | +15.3% | -12.8% |
@@ -109,106 +81,66 @@ Tested 10 allocation splits from equal $33 to MR $60 / BS $25 / DH $15.
 | 18 | 2026 YTD | +16.4% | -2.8% |
 | 19 | Primary Window | +30.7% | -13.9% |
 
----
-
-## Design Decisions Logged
-
-### Staggered Slot Architecture (not yet built)
-
-Current `scale_up`/`scale_down` slot behavior is NOT the intended design. What we want:
-- Two independent capital buckets per stream
-- Slots cannot enter the same signal simultaneously — Slot 2 must wait for the NEXT signal
-- Slots alternate freely based on availability
-- Optional configurable wait time before Slot 2 becomes eligible
-
-Best fit for DH (sequential fear dips) and BS (consecutive squeeze breakouts). MR less useful since EMA crossovers in the same direction don't repeat quickly.
-
-This is an engine-level change that requires a feature branch before touching `engine.py`.
+**live schema (Supabase):**
+- `live.models`: model_id=1, Model 1, status=active
+- `live.streams`: stream_ids 1/2/3, mirroring backtest streams at $33.33/lot each
+- `live.executor_state`: id=1, last_run_at updated each tick
 
 ---
 
 ## Roadmap
 
-| Priority | Path | Notes |
+| Priority | Item | Notes |
 |---|---|---|
-| **1** | **Deploy Model 1 Live** | Kraken API integration, `live.*` schema, execution engine. Model 1 has passed all gates — this is the mission. |
-| **2** | **Architecture & Database Remodel** | Third full remodel — DB schema + code restructure. Scope after seeing live operation pain points. |
-| **2** | **Live Dashboard** | Streamlit monitoring for the live model — P&L, trade log, stream breakdown, benchmarks. Depends on live deployment; likely runs concurrently with architecture work. |
-| — | **Stream/Model Tester Fixes** | Known UI issues in Stream Tester and Model Tester. Address opportunistically or bundle into architecture remodel. |
-| — | **Staggered Slot Redesign** | Engine-level feature branch. Makes multi-slot streams actually useful (sequential entries vs. duplicate). Benefits DH + BS most. |
-| — | **Build Model 2** | Overlap phase — start once live is stable and running. |
-
----
-
-## Deploy Model 1 Live — Status
-
-### Code complete (on `live-model-1` branch)
-
-| File | Purpose |
-|---|---|
-| `src/live/kraken_client.py` | Authenticated REST wrapper — place_order, cancel_order, get_order_status, get_balance, get_ticker_price |
-| `src/live/deploy.py` | One-time script — creates live.models row + copies streams at $33.33/lot |
-| `src/live/signal_engine.py` | Runs locked signal logic on latest market_data; returns True/False per stream |
-| `src/live/order_manager.py` | CASH→PENDING→OPEN→CLOSED state machine; entry limit orders + market exit |
-| `src/live/position_monitor.py` | Trailing stop monitor; fires on candle close per stream's timeframe |
-| `src/live/executor.py` | Single-invocation tick (GitHub Actions); `--dry-run` flag skips Kraken orders but writes DB |
-| `src/live/market_data_updater.py` | GitHub Actions cron: fetches last 2h of 15-min candles from Kraken public OHLC API, upserts to Supabase |
-| `tests/live/test_signal_parity.py` | Layer 1 parity tests — 3/3 passing; reads locked configs from DB |
-| `.github/workflows/executor.yml` | Runs executor every 30 min via GitHub Actions |
-| `.github/workflows/market_data.yml` | Fetches market data every 15 min via GitHub Actions |
-
-### Schema changes applied (schema.sql)
-- `live.lots.status`: added `PENDING` state (CASH → PENDING → OPEN → CLOSED)
-- `live.lots.entry_expiry_at`: new column — timestamp when limit order should be cancelled if unfilled
-
-### What still needs to happen before real money
-
-**Hosting architecture: GitHub Actions + Supabase ($0/month)**
-- GitHub Actions runs two workflows: executor every 30 min, market data updater every 15 min
-- Supabase free PostgreSQL holds live schema + 60 days of market_data only
-- Minimum candle timeframe: 30 minutes (15m streams would miss closes at 30-min executor interval)
-
-**User actions required:**
-1. Set GitHub $0 spending cap — Settings → Billing → Spending limits → Actions → $0
-2. Create Supabase account at supabase.com with personal email
-3. Come back for help: apply live schema to Supabase, seed 60 days market_data + sentiment_data, add GitHub Secrets
-4. Create Kraken Pro account → generate API key (Create Order permission only, NO withdrawal)
-
-**Code steps (after infrastructure):**
-5. Push `live-model-1` branch — workflows activate automatically on schedule
-6. Run `python -m src.live.deploy` pointed at Supabase — creates live.models + live.streams rows
-7. Set `DRY_RUN=true` GitHub Secret → monitor Actions logs 24h — verify signal detection and DB state machine
-8. Remove dry-run secret → deploy full $100
-
-### Fee note
-Round trip live = 0.65% (0.25% limit entry + 0.40% market exit) vs. 0.50% assumed in backtest. ~$0.80 total delta over all trades. Known and acceptable.
-
-### Branch strategy
-- `main` — all development (testers, arch remodel, Model 2). Never deployed directly.
-- `live-model-1` — frozen at this deployment. Runs via GitHub Actions.
-- Bug fixes: patch `live-model-1`, cherry-pick to `main`.
-- Model 2: new `live-model-2` branch from `main` when it passes its backtest gate.
+| **Now** | **Go live** | Set `DRY_RUN=false` in GitHub Secrets. Monitor Actions logs for first real signal + order. |
+| **Next** | **Live Dashboard** | Streamlit monitoring — P&L, trade log, stream breakdown. Build once first trades occur. |
+| — | Architecture & DB Remodel | Third full remodel. Scope after seeing live operation pain points. |
+| — | Staggered Slot Redesign | Engine feature branch. Makes multi-slot streams useful (sequential vs. duplicate entries). DH + BS benefit most. |
+| — | Build Model 2 | Start once Model 1 is stable. Overlap phase. |
 
 ---
 
 ## Architecture Reference
 
+### src/live/ module (live-model-1 branch)
 | File | Purpose |
 |---|---|
-| `src/backtester/engine.py` | Core backtest engine — `_run_slot()`, slot_mode dispatch, `_warmup_days()` |
-| `src/backtester/signals.py` | `generate_signals()` + `_check_filters()` — all signal/filter logic |
-| `src/backtester/model_runner.py` | `run_model()` — loads locked streams from DB, applies allocations |
-| `src/backtester/run_stream_test.py` | Quick single-config runner → writes .last_run.pkl for Stream Tester |
-| `src/backtester/explore_bs_v2.py` | BS v2 Round 1 (stop width, entry relaxation, F&G, lookback) |
-| `src/backtester/explore_bs_v2b.py` | BS v2 Round 2 (max_hold, SMA regime, lookback combos, scale_up) |
-| `src/backtester/explore_bs_v2c.py` | BS v2 Round 3 (SMA on CandA, CandB refinements, scale_up on top R2 configs) |
-| `src/backtester/explore_allocation.py` | Model 1 allocation splits (equal vs MR-heavy) |
-| `src/backtester/run_model_r4.py` | One-shot script that locked BS v2 and saved Run #4 |
-| `src/app/db.py` | All DB ops — `save_stream_test()`, `save_model_test()`, `get_engine()` |
-| `src/app/pages/model_tester.py` | Model Tester page |
-| `src/app/model_dashboard.py` | Model dashboard renderer (stream colors defined here) |
+| `kraken_client.py` | REST wrapper — place_order, cancel_order, get_order_status, get_balance, get_ticker_price |
+| `deploy.py` | One-time script — creates live.models + live.streams rows. Already run against Supabase. |
+| `signal_engine.py` | Checks latest candle for signal using same logic as backtester |
+| `order_manager.py` | CASH→PENDING→OPEN→CLOSED state machine; limit entry + market exit |
+| `position_monitor.py` | Checks trailing stops on OPEN lots at candle close |
+| `executor.py` | Single-invocation tick (GitHub Actions); `--dry-run` skips Kraken calls, DB writes are real |
+| `market_data_updater.py` | Fetches candles from Kraken public OHLC since latest DB timestamp, upserts to Supabase |
+
+### GitHub Actions (workflows on both main + live-model-1)
+| Workflow | Schedule | Key Secrets |
+|---|---|---|
+| `executor.yml` | every 30 min | SUPABASE_DATABASE_URL, KRAKEN_API_KEY, KRAKEN_API_SECRET, DRY_RUN |
+| `market_data.yml` | every 15 min | SUPABASE_DATABASE_URL only |
+
+### Supabase
+- Account: personal Gmail (separate from Reverie Revival GitHub org — intentional)
+- Project: forge-model-1, US East Ohio, free tier
+- **Connection: Session Pooler URL required** — direct connection is IPv6, GitHub Actions is IPv4 only
+- Schema: `src/data/supabase_schema.sql`
+- Seed: `src/data/seed_supabase.py` (copies N days from local Postgres)
+
+### Backtester (main branch, local only)
+| File | Purpose |
+|---|---|
+| `src/backtester/engine.py` | Core engine — `_run_slot()`, `_warmup_days()`, `load_market_data()` |
+| `src/backtester/signals.py` | Signal + filter logic |
+| `src/backtester/model_runner.py` | Loads locked streams, runs model-level backtest |
+| `src/app/db.py` | All DB ops |
 
 **Run Streamlit:** `streamlit run src/app/app.py`
 
-**Available signals in engine:** `ema_crossover`, `rsi_recovery`, `rsi_dip`, `range_breakout`, `volume_surge`, `fear_dip`, `sma_pullback`
-**Available filters:** `trend_context`, `rsi`, `drawdown_from_high`, `sentiment.fear_greed`, `volume`, `atr_regime`, `bollinger`, `breakout_candle`
+### Design Decisions Logged
+
+**Staggered Slot Architecture (not yet built)**
+Current slots are redundant (both enter same signal simultaneously). Intended design:
+- Two independent capital buckets per stream
+- Slot 2 must wait for the NEXT signal — no simultaneous entry
+- Benefits DH (sequential fear dips) and BS (consecutive breakouts) most
+- Engine-level change requiring a feature branch before touching `engine.py`
