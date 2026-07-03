@@ -27,7 +27,8 @@ def check(stream: dict) -> bool:
     warmup = _warmup_days(params)
 
     # Load enough history to fully warm up all indicators
-    now = pd.Timestamp.utcnow()
+    # tz-naive to match market_data index (load_market_data returns datetime64[ns])
+    now = pd.Timestamp.utcnow().replace(tzinfo=None)
     load_start = (now - pd.Timedelta(days=warmup + 5)).strftime("%Y-%m-%d")
 
     df = load_market_data(load_start)
@@ -39,10 +40,8 @@ def check(stream: dict) -> bool:
 
     if params.get("sentiment"):
         fng_map = load_sentiment(load_start)
-        df["fng_value"] = df.index.normalize()
-        df["fng_value"] = pd.to_datetime(df.index.date).map(
-            lambda d: fng_map.get(d)
-        )
+        df["fng_value"] = df.index.date
+        df["fng_value"] = df["fng_value"].map(fng_map)
 
     df = add_indicators(df, params)
 
