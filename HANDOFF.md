@@ -16,7 +16,7 @@ This reminder must stay at the top of every handoff until confirmed complete.
 - HWM = $62,710.10 (entry price — no run-up yet)
 - 10% trailing stop → stop triggers if price drops to ~$56,439
 - Position is OPEN in Supabase `live.lots`
-- Backtester confirmed the same signal and entry — system is behaving correctly
+- **Note:** F&G was 21 at entry — filter (≥55) was silently passing due to stale sentiment data. Sentiment fix is deployed; filter is now enforced going forward.
 
 ## Done This Session
 
@@ -50,10 +50,9 @@ Synced local postgres market_data to match Supabase (568 candles upserted). `DAT
 
 ## Next Session — In Order
 
-1. **Finish `feature/live-monitor`** — any remaining polish, then merge into main
+1. **Review live-model-1** — confirm F&G fix is in place; verify open Breakout Scout position is being tracked correctly
 2. **Set up session-start local sync habit** — run `python -m src.data.downloader` + `python -m src.data.sentiment` at the start of every session
-3. **Watch the open Breakout Scout position** — confirm trailing stop monitoring is running correctly
-4. **Reporting dashboard** — deferred until there are closed trades to verify with
+3. **Reporting dashboard** — deferred until there are closed trades to verify with
 
 ## Open Questions
 
