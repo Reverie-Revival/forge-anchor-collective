@@ -71,12 +71,26 @@ class KrakenClient:
           status:   'pending' | 'open' | 'closed' | 'canceled' | 'expired'
           vol_exec: volume filled so far (string)
           price:    average fill price (string)
-        Returns empty dict if txid not found.
+        Returns empty dict if txid not found in either QueryOrders or TradesHistory.
+
+        Note: Kraken's QueryOrders can return empty for orders that filled
+        immediately (taker fills). Falls back to TradesHistory to detect fills.
         """
         resp = self._api.query_private("QueryOrders", {"txid": txid, "trades": True})
         if resp.get("error"):
             raise RuntimeError(f"Kraken QueryOrders error: {resp['error']}")
-        return resp["result"].get(txid, {})
+        order = resp["result"].get(txid, {})
+        if order:
+            return order
+
+        # QueryOrders missed it — check TradesHistory for a matching fill
+        resp2 = self._api.query_private("TradesHistory")
+        if resp2.get("error"):
+            return {}
+        for trade in resp2["result"].get("trades", {}).values():
+            if trade.get("ordertxid") == txid:
+                return {"status": "closed", "vol_exec": trade["vol"], "price": trade["price"]}
+        return {}
 
     def get_ticker_price(self) -> float:
         """Return current BTC/USD last trade price."""
