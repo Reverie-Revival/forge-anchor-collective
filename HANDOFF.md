@@ -9,19 +9,13 @@ This reminder must stay at the top of every handoff until confirmed complete.
 
 ## Current State
 
-**Model 1 is deployed in dry-run mode. Repo is public. Workflows firing automatically overnight.**
+**Model 1 is LIVE. Real money. First position already open.**
 
-### First thing tomorrow
-Check **GitHub Actions tab** — you should see a run history of both workflows firing on schedule overnight. If they ran clean, flip `DRY_RUN` to `false` in GitHub Secrets and you're live.
+`DRY_RUN=false` set 2026-07-03. Workflows firing automatically via cron-job.org. Market data updating every 15 min, executor running every 30 min. First live position opened shortly after go-live.
 
-### What's running on GitHub Actions (automatic, no action needed)
-- **Market Data Updater** — every 15 min. Fetches from Kraken public OHLC since latest DB timestamp, upserts into Supabase `market_data`.
-- **Live Executor** — every 30 min. Checks signals, manages lots, updates trailing stops. Currently in dry-run — no real Kraken orders.
-
-### To go live
-1. Check overnight Actions run history — confirm no errors
-2. GitHub repo → Settings → Secrets → set `DRY_RUN` to `false`
-3. Kraken account has $100 USD ready (verified at deploy time)
+### What's running (automatic, no action needed)
+- **Market Data Updater** — every 15 min via cron-job.org → GitHub Actions
+- **Live Executor** — every 30 min via cron-job.org → GitHub Actions. Real Kraken orders.
 
 ### Why repo is public
 Unlimited free GitHub Actions minutes. No credentials in the repo — `.env` is gitignored and has never been committed (verified). Secrets are in GitHub Secrets only.
@@ -91,8 +85,7 @@ Unlimited free GitHub Actions minutes. No credentials in the repo — `.env` is 
 
 | Priority | Item | Notes |
 |---|---|---|
-| **Now** | **Go live** | Set `DRY_RUN=false` in GitHub Secrets. Monitor Actions logs for first real signal + order. |
-| **Next** | **Live Dashboard** | Streamlit monitoring — P&L, trade log, stream breakdown. Build once first trades occur. |
+| **Now** | **Live Dashboard** | `feature/live-monitor` branch is built — finish polish and merge to `main`. |
 | — | Architecture & DB Remodel | Third full remodel. Scope after seeing live operation pain points. |
 | — | Staggered Slot Redesign | Engine feature branch. Makes multi-slot streams useful (sequential vs. duplicate entries). DH + BS benefit most. |
 | — | Build Model 2 | Start once Model 1 is stable. Overlap phase. |
