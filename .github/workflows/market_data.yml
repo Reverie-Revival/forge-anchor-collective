@@ -25,3 +25,8 @@ jobs:
         env:
           DATABASE_URL: ${{ secrets.SUPABASE_DATABASE_URL }}
         run: python -m src.live.market_data_updater
+
+      - name: Update Fear & Greed sentiment (no-op if already current)
+        env:
+          DATABASE_URL: ${{ secrets.SUPABASE_DATABASE_URL }}
+        run: python -m src.data.sentiment
