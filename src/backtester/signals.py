@@ -2,40 +2,51 @@ import pandas as pd
 
 
 def _check_filters(row: pd.Series, prev_row: pd.Series, params: dict) -> bool:
-    """Return False if any enabled filter fails."""
+    """Return False if any enabled filter fails or its required data is missing/NaN.
+    A configured filter is required — a missing value is a failed filter, not a pass.
+    """
     filters = params.get("filters") or {}
 
     tc = filters.get("trend_context") or {}
     if tc:
         col = f"trend_sma_{tc['sma_period']}"
-        if col in row.index:
-            if tc.get("require") == "above" and row["close"] <= row[col]:
-                return False
-            if tc.get("require") == "below" and row["close"] >= row[col]:
-                return False
+        if col not in row.index or pd.isna(row[col]):
+            return False
+        if tc.get("require") == "above" and row["close"] <= row[col]:
+            return False
+        if tc.get("require") == "below" and row["close"] >= row[col]:
+            return False
 
     rsi_f = filters.get("rsi") or {}
-    if rsi_f and "rsi" in row.index:
+    if rsi_f:
+        if "rsi" not in row.index or pd.isna(row["rsi"]):
+            return False
         if rsi_f.get("min") is not None and row["rsi"] < rsi_f["min"]:
             return False
         if rsi_f.get("max") is not None and row["rsi"] > rsi_f["max"]:
             return False
 
     vol_f = filters.get("volume") or {}
-    if vol_f and "volume_avg" in row.index:
+    if vol_f:
+        if "volume_avg" not in row.index or pd.isna(row["volume_avg"]):
+            return False
         threshold = row["volume_avg"] * vol_f.get("min_multiplier", 1.0)
         if row["volume"] < threshold:
             return False
 
     atr_f = filters.get("atr_regime") or {}
-    if atr_f and "atr" in row.index and "atr_avg" in row.index:
+    if atr_f:
+        if "atr" not in row.index or "atr_avg" not in row.index or pd.isna(row["atr"]) or pd.isna(row["atr_avg"]):
+            return False
         max_pct = atr_f.get("max_pct_of_avg", 100) / 100.0
         if row["atr"] > row["atr_avg"] * max_pct:
             return False
 
     sentiment = params.get("sentiment") or {}
     fng = sentiment.get("fear_greed") or {}
-    if fng and "fng_value" in row.index and not pd.isna(row["fng_value"]):
+    if fng:
+        if "fng_value" not in row.index or pd.isna(row["fng_value"]):
+            return False
         val = row["fng_value"]
         if fng.get("min") is not None and val < fng["min"]:
             return False
@@ -43,12 +54,16 @@ def _check_filters(row: pd.Series, prev_row: pd.Series, params: dict) -> bool:
             return False
 
     dfh_f = filters.get("drawdown_from_high") or {}
-    if dfh_f and "drawdown_from_high_pct" in row.index and not pd.isna(row["drawdown_from_high_pct"]):
+    if dfh_f:
+        if "drawdown_from_high_pct" not in row.index or pd.isna(row["drawdown_from_high_pct"]):
+            return False
         if row["drawdown_from_high_pct"] > -(dfh_f.get("min_drop_pct", 15.0)):
             return False
 
     bb_f = filters.get("bollinger") or {}
-    if bb_f and "bb_bandwidth" in row.index and not pd.isna(row["bb_bandwidth"]):
+    if bb_f:
+        if "bb_bandwidth" not in row.index or pd.isna(row["bb_bandwidth"]):
+            return False
         squeeze = bb_f.get("squeeze") or {}
         if squeeze.get("max_bandwidth_pct") is not None:
             if row["bb_bandwidth"] > squeeze["max_bandwidth_pct"]:
@@ -67,8 +82,9 @@ def _check_filters(row: pd.Series, prev_row: pd.Series, params: dict) -> bool:
                 if close_pos < bc_f["close_position_min"]:
                     return False
 
-    atr_f = filters.get("atr_regime") or {}
-    if atr_f.get("min_consecutive_candles") and "atr_low_streak" in row.index and not pd.isna(row["atr_low_streak"]):
+    if atr_f.get("min_consecutive_candles"):
+        if "atr_low_streak" not in row.index or pd.isna(row["atr_low_streak"]):
+            return False
         if row["atr_low_streak"] < atr_f["min_consecutive_candles"]:
             return False
 

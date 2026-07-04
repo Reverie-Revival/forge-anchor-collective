@@ -100,6 +100,34 @@ def _latest_candle_for_stream(stream: dict):
     return {"close": float(last["close"]), "low": float(last["low"])}
 
 
+def _preflight_check(conn) -> list:
+    """Verify data freshness before trading. Returns list of failure reasons."""
+    from datetime import date
+    issues = []
+
+    row = conn.execute(text("SELECT MAX(timestamp) FROM market_data")).fetchone()
+    if row[0] is None:
+        issues.append("market_data is empty")
+    else:
+        latest = row[0]
+        if latest.tzinfo is None:
+            latest = latest.replace(tzinfo=timezone.utc)
+        age_min = (datetime.now(timezone.utc) - latest).total_seconds() / 60
+        if age_min > 120:
+            issues.append(f"market_data stale ({int(age_min)}m since last candle)")
+
+    row = conn.execute(text("SELECT MAX(date) FROM sentiment_data")).fetchone()
+    if row[0] is None:
+        issues.append("sentiment_data is empty")
+    else:
+        from datetime import date
+        days_old = (date.today() - row[0]).days
+        if days_old > 2:
+            issues.append(f"sentiment_data stale ({days_old}d since last entry)")
+
+    return issues
+
+
 def _read_last_run(conn) -> datetime:
     row = conn.execute(text("SELECT last_run_at FROM live.executor_state WHERE id = 1")).fetchone()
     if row is None:
@@ -228,6 +256,15 @@ def run(dry_run: bool = False) -> None:
         log.info(f"Loaded {len(streams)} streams: {[s['stream_name'] for s in streams.values()]}")
 
         last_tick = _read_last_run(conn)
+
+        issues = _preflight_check(conn)
+        if issues:
+            msg = "Pre-flight failed: " + "; ".join(issues)
+            log.error(msg)
+            _log_tick(conn, last_tick, set(), 0, 0, [], 0, 0, 0, 0, error=msg)
+            _write_last_run(conn, now)
+            sys.exit(1)
+
         tick(conn, streams, kraken, last_tick, now, dry_run)
         _write_last_run(conn, now)
 
