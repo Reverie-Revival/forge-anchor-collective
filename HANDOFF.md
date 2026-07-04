@@ -1,4 +1,4 @@
-# Handoff — 2026-07-03 (end of session)
+# Handoff — 2026-07-04 (end of session)
 
 ---
 ## ⚠️ ACTION REQUIRED BY AUG 1, 2026 — ORACLE ACCOUNT
@@ -9,137 +9,85 @@ This reminder must stay at the top of every handoff until confirmed complete.
 
 ## Current State
 
-**Model 1 is deployed in dry-run mode. Repo is public. Workflows firing automatically overnight.**
+**Model 1 is LIVE with its first open trade.**
 
-### First thing tomorrow
-Check **GitHub Actions tab** — you should see a run history of both workflows firing on schedule overnight. If they ran clean, flip `DRY_RUN` to `false` in GitHub Secrets and you're live.
+- **Breakout Scout v2** entered at **$62,710.10** on 2026-07-03 21:00 UTC
+- lot_id=2, stream_id=3, 0.00053149 BTC
+- HWM = $62,710.10 (entry price — no run-up yet)
+- 10% trailing stop → stop triggers if price drops to ~$56,439
+- Position is OPEN in Supabase `live.lots`
+- Backtester confirmed the same signal and entry — system is behaving correctly
 
-### What's running on GitHub Actions (automatic, no action needed)
-- **Market Data Updater** — every 15 min. Fetches from Kraken public OHLC since latest DB timestamp, upserts into Supabase `market_data`.
-- **Live Executor** — every 30 min. Checks signals, manages lots, updates trailing stops. Currently in dry-run — no real Kraken orders.
+## Done This Session
 
-### To go live
-1. Check overnight Actions run history — confirm no errors
-2. GitHub repo → Settings → Secrets → set `DRY_RUN` to `false`
-3. Kraken account has $100 USD ready (verified at deploy time)
+### Critical Bug Fix — Fill Detection
+Kraken's `QueryOrders` silently returns `{}` for limit orders that fill immediately as taker trades. This caused the first live trade to be detected as expired and deleted (lots went empty despite a confirmed Kraken purchase). Fixed in `src/live/kraken_client.py`: `get_order_status()` now falls back to `TradesHistory` when `QueryOrders` returns empty. **Committed and pushed to live-model-1.**
 
-### Why repo is public
-Unlimited free GitHub Actions minutes. No credentials in the repo — `.env` is gitignored and has never been committed (verified). Secrets are in GitHub Secrets only.
+### Lot Restoration
+Manually re-inserted lot_id=2 into `live.lots` with correct values from Kraken `TradesHistory` data (txid=OF6YSN-4RZAY-LLJMSQ). lot_id is 2 not 1 because PostgreSQL SERIAL doesn't reset on row deletion.
+
+### Sentiment Data Gap Fixed
+`sentiment_data` in Supabase was stale (last date: 2026-06-28). The F&G ≥ 55 filter in Breakout Scout was silently doing nothing live (NaN comparison always passes). Fixed:
+- Backfilled July 1–4 manually
+- `src/data/sentiment.py` now incremental — checks DB max date, fetches only missing days (was fetching full 2000-row history every time, causing timeouts)
+- Sentiment step added to `market_data.yml` GitHub Actions workflow — runs every 15 min, no-ops when already current, no separate cron-job.org job needed
+
+### Run Logging (from earlier in session)
+`executor.py` and `market_data_updater.py` now write one row per run to `live.executor_runs` and `live.market_data_runs`. 90-day retention enforced inline. Tables exist in Supabase and local postgres.
+
+### Live Monitor Dashboard
+Built `src/app/pages/live_monitor.py` on `feature/live-monitor` branch. Shows system status, open positions, executor/market_data run logs, closed trades. Registered in app.py nav. **Not yet merged to main — next session.**
+
+### Branch Cleanup
+Branches diverged badly during the session (feature work landed on live-model-1). Resolved: merged both directions, all conflicts resolved cleanly. As of session end:
+- `live-model-1` and `main` are in sync (main is one merge-commit ahead)
+- `feature/live-monitor` has the dashboard, one commit ahead of main
+
+**Hard rule established going forward:** `live-model-1` is production. Only critical bug fixes go there. All other work on feature branches off `main`.
+
+### Local DB Sync
+Synced local postgres market_data to match Supabase (568 candles upserted). `DATABASE_URL` added explicitly to `.env`.
+
+## Next Session — In Order
+
+1. **Finish `feature/live-monitor`** — any remaining polish, then merge into main
+2. **Set up session-start local sync habit** — run `python -m src.data.downloader` + `python -m src.data.sentiment` at the start of every session
+3. **Watch the open Breakout Scout position** — confirm trailing stop monitoring is running correctly
+4. **Reporting dashboard** — deferred until there are closed trades to verify with
+
+## Open Questions
+
+- Is the F&G ≥ 55 filter working correctly now that sentiment data is current? (Next signal from BS will be the real test)
+- When to start Model 2 build? (Suggested: after Model 1 has a few weeks of clean live data)
 
 ---
 
-## Bugs Fixed This Session
+## Reference: Architecture
 
+### Branch Strategy (hard rule as of 2026-07-04)
+- `main` — all development, workflow files, feature branches merge here
+- `live-model-1` — production. GitHub Actions checks this out. **Critical fixes only. No feature work.**
+- `feature/*` — new work, always branched from main, merged back to main
+- Bug fixes to live: commit to `live-model-1` directly, cherry-pick to `main`
+
+### GitHub Actions Workflows (all on main, workflow_dispatch only, triggered by cron-job.org)
+| Workflow | Trigger | What It Does |
+|---|---|---|
+| `executor.yml` | Every 30 min | Runs `src.live.executor` tick |
+| `market_data.yml` | Every 15 min | Fetches candles + updates sentiment (incremental) |
+
+### Streams
+- **Momentum Rider v2** (stream_id=1) — 4h \| EMA 30/120 \| 7% trail \| $33.33
+- **Dip Hunter v2** (stream_id=2) — 1h \| fear_dip \| RSI≥35 \| 10% trail \| $33.33
+- **Breakout Scout v2** (stream_id=3) — 1h \| range_breakout \| SMA200 \| F&G≥55 \| 10% trail \| $33.33
+
+### Known Bugs Fixed (lifetime)
 | File | Bug | Fix |
 |---|---|---|
-| `signal_engine.py` | `pd.Timestamp.utcnow()` is tz-aware in pandas 2.x; `market_data` index is tz-naive → crash on comparison | `.replace(tzinfo=None)` |
-| `signal_engine.py` | Sentiment mapping used wrong pattern — broke key lookup vs `fng_map` | Match `engine.py`: `df.index.date` + `.map(fng_map)` |
-| `market_data_updater.py` | Insert column named `ts` instead of `timestamp` | Renamed |
-| `market_data_updater.py` | Kraken returns pair as `XXBTZUSD` not `XBTUSD` in response body | Fallback key lookup |
-| `market_data_updater.py` | Fixed 2h lookback; gaps > 2h never self-healed | Fetch from latest DB timestamp |
-
----
-
-## Prior Work — Streams + Model Assembly
-
-### Streams (all v2, all locked)
-
-**Momentum Rider v2** (stream_id=1, locked_test_id=26) — 4h | EMA 30/120 crossover | min_hold 48h | 7% trail
-- Primary v2: +21.5% | Full History: +25.9% | Recent: +16.9%
-
-**Dip Hunter v2** (stream_id=2, locked_test_id=34) — 1h | fear_dip | RSI min=35 | max_hold 240 candles | 10% trail
-- Primary v2: +11.7% | Full History: +12.1% | Recent: +10.5%
-
-**Breakout Scout v2** (stream_id=3, locked_test_id=35) — 1h | range_breakout lookback 24h | SMA 200 above | F&G ≥ 55 | 10% trail
-- Primary v2: +11.6% | Full History: +25.1% | Recent: +16.6% | 2026 YTD: 0 trades (fear regime)
-
-### Model Run #4 (all v2, equal $33.33/stream, $99.99 total)
-| Window | Ann% | DD |
-|---|---|---|
-| Primary v2 (2022–) | +15.3% | -12.8% |
-| Full History (2018–) | +22.2% | -15.8% |
-| Recent (2024–) | +14.7% | -13.6% |
-| 2026 YTD | +16.4% | -2.8% |
-| Primary Window (2019–2023) | +30.7% | -13.9% |
-
----
-
-## DB State
-
-**backtest.streams (local Postgres only):**
-- stream_id=1: Momentum Rider v2 — LOCKED (locked_test_id=26)
-- stream_id=2: Dip Hunter v2 — LOCKED (locked_test_id=34)
-- stream_id=3: Breakout Scout v2 — LOCKED (locked_test_id=35)
-
-**backtest.model_tests (local Postgres only):**
-| model_test_id | preset | ann% | DD |
-|---|---|---|---|
-| 15 | Primary v2 | +15.3% | -12.8% |
-| 16 | Full History | +22.2% | -15.8% |
-| 17 | Recent | +14.7% | -13.6% |
-| 18 | 2026 YTD | +16.4% | -2.8% |
-| 19 | Primary Window | +30.7% | -13.9% |
-
-**live schema (Supabase):**
-- `live.models`: model_id=1, Model 1, status=active
-- `live.streams`: stream_ids 1/2/3, mirroring backtest streams at $33.33/lot each
-- `live.executor_state`: id=1, last_run_at updated each tick
-
----
-
-## Roadmap
-
-| Priority | Item | Notes |
-|---|---|---|
-| **Now** | **Go live** | Set `DRY_RUN=false` in GitHub Secrets. Monitor Actions logs for first real signal + order. |
-| **Next** | **Live Dashboard** | Streamlit monitoring — P&L, trade log, stream breakdown. Build once first trades occur. |
-| — | Architecture & DB Remodel | Third full remodel. Scope after seeing live operation pain points. |
-| — | Staggered Slot Redesign | Engine feature branch. Makes multi-slot streams useful (sequential vs. duplicate entries). DH + BS benefit most. |
-| — | Build Model 2 | Start once Model 1 is stable. Overlap phase. |
-
----
-
-## Architecture Reference
-
-### src/live/ module (live-model-1 branch)
-| File | Purpose |
-|---|---|
-| `kraken_client.py` | REST wrapper — place_order, cancel_order, get_order_status, get_balance, get_ticker_price |
-| `deploy.py` | One-time script — creates live.models + live.streams rows. Already run against Supabase. |
-| `signal_engine.py` | Checks latest candle for signal using same logic as backtester |
-| `order_manager.py` | CASH→PENDING→OPEN→CLOSED state machine; limit entry + market exit |
-| `position_monitor.py` | Checks trailing stops on OPEN lots at candle close |
-| `executor.py` | Single-invocation tick (GitHub Actions); `--dry-run` skips Kraken calls, DB writes are real |
-| `market_data_updater.py` | Fetches candles from Kraken public OHLC since latest DB timestamp, upserts to Supabase |
-
-### GitHub Actions (workflows on both main + live-model-1)
-| Workflow | Schedule | Key Secrets |
-|---|---|---|
-| `executor.yml` | every 30 min | SUPABASE_DATABASE_URL, KRAKEN_API_KEY, KRAKEN_API_SECRET, DRY_RUN |
-| `market_data.yml` | every 15 min | SUPABASE_DATABASE_URL only |
-
-### Supabase
-- Account: personal Gmail (separate from Reverie Revival GitHub org — intentional)
-- Project: forge-model-1, US East Ohio, free tier
-- **Connection: Session Pooler URL required** — direct connection is IPv6, GitHub Actions is IPv4 only
-- Schema: `src/data/supabase_schema.sql`
-- Seed: `src/data/seed_supabase.py` (copies N days from local Postgres)
-
-### Backtester (main branch, local only)
-| File | Purpose |
-|---|---|
-| `src/backtester/engine.py` | Core engine — `_run_slot()`, `_warmup_days()`, `load_market_data()` |
-| `src/backtester/signals.py` | Signal + filter logic |
-| `src/backtester/model_runner.py` | Loads locked streams, runs model-level backtest |
-| `src/app/db.py` | All DB ops |
-
-**Run Streamlit:** `streamlit run src/app/app.py`
-
-### Design Decisions Logged
-
-**Staggered Slot Architecture (not yet built)**
-Current slots are redundant (both enter same signal simultaneously). Intended design:
-- Two independent capital buckets per stream
-- Slot 2 must wait for the NEXT signal — no simultaneous entry
-- Benefits DH (sequential fear dips) and BS (consecutive breakouts) most
-- Engine-level change requiring a feature branch before touching `engine.py`
+| `signal_engine.py` | tz-naive/aware mismatch | `.replace(tzinfo=None)` |
+| `signal_engine.py` | Sentiment key lookup broken | Match `df.index.date` + `.map(fng_map)` |
+| `market_data_updater.py` | Column named `ts` not `timestamp` | Renamed |
+| `market_data_updater.py` | Kraken returns `XXBTZUSD` not `XBTUSD` | Fallback key lookup |
+| `market_data_updater.py` | Fixed 2h lookback; gaps never self-healed | Fetch from latest DB timestamp |
+| `executor.py` | tz-naive/aware in `_latest_candle_for_stream` | `.replace(tzinfo=None)` |
+| `kraken_client.py` | `QueryOrders` returns `{}` for taker fills | Fall back to `TradesHistory` |
