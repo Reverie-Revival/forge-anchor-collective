@@ -219,10 +219,16 @@ def load_stream_status():
                     note = "crossed this candle ✓" if crossed else "aligned — awaiting next cross"
                 else:
                     note = f"{abs(gap):.2f}% below — gap closing" if gap > -2 else "below — not aligned"
+                if crossed:
+                    _p = 1.0
+                elif not pd.isna(gap):
+                    _p = min(max((gap + 10) / 10 * 0.9, 0.0), 0.9)
+                else:
+                    _p = 0.0
                 conditions.append({
                     "label": f"EMA {core_p['ema_short']}/{core_p['ema_long']} crossover",
                     "current": f"EMA{core_p['ema_short']} ${es:,.0f}  /  EMA{core_p['ema_long']} ${el:,.0f}  ({gap:+.2f}%)",
-                    "pass": crossed, "note": note,
+                    "pass": crossed, "note": note, "progress": _p,
                 })
 
             elif core == "rsi_recovery":
@@ -236,10 +242,16 @@ def load_stream_status():
                     note = f"oversold ({rsi_val:.1f}) — watching for bounce"
                 else:
                     note = f"above threshold — wait for next dip below {threshold}"
+                if crossed_up:
+                    _p = 1.0
+                elif rsi_val < threshold:
+                    _p = min(rsi_val / threshold * 0.9, 0.9)
+                else:
+                    _p = 0.0
                 conditions.append({
                     "label": f"RSI recovery (cross above {threshold})",
                     "current": f"RSI {rsi_val:.1f}  (prev {rsi_prev:.1f})",
-                    "pass": crossed_up, "note": note,
+                    "pass": crossed_up, "note": note, "progress": _p,
                 })
 
             elif core == "range_breakout":
@@ -248,10 +260,11 @@ def load_stream_status():
                 gap = (price - bh) / bh * 100 if not pd.isna(bh) and bh else float("nan")
                 broke = not pd.isna(bh) and price > bh
                 note = "broke out this candle ✓" if broke else f"{abs(gap):.1f}% below breakout level"
+                _p = 1.0 if broke else (min(price / bh * 0.95, 0.95) if not pd.isna(bh) and bh > 0 else 0.0)
                 conditions.append({
                     "label": f"Range breakout ({core_p.get('breakout_lookback', 24)}-candle high)",
                     "current": f"Price ${price:,.0f}  /  Range High ${bh:,.0f}  ({gap:+.1f}%)",
-                    "pass": broke, "note": note,
+                    "pass": broke, "note": note, "progress": _p,
                 })
 
             # RSI filter
@@ -266,7 +279,15 @@ def load_stream_status():
                 if rsi_f.get("max") is not None:
                     ok = ok and rval <= rsi_f["max"]
                     parts.append(f"≤ {rsi_f['max']}")
-                conditions.append({"label": f"RSI filter ({', '.join(parts)})", "current": f"RSI {rval:.1f}", "pass": ok, "note": ""})
+                if ok:
+                    _p = 1.0
+                elif rsi_f.get("min") is not None and rval < rsi_f["min"]:
+                    _p = rval / rsi_f["min"]
+                elif rsi_f.get("max") is not None and rval > rsi_f["max"]:
+                    _p = max(0.0, 1.0 - (rval - rsi_f["max"]) / 30.0)
+                else:
+                    _p = 0.0
+                conditions.append({"label": f"RSI filter ({', '.join(parts)})", "current": f"RSI {rval:.1f}", "pass": ok, "note": "", "progress": _p})
 
             # Trend context (SMA)
             tc = filters.get("trend_context") or {}
@@ -278,10 +299,18 @@ def load_stream_status():
                     req = tc.get("require", "above")
                     ok = (price > sma_val) if req == "above" else (price < sma_val)
                     gap = (price - sma_val) / sma_val * 100
+                    if ok:
+                        _p = 1.0
+                    elif req == "above" and sma_val > 0:
+                        _p = min(price / sma_val, 0.95)
+                    elif req == "below" and price > 0:
+                        _p = min(sma_val / price, 0.95)
+                    else:
+                        _p = 0.0
                     conditions.append({
                         "label": f"Price {req} SMA {tc['sma_period']}",
                         "current": f"${price:,.0f}  /  SMA {tc['sma_period']} ${sma_val:,.0f}  ({gap:+.1f}%)",
-                        "pass": ok, "note": "",
+                        "pass": ok, "note": "", "progress": _p,
                     })
 
             # Sentiment / F&G
@@ -295,10 +324,18 @@ def load_stream_status():
                 if fng_conf.get("max") is not None:
                     ok = ok and latest_fng <= fng_conf["max"]
                     parts.append(f"≤ {fng_conf['max']}")
+                if ok:
+                    _p = 1.0
+                elif fng_conf.get("min") is not None and latest_fng < fng_conf["min"]:
+                    _p = latest_fng / fng_conf["min"]
+                elif fng_conf.get("max") is not None and latest_fng > fng_conf["max"]:
+                    _p = max(0.0, 1.0 - (latest_fng - fng_conf["max"]) / (100 - fng_conf["max"]))
+                else:
+                    _p = 0.0
                 conditions.append({
                     "label": f"F&G ({', '.join(parts)})",
                     "current": f"F&G {latest_fng} ({latest_fng_date})",
-                    "pass": ok, "note": "",
+                    "pass": ok, "note": "", "progress": _p,
                 })
 
             # Drawdown from high
@@ -310,7 +347,7 @@ def load_stream_status():
                 conditions.append({
                     "label": f"Drawdown from {dfh_f.get('lookback_days', 90)}d high ≥ {min_drop}%",
                     "current": f"{dd:.1f}% from peak",
-                    "pass": ok, "note": "",
+                    "pass": ok, "note": "", "progress": min(abs(dd) / min_drop, 1.0),
                 })
 
             # Bollinger squeeze
@@ -322,7 +359,7 @@ def load_stream_status():
                 conditions.append({
                     "label": f"BB squeeze (bandwidth ≤ {max_bw}%)",
                     "current": f"BB bandwidth {bw:.1f}%",
-                    "pass": ok, "note": "",
+                    "pass": ok, "note": "", "progress": 1.0 if ok else (min(max_bw / bw, 0.95) if bw > 0 else 0.0),
                 })
 
             # ATR regime
@@ -335,7 +372,7 @@ def load_stream_status():
                     conditions.append({
                         "label": f"ATR regime (≤ {max_pct}% of avg)",
                         "current": f"ATR {ratio:.0f}% of avg",
-                        "pass": ok, "note": "",
+                        "pass": ok, "note": "", "progress": 1.0 if ok else (min(max_pct / ratio, 0.95) if ratio > 0 else 0.0),
                     })
 
             n_met = sum(1 for c in conditions if c["pass"])
@@ -539,12 +576,23 @@ else:
                 unsafe_allow_html=True,
             )
 
-        cdf = pd.DataFrame([
-            {"": "✓" if c["pass"] else "✗", "Condition": c["label"], "Current": c["current"], "Note": c["note"]}
-            for c in ss["conditions"]
-        ])
-        st.dataframe(cdf, use_container_width=True, hide_index=True,
-                     column_config={"": st.column_config.TextColumn(width="small")})
+        for c in ss["conditions"]:
+            pct = int(c.get("progress", 1.0 if c["pass"] else 0.0) * 100)
+            bar_color = "#4ade80" if c["pass"] else ("#fbbf24" if pct >= 66 else "#f87171")
+            icon = "✓" if c["pass"] else "✗"
+            note_part = f" <span style='color:#666; font-size:0.75rem'>— {c['note']}</span>" if c.get("note") else ""
+            st.markdown(
+                f"<div style='margin-bottom:12px'>"
+                f"<div style='display:flex; justify-content:space-between; align-items:baseline; margin-bottom:4px'>"
+                f"<span style='font-size:0.85rem'><span style='color:{bar_color}; font-weight:700'>{icon}</span>&nbsp;{c['label']}{note_part}</span>"
+                f"<span style='font-size:0.8rem; color:#aaa'>{c['current']}</span>"
+                f"</div>"
+                f"<div style='background:#2a2a2a; border-radius:4px; height:7px'>"
+                f"<div style='background:{bar_color}; width:{pct}%; height:7px; border-radius:4px'></div>"
+                f"</div>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
         st.divider()
 
 # ── Section 4: Executor Run Log ───────────────────────────────────────────────
