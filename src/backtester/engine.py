@@ -92,6 +92,7 @@ def _run_slot(df: pd.DataFrame, signals: pd.Series, params: dict, slot: int,
     position = params.get("position", {})
     trail_pct = position.get("trailing_stop_pct")
     trail_atr_mult = position.get("trailing_stop_atr_multiplier")
+    stop_loss_pct = position.get("stop_loss_pct")
     expiry = position.get("entry_expiry_candles", 2)
     min_hold = position.get("min_hold_candles") or 0
     max_hold = position.get("max_hold_candles")
@@ -127,11 +128,21 @@ def _run_slot(df: pd.DataFrame, signals: pd.Series, params: dict, slot: int,
         if open_trade:
             open_trade["highest_close"] = max(open_trade["highest_close"], row["close"])
             open_trade["candles_held"] += 1
+
+            # Trailing stop (from peak)
             if trail_atr_mult and "atr" in row.index and not pd.isna(row["atr"]):
-                stop_price = open_trade["highest_close"] - trail_atr_mult * row["atr"]
+                trail_stop = open_trade["highest_close"] - trail_atr_mult * row["atr"]
+            elif trail_pct:
+                trail_stop = open_trade["highest_close"] * (1 - trail_pct / 100.0)
             else:
-                pct = (trail_pct or 3.0) / 100.0
-                stop_price = open_trade["highest_close"] * (1 - pct)
+                trail_stop = None
+
+            # Hard stop loss (from entry — never moves)
+            hard_stop = open_trade["entry_price"] * (1 - stop_loss_pct / 100.0) if stop_loss_pct else None
+
+            # Use the more protective (higher) of the two active stops
+            candidates = [s for s in [trail_stop, hard_stop] if s is not None]
+            stop_price = max(candidates) if candidates else open_trade["highest_close"] * 0.97
 
             # partial exit
             if partial and not open_trade["partial_done"]:
@@ -164,7 +175,11 @@ def _run_slot(df: pd.DataFrame, signals: pd.Series, params: dict, slot: int,
                     exit_reason = "max_hold"
                 elif row["low"] <= stop_price:
                     exit_price = stop_price
-                    exit_reason = "trailing_stop"
+                    # distinguish which stop fired
+                    if hard_stop and stop_price <= hard_stop:
+                        exit_reason = "stop_loss"
+                    else:
+                        exit_reason = "trailing_stop"
 
                 if exit_price:
                     gain = (exit_price - open_trade["entry_price"]) / open_trade["entry_price"]

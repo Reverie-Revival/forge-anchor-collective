@@ -153,9 +153,12 @@ Controls how entries are made and exits are managed.
 
 | Attribute | Description |
 |---|---|
-| `trailing_stop_pct` | Trail stop N% below highest close since entry. Use this or ATR stop — not both. |
+| `stop_loss_pct` | Hard floor N% below entry price — never moves. Caps your maximum loss per trade regardless of what price does after. Independent of trailing stop. |
+| `trailing_stop_pct` | Trails N% below the highest close since entry — protects profits as price rises. Use this or ATR stop — not both. |
 | `trailing_stop_atr_multiplier` | Trail stop N × ATR below highest close — volatility-adaptive. Widens in volatile markets, tightens in calm ones. Use with `trailing_stop_atr_period` (default 14). |
 | `trailing_stop_atr_period` | ATR lookback period used when `trailing_stop_atr_multiplier` is set (default 14) |
+
+Both `stop_loss_pct` and `trailing_stop_pct` can be set simultaneously. The engine checks both every candle and exits at whichever triggers first (the higher price). Example: `stop_loss_pct: 3, trailing_stop_pct: 7` — you lose at most 3% from entry, but once profitable the trailing stop lets winners run and only exits if price reverses 7% from peak.
 | `entry_order_type` | `limit` only (per system constraint) |
 | `entry_expiry_candles` | Cancel unfilled entry after N candles |
 | `partial_exit` | Take X% off position at Y% gain, trail the rest — fully implemented, use freely |
@@ -292,6 +295,7 @@ The complete structure every stream's `parameters` column should conform to:
   "timeframe_confirmation": null,
   "time_filters": null,
   "position": {
+    "stop_loss_pct": null,
     "trailing_stop_pct": 3.0,
     "trailing_stop_atr_multiplier": null,
     "trailing_stop_atr_period": 14,

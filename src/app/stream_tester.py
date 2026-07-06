@@ -134,8 +134,12 @@ with st.expander("🔧 Parameter Reference"):
     st.markdown("---")
     st.markdown("#### Position / Exit")
     position_rows = [
-        ("**trailing_stop_pct**",    "% drop from peak since entry to trigger exit. Use this or ATR stop — not both.", "e.g. 7.5"),
-        ("**trailing_stop_atr_multiplier**", "ATR-adaptive stop: exit if price drops N × ATR below peak. "
+        ("**stop_loss_pct**",         "Hard floor N% below entry price — never moves. Caps your max loss per trade. "
+         "Can be set alongside `trailing_stop_pct`: the engine exits at whichever triggers first. "
+         "Example: stop_loss=3%, trail=7% → max loss is 3%, winners trail at 7% from peak.", "e.g. 3.0"),
+        ("**trailing_stop_pct**",    "% drop from peak since entry to trigger exit. Protects profits as price rises. "
+         "Use alone (acts as both loss cap and profit protection) or pair with `stop_loss_pct` for independent control.", "e.g. 7.5"),
+        ("**trailing_stop_atr_multiplier**", "ATR-adaptive trailing stop: exit if price drops N × ATR below peak. "
          "Widens in volatile markets, tightens in calm ones. "
          "Pair with `trailing_stop_atr_period` (default 14).", "e.g. 2.5"),
         ("**min_hold_candles**",     "Stop cannot fire before this many candles — lets the trade develop",
