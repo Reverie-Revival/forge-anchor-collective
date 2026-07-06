@@ -44,7 +44,7 @@ def get_engine():
 
 @st.cache_data(ttl=300)
 def load_timeframe_presets() -> list:
-    """Returns active presets as a list of dicts: {preset_id, name, start_date, end_date, description}."""
+    """Returns active presets as a list of dicts."""
     try:
         engine = get_engine()
         with engine.connect() as conn:
@@ -74,6 +74,64 @@ def save_timeframe_preset(name: str, start_date, end_date, description: str = ""
     return preset_id
 
 
+# ── Stream Identity + Configs ─────────────────────────────────────────────────
+
+@st.cache_data(ttl=60)
+def load_streams() -> list:
+    """Load all stream identities from backtest.streams."""
+    try:
+        engine = get_engine()
+        with engine.connect() as conn:
+            rows = pd.read_sql(text("""
+                SELECT stream_id, stream_name, strategy_type, description
+                FROM backtest.streams
+                ORDER BY stream_name
+            """), conn)
+        return rows.to_dict("records")
+    except Exception:
+        return []
+
+
+@st.cache_data(ttl=60)
+def load_stream_configs(stream_id: int = None) -> list:
+    """
+    Load stream configs, optionally filtered by stream_id.
+    Returns list of dicts with parsed params.
+    """
+    try:
+        engine = get_engine()
+        where  = "WHERE sc.stream_id = :sid" if stream_id is not None else ""
+        params = {"sid": stream_id} if stream_id is not None else {}
+        with engine.connect() as conn:
+            rows = pd.read_sql(text(f"""
+                SELECT sc.stream_config_id, sc.stream_id, s.stream_name,
+                       sc.version, sc.parameters, sc.slot_count, sc.slot_mode,
+                       sc.notes, sc.created_at
+                FROM backtest.stream_configs sc
+                JOIN backtest.streams s ON sc.stream_id = s.stream_id
+                {where}
+                ORDER BY sc.stream_id, sc.version
+            """), conn, params=params)
+        result = []
+        for _, row in rows.iterrows():
+            p = row["parameters"] if isinstance(row["parameters"], dict) \
+                else json.loads(row["parameters"])
+            result.append({
+                "stream_config_id": int(row["stream_config_id"]),
+                "stream_id":        int(row["stream_id"]),
+                "stream_name":      row["stream_name"],
+                "version":          row["version"],
+                "params":           p,
+                "slot_count":       int(row["slot_count"]),
+                "slot_mode":        str(row["slot_mode"]),
+                "notes":            row["notes"],
+                "created_at":       row["created_at"],
+            })
+        return result
+    except Exception:
+        return []
+
+
 # ── Stream Tests ─────────────────────────────────────────────────────────────
 
 def load_run_payload(test_id: int):
@@ -88,17 +146,20 @@ def load_run_payload(test_id: int):
 
 
 @st.cache_data(ttl=60)
-def load_stream_history() -> pd.DataFrame:
+def load_stream_history(stream_config_id: int = None) -> pd.DataFrame:
     """
-    Returns all saved stream tests with a computed timeframe_label column:
-    preset name if a preset was used, otherwise a formatted date range.
+    Returns saved stream tests. If stream_config_id given, filters to that config.
+    Includes a computed timeframe_label column.
     """
     try:
         engine = get_engine()
+        where  = "AND st.stream_config_id = :cid" if stream_config_id is not None else ""
+        params = {"cid": stream_config_id} if stream_config_id is not None else {}
         with engine.connect() as conn:
-            return pd.read_sql(text("""
+            return pd.read_sql(text(f"""
                 SELECT
-                    st.test_id, st.stream_name, st.stream_version,
+                    st.test_id, st.stream_config_id,
+                    st.stream_name, st.stream_version,
                     st.run_number, st.preset_id, st.custom_start, st.custom_end,
                     st.simulation_start, st.simulation_end,
                     st.slot_count, st.slot_mode,
@@ -114,32 +175,139 @@ def load_stream_history() -> pd.DataFrame:
                     ) AS timeframe_label
                 FROM backtest.stream_tests st
                 LEFT JOIN timeframe_presets tp ON st.preset_id = tp.preset_id
-                ORDER BY st.run_number ASC, st.saved_at ASC
-            """), conn)
+                WHERE 1=1 {where}
+                ORDER BY st.saved_at ASC
+            """), conn, params=params)
     except Exception:
         return pd.DataFrame()
 
 
-@st.cache_data(ttl=60)
-def load_locked_streams() -> dict:
-    try:
-        engine = get_engine()
-        with engine.connect() as conn:
-            rows = pd.read_sql(text("""
-                SELECT stream_name, stream_version, description, grade, notes
-                FROM backtest.streams
-            """), conn)
-        return {
-            f"{r['stream_name']} {r['stream_version']}": {
-                "description": r["description"],
-                "grade":       r["grade"],
-                "notes":       r["notes"],
-            }
-            for _, r in rows.iterrows()
-        }
-    except Exception:
-        return {}
+def save_stream_test(
+    stream_config_id: int,
+    params: dict,
+    result: dict,
+    metrics: dict,
+    initial_capital: float,
+    ending_balance: float,
+    payload: dict,
+    preset_id: int = None,
+    custom_start=None,
+    custom_end=None,
+    notes: str = "",
+) -> int:
+    """
+    Save (or replace) a stream test result.
+    Dedup key: (stream_config_id, preset_id) for preset runs,
+               (stream_config_id, custom_start, custom_end) for custom.
+    Returns test_id.
+    """
+    engine     = get_engine()
+    slot_count = payload.get("slot_count", 1)
+    slot_mode  = payload.get("slot_mode", "single")
 
+    with engine.connect() as conn:
+        # Look up stream_name + version for legacy columns
+        cfg = conn.execute(text("""
+            SELECT s.stream_name, sc.version
+            FROM backtest.stream_configs sc
+            JOIN backtest.streams s ON sc.stream_id = s.stream_id
+            WHERE sc.stream_config_id = :cid
+        """), {"cid": stream_config_id}).fetchone()
+        stream_nm = cfg[0] if cfg else "unknown"
+        version   = cfg[1] if cfg else "v1"
+
+        # Check for existing row (upsert)
+        if preset_id is not None:
+            existing = conn.execute(text("""
+                SELECT test_id FROM backtest.stream_tests
+                WHERE stream_config_id = :cid AND preset_id = :pid
+            """), {"cid": stream_config_id, "pid": preset_id}).fetchone()
+        else:
+            existing = conn.execute(text("""
+                SELECT test_id FROM backtest.stream_tests
+                WHERE stream_config_id = :cid
+                  AND custom_start = :cs
+                  AND custom_end IS NOT DISTINCT FROM :ce
+            """), {"cid": stream_config_id, "cs": custom_start, "ce": custom_end}).fetchone()
+
+        vals = {
+            "cid":    stream_config_id,
+            "sname":  stream_nm,
+            "sver":   version,
+            "rnum":   1,
+            "pid":    preset_id,
+            "cs":     custom_start,
+            "ce":     custom_end,
+            "ss":     result["start"],
+            "se":     result["end"],
+            "sc":     slot_count,
+            "sm":     slot_mode,
+            "params": json.dumps(params),
+            "ic":     initial_capital,
+            "eb":     ending_balance,
+            "tt":     metrics["total_trades"],
+            "wr":     metrics["win_rate"],
+            "tp":     metrics["total_pnl"],
+            "tr":     metrics["total_return_pct"],
+            "ar":     metrics["annualized_return_pct"],
+            "aw":     metrics["avg_winner_pct"],
+            "al":     metrics["avg_loser_pct"],
+            "pf":     metrics["profit_factor"],
+            "dd":     metrics["max_drawdown_pct"],
+            "ah":     metrics["avg_hold_candles"],
+            "notes":  notes,
+        }
+
+        if existing:
+            test_id = existing[0]
+            conn.execute(text("""
+                UPDATE backtest.stream_tests SET
+                    simulation_start = :ss, simulation_end = :se,
+                    slot_count = :sc, slot_mode = :sm,
+                    parameters = :params, initial_capital = :ic, ending_balance = :eb,
+                    total_trades = :tt, win_rate = :wr, total_pnl = :tp,
+                    total_return_pct = :tr, annualized_return_pct = :ar,
+                    avg_winner_pct = :aw, avg_loser_pct = :al,
+                    profit_factor = :pf, max_drawdown_pct = :dd,
+                    avg_hold_candles = :ah, notes = :notes, saved_at = NOW()
+                WHERE test_id = :tid
+            """), {**vals, "tid": test_id})
+        else:
+            row = conn.execute(text("""
+                INSERT INTO backtest.stream_tests (
+                    stream_config_id,
+                    stream_name, stream_version, run_number,
+                    preset_id, custom_start, custom_end,
+                    simulation_start, simulation_end,
+                    slot_count, slot_mode,
+                    parameters, initial_capital, ending_balance,
+                    total_trades, win_rate, total_pnl, total_return_pct,
+                    annualized_return_pct, avg_winner_pct, avg_loser_pct,
+                    profit_factor, max_drawdown_pct, avg_hold_candles, notes
+                ) VALUES (
+                    :cid,
+                    :sname, :sver, :rnum,
+                    :pid, :cs, :ce,
+                    :ss, :se,
+                    :sc, :sm,
+                    :params, :ic, :eb,
+                    :tt, :wr, :tp, :tr,
+                    :ar, :aw, :al,
+                    :pf, :dd, :ah, :notes
+                ) RETURNING test_id
+            """), vals)
+            test_id = row.scalar()
+
+        conn.commit()
+
+    pkl_path = RUNS_DIR / f"{test_id}.pkl"
+    with open(pkl_path, "wb") as f:
+        pickle.dump(payload, f)
+
+    return test_id
+
+
+# ── Pending run helpers (legacy — kept for backwards-compat) ─────────────────
 
 def load_pending_runs(run_rows: list) -> list:
     if not run_rows:
@@ -150,7 +318,6 @@ def load_pending_runs(run_rows: list) -> list:
         ph = params_hash(p)
     except Exception:
         return []
-
     saved_windows = {(str(r["simulation_start"])[:10], str(r["simulation_end"])[:10]) for r in run_rows}
     return _pending_for_hash(ph, exclude=saved_windows)
 
@@ -199,97 +366,6 @@ def next_run_number(stream_nm: str, params_h: str, history: pd.DataFrame) -> int
                 pass
     existing = stream_rows["run_number"].dropna() if (not stream_rows.empty and "run_number" in stream_rows.columns) else pd.Series(dtype=float)
     return int(existing.max()) + 1 if not existing.empty else 1
-
-
-def save_stream_test(
-    stream_name: str,
-    params: dict,
-    result: dict,
-    metrics: dict,
-    initial_capital: float,
-    ending_balance: float,
-    payload: dict,
-    preset_id: int = None,
-    custom_start=None,
-    custom_end=None,
-    notes: str = "",
-    history: pd.DataFrame = None,
-) -> tuple:
-    """
-    Save a stream test result to the database.
-    Exactly one of (preset_id) or (custom_start) must be provided.
-    custom_end may be None for open-ended custom windows.
-    """
-    engine    = get_engine()
-    parts     = stream_name.rsplit(" ", 1)
-    version   = parts[1] if len(parts) == 2 and parts[1].startswith("v") else "v1"
-    stream_nm = parts[0].strip()
-    p_hash    = params_hash(params)
-    hist      = history if history is not None else pd.DataFrame()
-    slot_count = payload.get("slot_count", 1)
-    slot_mode  = payload.get("slot_mode", "single")
-
-    run_num = next_run_number(stream_nm, p_hash, hist)
-
-    with engine.connect() as conn:
-        row = conn.execute(text("""
-            INSERT INTO backtest.stream_tests (
-                stream_name, stream_version, run_number,
-                preset_id, custom_start, custom_end,
-                simulation_start, simulation_end,
-                slot_count, slot_mode,
-                parameters, initial_capital, ending_balance,
-                total_trades, win_rate, total_pnl, total_return_pct,
-                annualized_return_pct, avg_winner_pct, avg_loser_pct,
-                profit_factor, max_drawdown_pct, avg_hold_candles, notes
-            ) VALUES (
-                :stream_name, :stream_version, :run_number,
-                :preset_id, :custom_start, :custom_end,
-                :simulation_start, :simulation_end,
-                :slot_count, :slot_mode,
-                :parameters, :initial_capital, :ending_balance,
-                :total_trades, :win_rate, :total_pnl, :total_return_pct,
-                :annualized_return_pct, :avg_winner_pct, :avg_loser_pct,
-                :profit_factor, :max_drawdown_pct, :avg_hold_candles, :notes
-            ) RETURNING test_id
-        """), {
-            "stream_name":           stream_nm,
-            "stream_version":        version,
-            "run_number":            run_num,
-            "preset_id":             preset_id,
-            "custom_start":          custom_start,
-            "custom_end":            custom_end,
-            "simulation_start":      result["start"],
-            "simulation_end":        result["end"],
-            "slot_count":            slot_count,
-            "slot_mode":             slot_mode,
-            "parameters":            json.dumps(params),
-            "initial_capital":       initial_capital,
-            "ending_balance":        ending_balance,
-            "total_trades":          metrics["total_trades"],
-            "win_rate":              metrics["win_rate"],
-            "total_pnl":             metrics["total_pnl"],
-            "total_return_pct":      metrics["total_return_pct"],
-            "annualized_return_pct": metrics["annualized_return_pct"],
-            "avg_winner_pct":        metrics["avg_winner_pct"],
-            "avg_loser_pct":         metrics["avg_loser_pct"],
-            "profit_factor":         metrics["profit_factor"],
-            "max_drawdown_pct":      metrics["max_drawdown_pct"],
-            "avg_hold_candles":      metrics["avg_hold_candles"],
-            "notes":                 notes,
-        })
-        test_id = row.scalar()
-        conn.commit()
-
-    pkl_path = RUNS_DIR / f"{test_id}.pkl"
-    with open(pkl_path, "wb") as f:
-        pickle.dump(payload, f)
-
-    pending = RUNS_DIR / f"pending_{p_hash}_{str(result['start'])[:10]}_{str(result['end'])[:10]}.pkl"
-    if pending.exists():
-        pending.unlink()
-
-    return test_id, run_num
 
 
 # ── Model Tester DB ops ──────────────────────────────────────────────────────
@@ -344,35 +420,73 @@ def load_model_history() -> pd.DataFrame:
 
 
 @st.cache_data(ttl=60)
-def load_locked_streams_full() -> list:
-    """Load locked stream configs with params, lot_size_usd, slot_count, slot_mode."""
+def load_model_composition(model_id: int) -> list:
+    """Load the stream configs that make up a model version."""
     try:
         engine = get_engine()
         with engine.connect() as conn:
             rows = pd.read_sql(text("""
-                SELECT stream_id, stream_name, stream_version, strategy_type,
-                       parameters, lot_size_usd, slot_count, slot_mode,
-                       grade, description, notes
-                FROM backtest.streams
-                ORDER BY stream_id
+                SELECT
+                    ms.id, ms.lot_size_usd,
+                    sc.stream_config_id, sc.version, sc.slot_count, sc.slot_mode,
+                    sc.parameters,
+                    s.stream_name, s.strategy_type
+                FROM backtest.model_streams ms
+                JOIN backtest.stream_configs sc ON ms.stream_config_id = sc.stream_config_id
+                JOIN backtest.streams s ON sc.stream_id = s.stream_id
+                WHERE ms.model_id = :mid
+                ORDER BY s.stream_name
+            """), conn, params={"mid": model_id})
+        result = []
+        for _, row in rows.iterrows():
+            p = row["parameters"] if isinstance(row["parameters"], dict) \
+                else json.loads(row["parameters"])
+            result.append({
+                "stream_name":      row["stream_name"],
+                "strategy_type":    row["strategy_type"],
+                "stream_config_id": int(row["stream_config_id"]),
+                "version":          row["version"],
+                "slot_count":       int(row["slot_count"]),
+                "slot_mode":        str(row["slot_mode"]),
+                "lot_size_usd":     float(row["lot_size_usd"]),
+                "params":           p,
+            })
+        return result
+    except Exception:
+        return []
+
+
+@st.cache_data(ttl=60)
+def load_locked_streams_full() -> list:
+    """Load locked stream configs with params — for model tester."""
+    try:
+        engine = get_engine()
+        with engine.connect() as conn:
+            rows = pd.read_sql(text("""
+                SELECT
+                    sc.stream_config_id, sc.stream_id, s.stream_name,
+                    sc.version AS stream_version, s.strategy_type,
+                    sc.parameters, sc.slot_count, sc.slot_mode, sc.notes
+                FROM backtest.stream_configs sc
+                JOIN backtest.streams s ON sc.stream_id = s.stream_id
+                ORDER BY s.stream_name, sc.version
             """), conn)
         result = []
         for _, row in rows.iterrows():
-            params = row["parameters"] if isinstance(row["parameters"], dict) \
-                     else json.loads(row["parameters"])
+            p = row["parameters"] if isinstance(row["parameters"], dict) \
+                else json.loads(row["parameters"])
             result.append({
-                "stream_id":      int(row["stream_id"]),
-                "stream_name":    row["stream_name"],
-                "stream_version": row["stream_version"],
-                "full_name":      f"{row['stream_name']} {row['stream_version']}",
-                "strategy_type":  row["strategy_type"],
-                "params":         params,
-                "lot_size_usd":   float(row["lot_size_usd"]),
-                "slot_count":     int(row["slot_count"]),
-                "slot_mode":      str(row["slot_mode"]),
-                "grade":          row["grade"],
-                "description":    row["description"],
-                "notes":          row["notes"],
+                "stream_config_id": int(row["stream_config_id"]),
+                "stream_id":        int(row["stream_id"]),
+                "stream_name":      row["stream_name"],
+                "stream_version":   row["stream_version"],
+                "full_name":        f"{row['stream_name']} {row['stream_version']}",
+                "strategy_type":    row["strategy_type"],
+                "params":           p,
+                "lot_size_usd":     10.0,
+                "slot_count":       int(row["slot_count"]),
+                "slot_mode":        str(row["slot_mode"]),
+                "notes":            row["notes"],
             })
         return result
     except Exception:
@@ -419,7 +533,6 @@ def _pending_model_for_hash(ah: str, exclude: set = None) -> list:
 
 
 def next_model_run_number(model_id: int, alloc_h: str) -> int:
-    """Query DB fresh — never rely on a passed DataFrame to avoid stale-history bugs."""
     engine = get_engine()
     with engine.connect() as conn:
         rows = conn.execute(text("""
@@ -447,19 +560,15 @@ def save_model_test(
     custom_start=None,
     custom_end=None,
     notes: str = "",
-    history: pd.DataFrame = None,  # kept for backwards-compat, ignored
+    history: pd.DataFrame = None,
 ) -> tuple:
-    """
-    Save a model test result to the database.
-    Exactly one of (preset_id) or (custom_start) must be provided.
-    """
     engine   = get_engine()
     cm       = payload["combined_metrics"]
     alloc    = payload["allocations"]
     ah       = _alloc_hash(alloc)
     model_id = payload.get("model_id", 1)
 
-    run_num = next_model_run_number(model_id, ah)
+    run_num       = next_model_run_number(model_id, ah)
     configuration = json.dumps({"allocations": alloc})
 
     with engine.connect() as conn:

@@ -11,23 +11,13 @@ from src.app.utils import (
     _compact_config, _human_readable_description,
 )
 from src.app.db import (
-    LAST_RUN_PATH, RUNS_DIR,
-    load_stream_history, load_locked_streams,
-    load_pending_runs, load_latest_run,
-    next_run_number, load_run_payload, _pending_for_hash,
+    RUNS_DIR,
+    load_streams, load_stream_configs, load_stream_history, load_timeframe_presets,
+    load_run_payload, save_stream_test,
 )
 from src.app.dashboard import render_dashboard
-
-KNOWN_STREAMS = [
-    "Breakout Scout v1",
-    "Breakout Scout v2",
-    "Dip Hunter v1",
-    "Dip Hunter v2",
-    "Momentum Rider v1",
-    "Momentum Rider v2",
-    "Steady Climber v1",
-    "Surge Rider v1",
-]
+from src.backtester.engine import run_backtest
+from src.backtester.metrics import compute_metrics
 
 st.title("⚓ Forge Anchor — Stream Tester")
 
@@ -58,8 +48,9 @@ GLOSSARY = {
         "Total $ won ÷ total $ lost. Above 1.0 = profitable overall. 1.5 means $1.50 earned "
         "for every $1 lost, regardless of win rate.",
     "Slot":
-        "Each stream can run in 1–2 slots with stream-specific behavior. "
-        "'single' = one position at a time. 'scale_down' = slot 2 adds if price drops further (DH). "
+        "Each stream can run in 1–3 slots. 'single' = one position at a time. "
+        "'staggered' = independent slots consume signals round-robin (longest-free first). "
+        "'scale_down' = slot 2 adds if price drops further (DH). "
         "'scale_up' = slot 2 adds to a winning position when trend confirms (MR).",
 }
 
@@ -153,6 +144,35 @@ with st.expander("🔧 Parameter Reference"):
         c1.markdown(name); c2.markdown(desc); c3.markdown(default)
 
     st.markdown("---")
+    st.markdown("#### Slot Position")
+    st.caption(
+        "Controls how capital is deployed across multiple independent slots within a stream. "
+        "Each slot maintains its own position, capital, and trailing stop independently. "
+        "Slot config lives under a `slots` key in the stream's parameters."
+    )
+    slot_rows = [
+        ("**slot_count**",              "Number of independent slots (1–3)",
+         "all modes", "1"),
+        ("**slot_mode**",               "How slots interact: `single` · `staggered` · `scale_down` · `scale_up`",
+         "all modes", "single"),
+        ("**slot_entry_gap_candles**",  "Minimum candles between any two slot entries — prevents rapid stacking",
+         "staggered", "0"),
+        ("**slot2_trigger_pct**",       "Price must move this % from slot 1's entry before slot 2 fires",
+         "scale_up / scale_down", "—"),
+        ("**slot_capital_weight**",     "Capital split across slots, e.g. `[70, 30]` — sums to 100. "
+         "Default is equal split.",
+         "multi-slot", "equal split"),
+    ]
+    c1, c2, c3, c4 = st.columns([1.8, 2.8, 1.2, 1.0])
+    c1.markdown("**Parameter**"); c2.markdown("**What it does**")
+    c3.markdown("**Applies to**"); c4.markdown("**Default**")
+    st.divider()
+    for name, desc, applies, default in slot_rows:
+        c1, c2, c3, c4 = st.columns([1.8, 2.8, 1.2, 1.0])
+        c1.markdown(name); c2.markdown(desc)
+        c3.markdown(applies); c4.markdown(default)
+
+    st.markdown("---")
     st.markdown("#### Timeframe")
     st.markdown(
         "**primary_timeframe** — candle size for signal evaluation. "
@@ -161,256 +181,266 @@ with st.expander("🔧 Parameter Reference"):
         "Coarser timeframes fire less often but with much less noise."
     )
 
-# ── Load data ─────────────────────────────────────────────────────────────────
 
-history        = load_stream_history()
-locked_streams = load_locked_streams()
+# ── Load streams + configs ────────────────────────────────────────────────────
 
-run_groups = {}
-if not history.empty:
-    for _, row in history.iterrows():
-        skey = f"{row['stream_name']} {row['stream_version']}"
-        rnum = int(row["run_number"]) if pd.notna(row.get("run_number")) else 0
-        run_groups.setdefault(skey, {}).setdefault(rnum, []).append(row)
+all_streams = load_streams()
+presets     = load_timeframe_presets()
 
-all_streams = list(dict.fromkeys(
-    KNOWN_STREAMS + sorted(s for s in run_groups if s not in KNOWN_STREAMS)
-))
+if not all_streams:
+    st.info("No streams in the database yet.")
+    st.stop()
+
+stream_names = [s["stream_name"] for s in all_streams]
+stream_by_name = {s["stream_name"]: s for s in all_streams}
+
 
 # ── Sidebar ────────────────────────────────────────────────────────────────────
 
 with st.sidebar:
     st.header("Stream Tester")
-    st.caption("Triggered from Claude Code · Save to record here")
 
     st.markdown('<p class="config-group-header">Stream</p>', unsafe_allow_html=True)
-    if not all_streams:
-        st.info("No streams yet.")
+    selected_stream_name = st.selectbox("", stream_names, label_visibility="collapsed")
+
+    selected_stream = stream_by_name[selected_stream_name]
+    stream_id       = selected_stream["stream_id"]
+    configs         = load_stream_configs(stream_id)
+
+    if not configs:
+        st.info("No configs for this stream yet.")
         st.stop()
 
-    selected_stream = st.selectbox("", all_streams, label_visibility="collapsed")
-    stream_runs     = run_groups.get(selected_stream, {})
-
-    st.markdown('<p class="config-group-header" style="margin-top:14px;">Test Run</p>',
+    st.markdown('<p class="config-group-header" style="margin-top:14px;">Config Version</p>',
                 unsafe_allow_html=True)
 
-    run_options = []
-    run_labels  = {}
+    # Build config options: show version + best annualized return across all presets
+    def _config_label(cfg: dict) -> str:
+        history = load_stream_history(cfg["stream_config_id"])
+        if not history.empty and history["annualized_return_pct"].notna().any():
+            best = history["annualized_return_pct"].dropna().max()
+            n    = len(history)
+            return f"{cfg['version']}  ·  {best:+.1f}% best  ·  {n} run{'s' if n != 1 else ''}"
+        return cfg["version"]
 
-    for rnum in sorted(stream_runs.keys()):
-        rows = stream_runs[rnum]
-        best = max(
-            (r["annualized_return_pct"] for r in rows if pd.notna(r["annualized_return_pct"])),
-            default=None,
-        )
-        lbl = f"#{rnum}"
-        if best is not None:
-            lbl += f"  ·  {best:+.1f}%"
-        if len(rows) > 1:
-            lbl += f"  ·  {len(rows)} windows"
-        run_options.append(rnum)
-        run_labels[rnum] = lbl
+    config_options = [c["stream_config_id"] for c in configs]
+    config_labels  = {c["stream_config_id"]: _config_label(c) for c in configs}
 
-    latest_run_preview = load_latest_run(selected_stream)
-    latest_is_new      = False
-    latest_matches_run = None
+    selected_config_id = st.selectbox(
+        "", config_options,
+        index=len(config_options) - 1,
+        format_func=lambda x: config_labels.get(x, str(x)),
+        label_visibility="collapsed",
+    )
 
-    if latest_run_preview:
-        lr_ph = params_hash(latest_run_preview["params"])
-
-        for rnum, rrows in stream_runs.items():
-            for row in rrows:
-                try:
-                    p = row["parameters"] if isinstance(row["parameters"], dict) \
-                        else json.loads(row["parameters"])
-                    if params_hash(p) == lr_ph:
-                        latest_matches_run = rnum
-                        break
-                except Exception:
-                    pass
-            if latest_matches_run is not None:
-                break
-
-        if latest_matches_run is None:
-            latest_is_new  = True
-            stream_nm_only = selected_stream.rsplit(" ", 1)[0]
-            new_run_num    = next_run_number(stream_nm_only, lr_ph, history)
-            run_options.append("__new__")
-            run_labels["__new__"] = f"⏳ Run #{new_run_num} — unsaved"
-
-    if not run_options or run_options == ["__new__"]:
-        if not latest_is_new:
-            st.caption("No saved runs for this stream yet.")
-        selected_run = "__new__" if latest_is_new else None
-    else:
-        if latest_matches_run is not None and latest_matches_run in run_options:
-            default_idx = run_options.index(latest_matches_run)
-        else:
-            default_idx = len(run_options) - 1
-        selected_run = st.selectbox(
-            "", run_options,
-            index=default_idx,
-            format_func=lambda x: run_labels.get(x, str(x)),
-            label_visibility="collapsed",
-        )
+    selected_config = next(c for c in configs if c["stream_config_id"] == selected_config_id)
 
     # Config details panel
-    if selected_run and selected_run != "__new__" and selected_run in stream_runs:
-        st.divider()
-        rows = stream_runs[selected_run]
-        try:
-            p       = rows[0]["parameters"] if isinstance(rows[0]["parameters"], dict) \
-                      else json.loads(rows[0]["parameters"])
-            compact = _compact_config(p)
-        except Exception:
-            p, compact = {}, "—"
+    st.divider()
+    st.markdown(f"**{selected_stream_name} {selected_config['version']}**")
 
-        stream_key  = f"{rows[0]['stream_name']} {rows[0]['stream_version']}"
-        locked_info = locked_streams.get(stream_key, {})
-        description = locked_info.get("description")
-        locked_grade = locked_info.get("grade")
+    params_dict = selected_config["params"]
+    description = _human_readable_description(params_dict)
+    st.markdown(f"*{description}*")
 
-        st.markdown(f"**{rows[0]['stream_name']} {rows[0]['stream_version']}**")
+    with st.expander("Signal details"):
+        st.caption(_compact_config(params_dict))
 
-        if locked_grade is not None:
-            grade_labels = {5: "Grade 5 · Elite", 4: "Grade 4 · Strong",
-                            3: "Grade 3 · Passing", 2: "Grade 2 · Weak", 1: "Grade 1 · Poor"}
-            grade_colors = {5: "#00d4aa", 4: "#4ade80", 3: "#facc15",
-                            2: "#fb923c",  1: "#f87171"}
-            gl = grade_labels.get(locked_grade, "—")
-            gc = grade_colors.get(locked_grade, "#555")
-            st.markdown(
-                f'<span class="grade-badge" style="background:{gc}22;color:{gc};'
-                f'border:1px solid {gc}66;font-size:0.75rem;padding:3px 10px;">'
-                f'🔒 Locked · {gl}</span>',
-                unsafe_allow_html=True,
-            )
+    slot_count = selected_config["slot_count"]
+    slot_mode  = selected_config["slot_mode"]
+    slot_info  = f"{slot_count} slot{'s' if slot_count > 1 else ''} · {slot_mode}"
+    if slot_count > 1:
+        weights = params_dict.get("slots", {}).get("slot_capital_weight")
+        if weights:
+            slot_info += f" · [{', '.join(str(w) for w in weights)}]%"
+    st.caption(f"⚙ {slot_info}")
+    st.divider()
 
-        st.markdown(description if description else f"*{_human_readable_description(p)}*")
+    # Per-preset result badges
+    history = load_stream_history(selected_config_id)
+    preset_map = {p["preset_id"]: p["name"] for p in presets}
 
-        with st.expander("Signal details"):
-            st.caption(compact)
+    saved_preset_ids = set()
+    if not history.empty and "preset_id" in history.columns:
+        saved_preset_ids = set(history["preset_id"].dropna().astype(int).tolist())
 
-        st.divider()
-
-        for row in rows:
-            win = row.get("timeframe_label") or label_window(
-                row.get("simulation_start") or row.get("custom_start"),
-                row.get("simulation_end") or row.get("custom_end"),
-            )
+    for p in presets:
+        pid = p["preset_id"]
+        if pid in saved_preset_ids:
+            row = history[history["preset_id"] == pid].iloc[0]
             ann = row["annualized_return_pct"]
-            pf  = row["profit_factor"]
             _, gl, gc = grade_info(ann if pd.notna(ann) else None)
             st.markdown(
                 f'<span class="grade-badge" style="background:{gc}20;color:{gc};'
-                f'border:1px solid {gc}55;font-size:0.75rem;padding:3px 10px;">'
-                f'{win}  ·  {ann:+.1f}%</span>' if pd.notna(ann) else
+                f'border:1px solid {gc}55;font-size:0.73rem;padding:2px 8px;">'
+                f'✓ {p["name"]}  ·  {ann:+.1f}%</span>' if pd.notna(ann) else
                 f'<span class="grade-badge" style="background:#33333380;color:#aaa;'
-                f'border:1px solid #55555555;font-size:0.75rem;padding:3px 10px;">'
-                f'{win}</span>',
+                f'border:1px solid #55555555;font-size:0.73rem;padding:2px 8px;">'
+                f'✓ {p["name"]}</span>',
                 unsafe_allow_html=True,
             )
-            if pd.notna(pf):
-                st.caption(
-                    f"PF {pf:.2f}  ·  DD {row['max_drawdown_pct']:.1f}%  ·  "
-                    f"WR {row['win_rate']*100:.0f}%  ·  {row['total_trades']} trades"
-                )
-            if row.get("notes"):
-                st.caption(f"💬 {row['notes']}")
+        else:
+            st.markdown(
+                f'<span class="grade-badge" style="background:#22222280;color:#666;'
+                f'border:1px solid #44444455;font-size:0.73rem;padding:2px 8px;">'
+                f'○ {p["name"]}</span>',
+                unsafe_allow_html=True,
+            )
+
+    st.divider()
+
+    run_all = st.button("▶ Run All Presets", use_container_width=True, type="primary")
+
+
+# ── Run All Presets ──────────────────────────────────────────────────────────
+
+def _run_and_save(cfg: dict, preset: dict, initial_capital: float = 20.0) -> dict:
+    """Run one backtest for a stream config + preset and save it. Returns the payload."""
+    p = cfg["params"]
+    result = run_backtest(
+        params     = p,
+        start      = str(preset["start_date"]),
+        end        = str(preset["end_date"]) if preset.get("end_date") else None,
+        slot_count = cfg["slot_count"],
+        slot_mode  = cfg["slot_mode"],
+        stream_name= cfg["stream_name"],
+        lot_size_usd = initial_capital,
+    )
+    metrics = compute_metrics(result["trades"], initial_capital, result["start"], result["end"])
+    ending  = initial_capital + (metrics["total_pnl"] or 0)
+    payload = {**result, "initial_capital": initial_capital,
+               "stream_config_id": cfg["stream_config_id"]}
+    save_stream_test(
+        stream_config_id = cfg["stream_config_id"],
+        params           = p,
+        result           = result,
+        metrics          = metrics,
+        initial_capital  = initial_capital,
+        ending_balance   = ending,
+        payload          = payload,
+        preset_id        = preset["preset_id"],
+    )
+    return payload
+
+
+if run_all:
+    missing = [p for p in presets if p["preset_id"] not in saved_preset_ids]
+    if not missing:
+        st.success("All presets already saved for this config.")
+    else:
+        progress = st.progress(0, text=f"Running {len(missing)} preset(s)…")
+        for i, preset in enumerate(missing):
+            progress.progress(i / len(missing), text=f"Running {preset['name']}…")
+            try:
+                _run_and_save(selected_config, preset)
+            except Exception as e:
+                st.error(f"Failed on {preset['name']}: {e}")
+        progress.progress(1.0, text="Done.")
+        st.cache_data.clear()
+        st.rerun()
 
 
 # ── Main area ─────────────────────────────────────────────────────────────────
 
-def _render_pending_tabs(pending: list):
-    """Render a list of pending runs as labelled tabs with save buttons."""
-    tab_labels = [f"⏳ {label_window(pr['start'], pr['end'])}" for pr in pending]
-    tabs = st.tabs(tab_labels)
-    for tab, pr in zip(tabs, pending):
-        with tab:
-            render_dashboard(pr["payload"], show_save=True,
-                             key_prefix=f"new_{pr['start']}_{pr['end']}")
+# Build tab list: presets first, then any custom runs from DB
+custom_rows = []
+if not history.empty:
+    custom_rows = history[history["preset_id"].isna()].to_dict("records")
 
+tab_entries = []
+for p in presets:
+    pid = p["preset_id"]
+    existing = None
+    if not history.empty and pid in saved_preset_ids:
+        match = history[history["preset_id"] == pid]
+        if not match.empty:
+            existing = match.iloc[0].to_dict()
+    tab_entries.append({
+        "label":    p["name"],
+        "preset":   p,
+        "existing": existing,
+        "type":     "preset",
+    })
 
-if selected_run == "__new__" and latest_run_preview:
-    lr_ph   = params_hash(latest_run_preview["params"])
-    pending = _pending_for_hash(lr_ph)
-    if pending:
-        _render_pending_tabs(pending)
-    else:
-        render_dashboard(latest_run_preview, show_save=True, key_prefix="new_run")
+for row in custom_rows:
+    lbl = label_window(
+        row.get("simulation_start") or row.get("custom_start"),
+        row.get("simulation_end")   or row.get("custom_end"),
+    )
+    tab_entries.append({
+        "label":    f"⊕ {lbl}",
+        "existing": row,
+        "type":     "custom",
+    })
 
-elif selected_run is not None and selected_run in stream_runs:
-    saved_rows   = stream_runs[selected_run]
-    pending_runs = load_pending_runs(saved_rows)
+if not tab_entries:
+    st.info("No presets configured. Add presets in the database to run tests.")
+    st.stop()
 
-    saved_entries = []
-    for row in saved_rows:
-        lbl = row.get("timeframe_label") or label_window(
-            row.get("simulation_start") or row.get("custom_start"),
-            row.get("simulation_end") or row.get("custom_end"),
-        )
-        saved_entries.append({"label": lbl, "type": "saved", "data": row})
-    saved_entries.sort(key=lambda e: e["label"])
+tabs = st.tabs([e["label"] for e in tab_entries])
 
-    tab_entries = saved_entries
-    for pr in pending_runs:
-        lbl = label_window(pr["start"], pr["end"])
-        tab_entries.append({"label": f"⏳ {lbl}", "type": "pending", "data": pr})
+for tab, entry in zip(tabs, tab_entries):
+    with tab:
+        existing = entry.get("existing")
 
-    # Deduplicate labels
-    seen = {}
-    for entry in tab_entries:
-        lbl = entry["label"]
-        seen[lbl] = seen.get(lbl, 0) + 1
-        if seen[lbl] > 1:
-            entry["label"] = f"{lbl} ({seen[lbl]})"
+        if existing is not None:
+            test_id = int(existing["test_id"])
+            payload = load_run_payload(test_id)
 
-    tabs = st.tabs([e["label"] for e in tab_entries])
-
-    for tab, entry in zip(tabs, tab_entries):
-        with tab:
-            if entry["type"] == "saved":
-                row     = entry["data"]
-                test_id = int(row["test_id"])
-                payload = load_run_payload(test_id)
-                if payload is not None:
-                    render_dashboard(payload, show_save=False, key_prefix=f"run_{test_id}")
-                else:
-                    # No pkl — show DB summary only
-                    ann = row["annualized_return_pct"]
-                    pf  = row["profit_factor"]
-                    dd  = row["max_drawdown_pct"]
-                    wr  = row["win_rate"]
-                    _, gl, gc = grade_info(ann if pd.notna(ann) else None)
-                    st.markdown(
-                        f'<span class="grade-badge" style="background:{gc}22;color:{gc};'
-                        f'border:1px solid {gc}66;font-size:1rem;">{gl}</span>',
-                        unsafe_allow_html=True,
-                    )
-                    sim_s = str(row.get("simulation_start") or "")[:10]
-                    sim_e = str(row.get("simulation_end") or "")[:10]
-                    st.caption(
-                        f"{row['stream_name']} {row['stream_version']}  ·  {sim_s} → {sim_e}"
-                    )
-                    st.divider()
-                    c1, c2, c3, c4 = st.columns(4)
-                    c1.metric("Annualized Return", f"{ann:+.1f}%" if pd.notna(ann) else "—")
-                    c2.metric("Profit Factor",     f"{pf:.2f}"    if pd.notna(pf)  else "—")
-                    c3.metric("Max Drawdown",      f"{dd:.1f}%"   if pd.notna(dd)  else "—")
-                    c4.metric("Win Rate",          f"{wr*100:.0f}%" if pd.notna(wr) else "—")
-                    st.info("Re-run from Claude Code to restore full charts.")
-                    if row.get("notes"):
-                        st.caption(f"💬 {row['notes']}")
+            if payload is not None:
+                render_dashboard(payload, show_save=False,
+                                 key_prefix=f"cfg_{selected_config_id}_t{test_id}")
             else:
-                pr = entry["data"]
-                render_dashboard(pr["payload"], show_save=True,
-                                 key_prefix=f"pending_{pr['start']}_{pr['end']}")
+                # No pkl — show DB summary
+                ann = existing.get("annualized_return_pct")
+                pf  = existing.get("profit_factor")
+                dd  = existing.get("max_drawdown_pct")
+                wr  = existing.get("win_rate")
+                _, gl, gc = grade_info(ann if pd.notna(ann) else None)
+                st.markdown(
+                    f'<span class="grade-badge" style="background:{gc}22;color:{gc};'
+                    f'border:1px solid {gc}66;font-size:1rem;">{gl}</span>',
+                    unsafe_allow_html=True,
+                )
+                sim_s = str(existing.get("simulation_start") or "")[:10]
+                sim_e = str(existing.get("simulation_end")   or "")[:10]
+                st.caption(
+                    f"{selected_stream_name} {selected_config['version']}  ·  {sim_s} → {sim_e}"
+                )
+                st.divider()
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Annualized Return", f"{ann:+.1f}%" if pd.notna(ann) else "—")
+                c2.metric("Profit Factor",     f"{pf:.2f}"    if pd.notna(pf)  else "—")
+                c3.metric("Max Drawdown",      f"{dd:.1f}%"   if pd.notna(dd)  else "—")
+                c4.metric("Win Rate",          f"{wr*100:.0f}%" if pd.notna(wr) else "—")
 
-else:
-    latest_run = load_latest_run(selected_stream)
-    if latest_run:
-        tabs = st.tabs(["⏳ Latest Run"])
-        with tabs[0]:
-            render_dashboard(latest_run, show_save=True, key_prefix="latest_run_new")
-    else:
-        st.info("No runs yet for this stream. Trigger one from Claude Code.")
+                # Re-run button for missing pkl
+                if entry["type"] == "preset" and st.button(
+                    "↺ Re-run to restore charts", key=f"rerun_{test_id}"
+                ):
+                    with st.spinner("Running…"):
+                        try:
+                            payload = _run_and_save(selected_config, entry["preset"])
+                            st.cache_data.clear()
+                            st.rerun()
+                        except Exception as e:
+                            st.error(str(e))
+
+        else:
+            # Not run yet
+            st.markdown(
+                '<div style="color:#666; font-size:0.9rem; padding:24px 0">'
+                'This preset has not been run yet for this config.'
+                '</div>',
+                unsafe_allow_html=True,
+            )
+            if entry["type"] == "preset" and st.button(
+                f"▶ Run {entry['preset']['name']}", key=f"run_{entry['preset']['preset_id']}"
+            ):
+                with st.spinner(f"Running {entry['preset']['name']}…"):
+                    try:
+                        _run_and_save(selected_config, entry["preset"])
+                        st.cache_data.clear()
+                        st.rerun()
+                    except Exception as e:
+                        st.error(str(e))
