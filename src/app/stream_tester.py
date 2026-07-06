@@ -305,7 +305,9 @@ with st.sidebar:
 
     st.divider()
 
-    run_all = st.button("▶ Run All Presets", use_container_width=True, type="primary")
+    col_run, col_rerun = st.columns(2)
+    run_all    = col_run.button("▶ Run All Presets",    use_container_width=True, type="primary")
+    rerun_all  = col_rerun.button("↺ Re-run All Presets", use_container_width=True)
 
 
 # ── Run All Presets ──────────────────────────────────────────────────────────
@@ -354,14 +356,14 @@ def _run_and_save(cfg: dict, preset: dict, initial_capital: float = 20.0) -> dic
     return payload
 
 
-if run_all:
-    missing = [p for p in presets if p["preset_id"] not in saved_preset_ids]
-    if not missing:
-        st.success("All presets already saved for this config.")
+if run_all or rerun_all:
+    to_run = presets if rerun_all else [p for p in presets if p["preset_id"] not in saved_preset_ids]
+    if not to_run:
+        st.success("All presets already saved. Use ↺ Re-run All to refresh.")
     else:
-        progress = st.progress(0, text=f"Running {len(missing)} preset(s)…")
-        for i, preset in enumerate(missing):
-            progress.progress(i / len(missing), text=f"Running {preset['name']}…")
+        progress = st.progress(0, text=f"Running {len(to_run)} preset(s)…")
+        for i, preset in enumerate(to_run):
+            progress.progress(i / len(to_run), text=f"Running {preset['name']}…")
             try:
                 _run_and_save(selected_config, preset)
             except Exception as e:
