@@ -2,6 +2,8 @@
 
 How backtest, paper test, and live data are unified for comparison.
 
+> **Current status:** Only `reporting.all_lots` is built. The additional views below (`model_performance`, `stream_performance`, `benchmark_comparison`) are designed but not yet created — they'll be added once there's enough live trade data to make them useful.
+
 ---
 
 ## Design Principle
@@ -10,11 +12,10 @@ The analytics layer never queries `backtest` or `live` schemas directly. Everyth
 
 - Comparison queries are simple — no schema-switching logic in application code
 - Adding a new environment in the future doesn't break existing queries
-- DBeaver dashboards always have one place to look
 
 ---
 
-## Core Views
+## Built Views
 
 ### reporting.all_lots
 
@@ -66,6 +67,8 @@ FROM live.lots ll
 ```
 
 ---
+
+## Planned Views (not yet built)
 
 ### reporting.model_performance
 

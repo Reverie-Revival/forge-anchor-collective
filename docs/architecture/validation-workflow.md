@@ -1,82 +1,66 @@
 # Model Validation Workflow
 
-How a model moves from idea to live deployment. Every model goes through the same cycle.
+How a stream moves from idea to locked, and how a model moves from locked streams to live deployment.
 
 ---
 
 ## The Full Cycle
 
 ```
-1. DESIGN        — choose 5 streams, set initial parameters
-2. EXPERIMENT    — run many historical backtests, tune aggressively
-3. PAPER TEST    — run multiple paper tests in parallel, prove against live data
-4. SELECT        — pick the best paper test configuration
-5. DEPLOY        — $100 live on Kraken
-6. REPEAT        — while current model runs live, begin next model's design phase
+1. STREAM DESIGN   — design stream signal, parameters, regime complement
+2. STREAM TUNING   — backtest across presets, iterate, lock a stream_config version
+3. MODEL ASSEMBLY  — combine locked stream configs, set allocations, run model-level backtest
+4. DEPLOY          — $100 live on Kraken; backtest confidence is the gate
+5. REPEAT          — while current model runs live, begin next model's stream design phase
 ```
+
+No mandatory paper trading phase. $100 live capital is low enough that live deployment IS the real-world test. See ADR 005 for the reasoning.
 
 ---
 
-## Phase 1 — Experimental Historical Backtests
+## Phase 1 — Stream Design and Tuning
 
-**Purpose:** Find the best stream combinations and parameter settings for the model.
+**Purpose:** Find the best signal configuration for each stream in isolation.
 
-- Run as many times as needed against stored historical data
-- Fast — months of simulation in seconds
-- Try different stream configurations, trailing stop percentages, entry thresholds
-- Compare results across runs to find what performs best across diverse market conditions
-  (bull runs, bear markets, sideways chop — the model must hold up across all of them)
-- No limit on number of runs — this is pure exploration
-- All runs logged in `backtest.model_tests` with `run_type = 'historical'`
+- Each stream is tuned one at a time — finish one before starting the next
+- Run presets via the Stream Tester app (Stream Tester → select stream → select config version → Run All Presets)
+- Results auto-save to `backtest.stream_tests` on `(stream_config_id, preset_id)` — re-running replaces, no duplicates
+- Test across all standard presets: Primary v2, Full History, Recent, 2026 YTD
+- Iterate parameters by creating new config versions in `backtest.stream_configs`
+- When a config version's signal is solid across all presets, lock it: the `stream_config_id` becomes the reference for model assembly
 
-**Output:** A set of promising stream configurations worth promoting to paper testing.
+**Key constraint:** Tune the signal, not the allocation. `lot_size_usd` is ignored during stream tuning — it gets set at model assembly.
+
+**Output:** A locked `stream_config_id` for each stream, with validated results across all presets.
 
 ---
 
-## Phase 2 — Paper Tests (Multiple, Concurrent)
+## Phase 2 — Model Assembly
 
-**Purpose:** Prove the top configurations against live market data before committing real money.
+**Purpose:** Prove the full configuration — all streams running simultaneously with capital allocation set.
 
-- Each promising configuration from Phase 1 gets its own paper test
-- Multiple paper tests run simultaneously for the same model — no limit
-- No real orders placed — Kraken live feed is used for prices only
-- All logged in `backtest.model_tests` with `run_type = 'paper'`
+1. Create a model record in `backtest.models`
+2. Populate `backtest.model_streams` with the locked stream configs and final `lot_size_usd` per stream
+3. Run model-level backtest via the Model Tester app — all streams fire against the same historical data concurrently
+4. Evaluate results across all presets: Primary v2 is the primary gate, others confirm robustness
 
-### Configurable Simulation Start Date
-Every paper test has a `simulation_start` date — set independently of when you actually kick it off.
+**Deployment gate:**
+- Primary v2 annualized return beats S&P 500 (~10%) across diverse market conditions
+- No single window is deeply negative
+- Max drawdown is acceptable (historically ≤ 20% for Model 1)
 
-**Why this matters:** If Paper Test 1 starts in January and Paper Test 2 starts in March, both can be set to the same `simulation_start` date so their results are directly comparable. The system fast-replays historical data from `simulation_start` to today, then transitions to real-time.
-
-```
-[simulation_start] → → → → [went_live_at] → → → → [now, running]
-     ↑                            ↑
-historical replay (fast)    real-time begins (real clock speed)
-```
-
-### Paper Tests Run in Perpetuity
-Paper tests are never cancelled when a better configuration is found. All run until a deployment decision is made. `selected_for_deployment = TRUE` marks the winner — all others continue as reference data.
-
-**Setting a new paper test off:**
-1. Experimental backtests identify a promising new configuration
-2. New paper test started with the same `simulation_start` as existing tests
-3. It fast-replays history, catches up, then runs forward alongside existing tests
-4. Now you have N+1 paper tests running in parallel
+**Output:** A `model_test_id` with validated results — this is the record that authorized the deployment.
 
 ---
 
 ## Phase 3 — Deploy Decision
 
-**Gate:** Backtest confidence + paper test performance. No calendar requirement.
-
-**Questions to answer before deploying:**
-- Does the selected paper test beat Model N-1's live results over the same period?
-- Does it hold up across the paper test's forward (real-time) period?
-- Do experimental backtests across diverse market conditions support the configuration?
+**Gate:** Backtest confidence. No calendar requirement. No paper testing required.
 
 When ready:
-1. Mark the winning paper test as `selected_for_deployment = TRUE`
-2. Deploy $100 live on Kraken as Model N
-3. `live.models.based_on_model_test_id` links back to the winning paper test
+1. Set `backtest.models.status = 'deployed'`
+2. Deploy $100 live on Kraken — insert rows into `live.models`, `live.streams`
+3. Executor begins running on cron schedule (GitHub Actions + Supabase)
 
 ---
 
@@ -85,10 +69,9 @@ When ready:
 While Model N runs live, Model N+1 development begins immediately.
 
 - Model N runs its full life per the model commitment rule — no early shutdown
-- Model N+1 goes through experimental backtests and paper tests concurrently
-- The paper tests for Model N+1 use Model N's live deployment date as `simulation_start`
-  so they can be compared directly against Model N's actual live performance
+- Model N+1 goes through stream design and model assembly concurrently
 - Every 2-3 months, assess whether a new model is ready to deploy
+- If Model N+1 backtest matches or beats Model N, deploy it with its own $100
 
 ---
 
@@ -98,19 +81,18 @@ At any point you can compare across environments and model versions:
 
 | Comparison | What it answers |
 |---|---|
-| Paper test vs historical backtest (same config) | Did real-time match what backtests predicted? |
-| Paper test vs live Model N (same time period) | Would this config have beaten the current live model? |
-| Paper Test A vs Paper Test B | Which configuration performs better live? |
-| Live Model N vs Live Model N+1 | Which deployed model is actually winning? |
+| Stream v2 vs v1 results | Did the parameter iteration actually help? |
+| Model N+1 backtest vs Model N backtest (same period) | Would the new model have beaten the current? |
+| Live Model N vs backtest prediction | Did real-world match what backtests predicted? |
 | Stream X across all models | Which stream lineages consistently outperform? |
 
-All of these comparisons are available through the `reporting` schema views.
+All live comparisons are available through the `reporting` schema views.
 
 ---
 
 ## Model Grading
 
-Applied to live models based on realized performance over time:
+Applied to live models based on realized annualized return:
 
 | Grade | Label | Criteria |
 |---|---|---|

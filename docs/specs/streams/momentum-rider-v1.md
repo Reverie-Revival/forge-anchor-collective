@@ -1,7 +1,7 @@
 # Momentum Rider v1
 
 **Type:** Trend-following
-**Status:** Locked — Model 1 candidate
+**Status:** Superseded by [Momentum Rider v2](momentum-rider-v2.md) — v1 is historical reference only
 
 ## Concept
 

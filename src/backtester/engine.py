@@ -16,7 +16,7 @@ MAKER_FEE = 0.0025  # 0.25% per side
 # Valid slot modes. 'single' = one slot only.
 # 'scale_down' = slot 2 adds when price drops below slot 1's entry (DH pattern).
 # 'scale_up'   = slot 2 adds when price rises above slot 1's entry + original signal fires (MR pattern).
-SLOT_MODES = ('single', 'scale_down', 'scale_up')
+SLOT_MODES = ('single', 'staggered', 'scale_down', 'scale_up')
 
 
 def _warmup_days(params: dict) -> int:
@@ -247,6 +247,151 @@ def _derive_slot2_signals(
     return pd.Series(False, index=df.index)
 
 
+def _run_staggered_slots(
+    df: pd.DataFrame,
+    signals: pd.Series,
+    params: dict,
+    slot_count: int,
+    total_capital: float,
+    fee: float = MAKER_FEE,
+) -> list[dict]:
+    """
+    Run multiple independent staggered slots.
+
+    Each signal goes to whichever slot has been free the longest (round-robin by
+    last-freed candle index). Slots never enter the same signal simultaneously.
+
+    Slot config comes from params["slots"]:
+      slot_entry_gap_candles — min candles between any two entries across all slots
+      slot_capital_weight    — e.g. [70, 30]; weights sum to 100; default = equal split
+    """
+    slots_conf = params.get("slots") or {}
+    gap = int(slots_conf.get("slot_entry_gap_candles", 0))
+    weights = slots_conf.get("slot_capital_weight")
+
+    if weights and len(weights) >= slot_count:
+        total_w = sum(weights[:slot_count])
+        slot_capitals = [total_capital * w / total_w for w in weights[:slot_count]]
+    else:
+        slot_capitals = [total_capital / slot_count] * slot_count
+
+    slots = [
+        {
+            "slot_number":      i + 1,
+            "open_trade":       None,
+            "pending_entry":    None,
+            "capital":          slot_capitals[i],
+            "last_freed_candle": -1,   # -1 = never occupied; sorts to front (longest free)
+            "last_entry_candle": -1,
+        }
+        for i in range(slot_count)
+    ]
+
+    all_trades = []
+    position    = params.get("position", {})
+    trail_pct   = position.get("trailing_stop_pct", 3.0) / 100.0
+    expiry      = position.get("entry_expiry_candles", 2)
+    min_hold    = position.get("min_hold_candles") or 0
+    max_hold    = position.get("max_hold_candles")
+    partial_conf = position.get("partial_exit")
+    last_global_entry = -1
+
+    for i, (ts, row) in enumerate(df.iterrows()):
+        for slot in slots:
+            # attempt pending fill
+            if slot["pending_entry"] and slot["open_trade"] is None:
+                lp, ttl, cap = slot["pending_entry"]
+                if row["low"] <= lp <= row["high"]:
+                    slot["open_trade"] = {
+                        "entry_ts": ts, "entry_price": lp,
+                        "highest_close": lp, "candles_held": 0,
+                        "partial_done": False, "capital": cap,
+                    }
+                    slot["pending_entry"] = None
+                else:
+                    ttl -= 1
+                    if ttl <= 0:
+                        slot["pending_entry"] = None
+                        slot["last_freed_candle"] = i
+                    else:
+                        slot["pending_entry"] = (lp, ttl, cap)
+
+            # manage open trade
+            if slot["open_trade"]:
+                t = slot["open_trade"]
+                t["highest_close"] = max(t["highest_close"], row["close"])
+                t["candles_held"] += 1
+                stop_price = t["highest_close"] * (1 - trail_pct)
+
+                if partial_conf and not t["partial_done"]:
+                    gain = (row["close"] - t["entry_price"]) / t["entry_price"]
+                    if gain >= partial_conf["at_gain_pct"] / 100.0:
+                        ep = partial_conf["exit_pct"] / 100.0
+                        pcap = t["capital"] * ep
+                        pnl = pcap * gain - pcap * fee * 2
+                        all_trades.append({
+                            "slot": slot["slot_number"], "entry_ts": t["entry_ts"],
+                            "exit_ts": ts, "entry_price": t["entry_price"],
+                            "exit_price": row["close"], "capital": pcap,
+                            "pnl": pnl, "exit_reason": "partial",
+                            "candles_held": t["candles_held"],
+                        })
+                        t["capital"] *= (1 - ep)
+                        t["partial_done"] = True
+
+                if t["candles_held"] >= min_hold:
+                    exit_price, exit_reason = None, None
+                    if max_hold and t["candles_held"] >= max_hold:
+                        exit_price, exit_reason = row["close"], "max_hold"
+                    elif row["low"] <= stop_price:
+                        exit_price, exit_reason = stop_price, "trailing_stop"
+
+                    if exit_price:
+                        gain = (exit_price - t["entry_price"]) / t["entry_price"]
+                        pnl  = t["capital"] * gain - t["capital"] * fee * 2
+                        all_trades.append({
+                            "slot": slot["slot_number"], "entry_ts": t["entry_ts"],
+                            "exit_ts": ts, "entry_price": t["entry_price"],
+                            "exit_price": exit_price, "capital": t["capital"],
+                            "pnl": pnl, "exit_reason": exit_reason,
+                            "candles_held": t["candles_held"],
+                        })
+                        slot["capital"] += pnl
+                        slot["open_trade"] = None
+                        slot["last_freed_candle"] = i
+
+        # dispatch signal to longest-free slot (gap enforced globally)
+        if signals.iloc[i] and (gap == 0 or (i - last_global_entry) >= gap):
+            free_slots = sorted(
+                [s for s in slots
+                 if s["open_trade"] is None and s["pending_entry"] is None
+                 and s["capital"] > 0.01],
+                key=lambda s: s["last_freed_candle"],
+            )
+            if free_slots:
+                chosen = free_slots[0]
+                chosen["pending_entry"] = (row["close"], expiry, chosen["capital"])
+                chosen["last_entry_candle"] = i
+                last_global_entry = i
+
+    # close open trades at end of data
+    for slot in slots:
+        if slot["open_trade"]:
+            t = slot["open_trade"]
+            last_row = df.iloc[-1]
+            gain = (last_row["close"] - t["entry_price"]) / t["entry_price"]
+            pnl  = t["capital"] * gain - t["capital"] * MAKER_FEE * 2
+            all_trades.append({
+                "slot": slot["slot_number"], "entry_ts": t["entry_ts"],
+                "exit_ts": df.index[-1], "entry_price": t["entry_price"],
+                "exit_price": last_row["close"], "capital": t["capital"],
+                "pnl": pnl, "exit_reason": "end_of_data",
+                "candles_held": t["candles_held"],
+            })
+
+    return all_trades
+
+
 def run_backtest(
     params: dict,
     start: str = None,
@@ -294,13 +439,15 @@ def run_backtest(
     signals = generate_signals(df, params)
 
     # --- Slot dispatch ---
-    slot1_trades = _run_slot(df, signals, params, slot=1, initial_capital=lot_size_usd)
-    all_trades = slot1_trades
-
-    if slot_count >= 2 and slot_mode in ('scale_down', 'scale_up'):
-        slot2_signals = _derive_slot2_signals(df, slot1_trades, slot_mode, params, signals)
-        slot2_trades  = _run_slot(df, slot2_signals, params, slot=2, initial_capital=lot_size_usd)
-        all_trades    = slot1_trades + slot2_trades
+    if slot_mode == 'staggered' and slot_count >= 2:
+        all_trades = _run_staggered_slots(df, signals, params, slot_count, lot_size_usd)
+    else:
+        slot1_trades = _run_slot(df, signals, params, slot=1, initial_capital=lot_size_usd)
+        all_trades = slot1_trades
+        if slot_count >= 2 and slot_mode in ('scale_down', 'scale_up'):
+            slot2_signals = _derive_slot2_signals(df, slot1_trades, slot_mode, params, signals)
+            slot2_trades  = _run_slot(df, slot2_signals, params, slot=2, initial_capital=lot_size_usd)
+            all_trades    = slot1_trades + slot2_trades
 
     trades_df = pd.DataFrame(all_trades)
     if not trades_df.empty:

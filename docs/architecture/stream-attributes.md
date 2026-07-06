@@ -4,7 +4,7 @@ Streams are composed of a **core signal** plus any number of **attributes**. The
 
 Any stream can enable any attribute. Two streams can share the same core signal but behave completely differently based on their attribute configuration. This is how the tournament generates meaningful variation across models — not by reinventing signals, but by composing them differently.
 
-Attributes are stored in the `parameters` JSONB column on `backtest.streams` and `live.streams`. A null value for any attribute group means that attribute is disabled for that stream.
+Attributes are stored in the `parameters` JSONB column on `backtest.stream_configs` (and `live.streams` for deployed configs). A null value for any attribute group means that attribute is disabled for that stream.
 
 ---
 
@@ -213,6 +213,35 @@ Exchange inflow/outflow, whale movement, miner activity. Requires paid services 
 
 ---
 
+### 9. Slot Position ✅
+
+Controls how capital is deployed across multiple independent slots within a stream. Each slot maintains its own open position, trailing stop, and capital independently. All slot configuration lives under a `"slots"` key in `parameters`.
+
+| Attribute | Applies To | Description |
+|---|---|---|
+| `slot_count` | all modes | Number of independent slots (1–3) |
+| `slot_mode` | all modes | `single` · `staggered` · `scale_down` · `scale_up` |
+| `slot_entry_gap_candles` | staggered | Minimum candles between any two slot entries — prevents rapid stacking |
+| `slot2_trigger_pct` | scale modes | Price must move this % from slot 1's entry before slot 2 fires |
+| `slot_capital_weight` | multi-slot | Capital split across slots, e.g. `[70, 30]` (sums to 100). Default: equal split. |
+
+**Slot modes:**
+- `single` — one slot, one position at a time; slot_count ignored
+- `staggered` — N slots consume signals round-robin; the slot that has been free longest gets the next signal; `slot_entry_gap_candles` enforces a minimum gap between any two entries
+- `scale_down` — slot 2 enters when price drops `slot2_trigger_pct` below slot 1's entry (DH: average down)
+- `scale_up` — slot 2 enters when price rises `slot2_trigger_pct` and signal fires again (MR: pyramid up)
+
+```json
+"slots": {
+  "slot_count": 2,
+  "slot_mode": "staggered",
+  "slot_entry_gap_candles": 4,
+  "slot_capital_weight": [70, 30]
+}
+```
+
+---
+
 ## Full Parameter Schema
 
 The complete structure every stream's `parameters` column should conform to:
@@ -247,7 +276,14 @@ The complete structure every stream's `parameters` column should conform to:
   },
   "pause_rules": null,
   "sentiment": null,
-  "on_chain": null
+  "on_chain": null,
+  "slots": {
+    "slot_count": 1,
+    "slot_mode": "single",
+    "slot_entry_gap_candles": 0,
+    "slot2_trigger_pct": null,
+    "slot_capital_weight": null
+  }
 }
 ```
 

@@ -1,7 +1,8 @@
--- Forge Anchor Collective — Database Schema v2
+-- Forge Anchor Collective — Database Schema v3
 -- PostgreSQL 16
 -- Run once to initialize: psql -d forge_anchor -f src/data/schema.sql
 -- Safe to re-run — all statements use IF NOT EXISTS / OR REPLACE
+-- Existing installs: run src/data/migration_v3.sql instead of this file
 
 -- ============================================================
 -- SCHEMAS
@@ -66,20 +67,70 @@ CREATE TABLE IF NOT EXISTS timeframe_presets (
 -- Freely rebuilt during development. Never real money.
 -- ============================================================
 
--- One row per model version defined for backtesting.
+-- Model identity + versioned config.
+-- Each model_version row IS the config — "Model 1 v1" describes a specific
+-- composition of stream configs and allocations (see backtest.model_streams).
+-- status: 'active' while running live, 'completed' when finished, 'archived' for old tests.
 CREATE TABLE IF NOT EXISTS backtest.models (
     model_id        SERIAL PRIMARY KEY,
-    model_version   INTEGER NOT NULL,
+    model_version   INTEGER      NOT NULL,
     description     TEXT,
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    status          VARCHAR(20)  NOT NULL DEFAULT 'active'
+                        CHECK (status IN ('active', 'completed', 'archived')),
+    deployed_at     TIMESTAMPTZ,
+    created_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+
+-- Stream identity — name and type only, no configuration.
+-- Configurations are versioned in backtest.stream_configs.
+CREATE TABLE IF NOT EXISTS backtest.streams (
+    stream_id       SERIAL PRIMARY KEY,
+    stream_name     VARCHAR(100) NOT NULL UNIQUE,
+    strategy_type   VARCHAR(50)  NOT NULL,
+    description     TEXT,
+    created_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+
+-- Versioned stream configurations.
+-- One row per distinct parameter set. Each new tuning attempt gets a new version.
+-- version label: clean "v1"/"v2" going forward; migrated data uses "v1r1" etc.
+-- slot_mode values: 'single' | 'staggered' | 'scale_down' | 'scale_up'
+-- Slot attributes are stored in parameters JSONB under a "slots" key:
+--   slot_count, slot_mode, slot_entry_gap_candles, slot2_trigger_pct, slot_capital_weight
+CREATE TABLE IF NOT EXISTS backtest.stream_configs (
+    stream_config_id  SERIAL PRIMARY KEY,
+    stream_id         INTEGER      NOT NULL REFERENCES backtest.streams(stream_id),
+    version           VARCHAR(20)  NOT NULL,
+    parameters        JSONB        NOT NULL,
+    slot_count        SMALLINT     NOT NULL DEFAULT 1 CHECK (slot_count >= 1),
+    slot_mode         VARCHAR(30)  NOT NULL DEFAULT 'single',
+    notes             TEXT,
+    created_at        TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    UNIQUE (stream_id, version)
+);
+
+CREATE INDEX IF NOT EXISTS idx_stream_configs_stream
+    ON backtest.stream_configs (stream_id);
+
+-- Model composition — which stream configs make up a model version and at what allocation.
+-- lot_size_usd here is the final deployed/tested allocation per stream.
+CREATE TABLE IF NOT EXISTS backtest.model_streams (
+    id                SERIAL PRIMARY KEY,
+    model_id          INTEGER      NOT NULL REFERENCES backtest.models(model_id),
+    stream_config_id  INTEGER      NOT NULL REFERENCES backtest.stream_configs(stream_config_id),
+    lot_size_usd      NUMERIC(10,2) NOT NULL DEFAULT 10.00 CHECK (lot_size_usd >= 10.00),
+    UNIQUE (model_id, stream_config_id)
 );
 
 -- Individual stream tuning runs.
--- run_number groups tests with identical parameters (same config, different timeframes).
--- Each row is one run against one timeframe (preset or custom).
--- slot_mode + slot_count at test time are stored here so results are self-describing.
+-- Each row is one stream config tested against one timeframe (preset or custom).
+-- Dedup key: (stream_config_id, preset_id) or (stream_config_id, custom_start/end).
+-- Re-running the same combo replaces the existing result.
 CREATE TABLE IF NOT EXISTS backtest.stream_tests (
     test_id               SERIAL PRIMARY KEY,
+    stream_config_id      INTEGER      NOT NULL REFERENCES backtest.stream_configs(stream_config_id),
+
+    -- Legacy name/version columns — kept for display; stream_config_id is authoritative
     stream_name           VARCHAR(100) NOT NULL,
     stream_version        VARCHAR(20)  NOT NULL DEFAULT 'v1',
     run_number            INTEGER      NOT NULL,
@@ -87,19 +138,17 @@ CREATE TABLE IF NOT EXISTS backtest.stream_tests (
     -- Timeframe: use a preset OR custom dates — not both, not neither
     preset_id             INTEGER      REFERENCES timeframe_presets(preset_id),
     custom_start          TIMESTAMPTZ,
-    custom_end            TIMESTAMPTZ,            -- NULL = latest available data
+    custom_end            TIMESTAMPTZ,
 
-    -- Slot configuration captured at test time
+    -- Slot configuration at test time (denormalized for self-describing rows)
     slot_count            SMALLINT     NOT NULL DEFAULT 1 CHECK (slot_count >= 1),
     slot_mode             VARCHAR(30)  NOT NULL DEFAULT 'single',
-    -- slot_mode values: 'single' | 'scale_down' | 'scale_up'
-    -- slot-specific trigger params (e.g. slot2_trigger_pct) live in parameters JSONB
 
     -- Actual simulation boundaries (from engine, after warmup clip)
     simulation_start      TIMESTAMPTZ,
     simulation_end        TIMESTAMPTZ,
 
-    -- Strategy parameters
+    -- Strategy parameters snapshot
     parameters            JSONB        NOT NULL,
     initial_capital       NUMERIC(10,2) NOT NULL,
 
@@ -125,34 +174,12 @@ CREATE TABLE IF NOT EXISTS backtest.stream_tests (
     )
 );
 
-CREATE INDEX IF NOT EXISTS idx_stream_tests_name_version
-    ON backtest.stream_tests (stream_name, stream_version);
-CREATE INDEX IF NOT EXISTS idx_stream_tests_run
-    ON backtest.stream_tests (stream_name, stream_version, run_number);
+CREATE INDEX IF NOT EXISTS idx_stream_tests_config
+    ON backtest.stream_tests (stream_config_id);
+CREATE INDEX IF NOT EXISTS idx_stream_tests_config_preset
+    ON backtest.stream_tests (stream_config_id, preset_id);
 
--- Streams locked into a model after validation.
--- locked_test_id points to the stream_tests row that earned the lock.
--- slot_mode here is the FINAL operational slot behavior for this stream in this model
--- (may differ from what was tested during tuning runs).
-CREATE TABLE IF NOT EXISTS backtest.streams (
-    stream_id       SERIAL PRIMARY KEY,
-    model_id        INTEGER      NOT NULL REFERENCES backtest.models(model_id),
-    stream_name     VARCHAR(100) NOT NULL,
-    stream_version  VARCHAR(10)  NOT NULL,
-    strategy_type   VARCHAR(50)  NOT NULL,
-    parameters      JSONB        NOT NULL,
-    slot_count      SMALLINT     NOT NULL DEFAULT 1 CHECK (slot_count >= 1),
-    slot_mode       VARCHAR(30)  NOT NULL DEFAULT 'single',
-    lot_size_usd    NUMERIC(10,2) NOT NULL DEFAULT 10.00 CHECK (lot_size_usd >= 10.00),
-    locked_test_id  INTEGER      REFERENCES backtest.stream_tests(test_id),
-    grade           SMALLINT     CHECK (grade BETWEEN 1 AND 5),
-    locked_at       TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
-    description     TEXT,
-    notes           TEXT
-);
-
--- Full model-level backtest runs (historical and paper).
--- run_number groups runs with the same allocation config across different timeframes.
+-- Full model-level backtest runs.
 CREATE TABLE IF NOT EXISTS backtest.model_tests (
     model_test_id            SERIAL PRIMARY KEY,
     model_id                 INTEGER      NOT NULL REFERENCES backtest.models(model_id),
@@ -162,7 +189,7 @@ CREATE TABLE IF NOT EXISTS backtest.model_tests (
     -- Timeframe: preset or custom
     preset_id                INTEGER      REFERENCES timeframe_presets(preset_id),
     custom_start             TIMESTAMPTZ,
-    custom_end               TIMESTAMPTZ,          -- NULL = latest available data
+    custom_end               TIMESTAMPTZ,
 
     -- Execution metadata
     simulation_start         TIMESTAMPTZ  NOT NULL,
@@ -196,29 +223,29 @@ CREATE TABLE IF NOT EXISTS backtest.model_tests (
 -- CASH → OPEN → CLOSED; capital compounds within a slot.
 -- Each lot has its own high_water_mark — trailing stops are independent per lot.
 CREATE TABLE IF NOT EXISTS backtest.lots (
-    lot_id           BIGSERIAL PRIMARY KEY,
-    model_test_id    INTEGER      NOT NULL REFERENCES backtest.model_tests(model_test_id),
-    model_id         INTEGER      NOT NULL REFERENCES backtest.models(model_id),
-    stream_id        INTEGER      NOT NULL REFERENCES backtest.streams(stream_id),
-    slot_number      SMALLINT     NOT NULL CHECK (slot_number >= 1),
-    lot_sequence     INTEGER      NOT NULL,
-    status           VARCHAR(10)  NOT NULL DEFAULT 'CASH'
-                         CHECK (status IN ('CASH', 'OPEN', 'CLOSED')),
-    opening_capital  NUMERIC(12,2) NOT NULL,
-    btc_quantity     NUMERIC(20,8),
-    entry_price      NUMERIC(12,2),
-    high_water_mark  NUMERIC(12,2),
-    exit_price       NUMERIC(12,2),
-    closing_capital  NUMERIC(12,2),
-    realized_pnl     NUMERIC(12,2),
-    entry_reason     TEXT,
-    exit_reason      TEXT,
-    opened_at        TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
-    closed_at        TIMESTAMPTZ
+    lot_id            BIGSERIAL PRIMARY KEY,
+    model_test_id     INTEGER      NOT NULL REFERENCES backtest.model_tests(model_test_id),
+    model_id          INTEGER      NOT NULL REFERENCES backtest.models(model_id),
+    stream_config_id  INTEGER      NOT NULL REFERENCES backtest.stream_configs(stream_config_id),
+    slot_number       SMALLINT     NOT NULL CHECK (slot_number >= 1),
+    lot_sequence      INTEGER      NOT NULL,
+    status            VARCHAR(10)  NOT NULL DEFAULT 'CASH'
+                          CHECK (status IN ('CASH', 'OPEN', 'CLOSED')),
+    opening_capital   NUMERIC(12,2) NOT NULL,
+    btc_quantity      NUMERIC(20,8),
+    entry_price       NUMERIC(12,2),
+    high_water_mark   NUMERIC(12,2),
+    exit_price        NUMERIC(12,2),
+    closing_capital   NUMERIC(12,2),
+    realized_pnl      NUMERIC(12,2),
+    entry_reason      TEXT,
+    exit_reason       TEXT,
+    opened_at         TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    closed_at         TIMESTAMPTZ
 );
 
 CREATE INDEX IF NOT EXISTS idx_backtest_lots_model_test ON backtest.lots (model_test_id);
-CREATE INDEX IF NOT EXISTS idx_backtest_lots_stream     ON backtest.lots (stream_id);
+CREATE INDEX IF NOT EXISTS idx_backtest_lots_config     ON backtest.lots (stream_config_id);
 CREATE INDEX IF NOT EXISTS idx_backtest_lots_status     ON backtest.lots (status);
 
 -- ============================================================

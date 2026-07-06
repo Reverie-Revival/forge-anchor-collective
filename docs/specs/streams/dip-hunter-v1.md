@@ -1,7 +1,7 @@
 # Dip Hunter v1
 
 **Type:** Mean reversion — fear bounce  
-**Status:** Locked — Model 1 (stream_id=2, Grade 4 — Strong)
+**Status:** Superseded by [Dip Hunter v2](dip-hunter-v2.md) — v1 is historical reference only
 
 ## Concept
 
@@ -54,7 +54,7 @@ params = {
 }
 ```
 
-## Validation Results (v2 baseline)
+## Validation Results (v1 — superseded)
 
 | Window | Period | Trades | Ann. Return | Win Rate | PF | Max DD |
 |---|---|---|---|---|---|---|

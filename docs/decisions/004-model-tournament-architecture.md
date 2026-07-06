@@ -4,13 +4,20 @@
 **Status:** Accepted
 
 ## Decision
-The system is built around versioned, independently-capitalized models that run in parallel. Each model is a complete trading system: 5 strategy streams × 2 position slots = $100 total capital. New models are built, backtested, and deployed alongside prior ones every 2-3 months.
+The system is built around versioned, independently-capitalized models that run in parallel. Each model is a complete trading system with 3–5 strategy streams and $100 total capital, allocated across streams at model assembly time. New models are built, backtested, and deployed alongside prior ones every 2-3 months.
 
 ## What a Model Is
-- 5 strategy streams, each with 2 position slots ($10 per slot)
+- 3–5 strategy streams, each with its own lot size and slot count (minimum $10/slot)
+- Capital allocation is configurable per stream: `lot_size_usd × slot_count` per stream, summing to $100
 - Each stream has a unique descriptive name and a version number
 - A model is identified by its model version (e.g., Model 1, Model 2)
 - $100 of independent capital per model
+
+## Model 1 Example Allocation
+3 streams × $33.33/slot × 1 slot = $99.99 total:
+- Momentum Rider v2: $33.33/slot × 1 slot
+- Dip Hunter v2: $33.33/slot × 1 slot
+- Breakout Scout v2: $33.33/slot × 1 slot
 
 ## Stream Naming Convention
 Streams are named descriptively to reflect their personality, plus a version number:
@@ -22,7 +29,7 @@ Streams are named descriptively to reflect their personality, plus a version num
 This makes it easy to trace which stream lineage performed well across models.
 
 ## Model Lifecycle
-1. **Build** — design 5 streams, set parameters, backtest across historical data
+1. **Build** — design 3–5 streams, set parameters, backtest across historical data
 2. **Gate** — backtest must show confidence across diverse market conditions (no calendar gate)
 3. **Deploy** — $100 live on Kraken, runs independently alongside prior models
 4. **Overlap** — while current model runs live, next model is being designed and backtested

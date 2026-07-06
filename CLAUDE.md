@@ -59,16 +59,14 @@ There is no mandatory paper trading phase. $100 is low enough that live deployme
 
 These are two distinct steps:
 
-1. **Lock a stream** — the stream's signal is validated in isolation. It's approved as a candidate for this model. `backtest.streams` row is written. Allocation (lot_size_usd, slot_count) gets a default placeholder.
-2. **Finalize a model** — all candidate streams assembled together, allocation weights set per stream, then model-level backtest runs all streams simultaneously. Only after model-level testing passes does the model become deployment-ready.
-
-Locking streams early is fine and expected — it's how we build up the model piece by piece. But no stream's allocation is truly decided until model assembly, when we can see how the streams interact and how much each one fires.
+1. **Lock a stream config** — validate a stream's signal in isolation. A `backtest.stream_configs` row exists with the tested parameters. Allocation (lot_size_usd) is a placeholder until model assembly.
+2. **Finalize a model** — assemble candidate stream configs into a `backtest.model_streams` composition, set final allocations, run model-level backtest. Only after this passes does the model become deployment-ready.
 
 ## Tech Stack
 
 - Python, PostgreSQL, Kraken Pro API
-- Jupyter Notebooks for backtesting dashboards
-- Streamlit (later, for live monitoring)
+- Streamlit for backtesting UI and live monitoring
+- GitHub Actions + Supabase + cron-job.org for live execution ($0/month)
 
 ## Key Constraints
 
@@ -77,23 +75,28 @@ Locking streams early is fine and expected — it's how we build up the model pi
 - Limit orders only (0.25% maker fee, 0.50% round trip)
 - No LLM in the live execution path — deterministic rules only
 - All gains measured as realized cash, not unrealized BTC value
-- No real money until backtesting earns it
+- $0 infrastructure cost — if something requires payment, find a free alternative
 
-## Database Tables
+## Database Tables (v3 schema)
 
 Shared (public schema):
 - `market_data` — 15m BTC/USD OHLCV candles, Jan 2017 → present
 - `sentiment_data` — daily Fear & Greed Index, Feb 2018 → present
+- `timeframe_presets` — named date windows (Primary v2, Full History, Recent, 2026 YTD)
 
 Backtest schema (stream tuning + model validation):
-- `backtest.stream_tests` — individual stream tuning runs (summary metrics, one row per saved test)
-- `backtest.model_tests` — full model backtests (historical and paper, gates live deployment)
-- `backtest.models` — model version registry
-- `backtest.streams` — stream configs within a model
+- `backtest.streams` — stream identity only (name, strategy type) — NOT configuration
+- `backtest.stream_configs` — versioned parameter sets per stream (v1, v2, etc.) + slot config
+- `backtest.model_streams` — model composition: which stream_config at what lot_size_usd
+- `backtest.models` — model version registry (status, deployed_at)
+- `backtest.stream_tests` — one result per (stream_config × timeframe); auto-saved by app
+- `backtest.model_tests` — full model backtests; gates live deployment
 - `backtest.lots` — per-trade capital state machine for model-level tests
+- `backtest_bak.*` — pre-v3 snapshot, preserved permanently
 
-Live schema (real money — not yet built):
-- `live.models`, `live.streams`, `live.lots` — mirrors backtest structure, adds Kraken order IDs
+Live schema (real money):
+- `live.models`, `live.streams`, `live.lots` — mirrors backtest structure, adds Kraken order IDs + PENDING status
+- `live.executor_state`, `live.executor_runs`, `live.market_data_runs` — run tracking for Live Monitor
 
 Reporting schema (views only):
 - `reporting.all_lots` — unions backtest + live lots for cross-environment queries

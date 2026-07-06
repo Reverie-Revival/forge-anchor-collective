@@ -1,29 +1,28 @@
-# Database Schema
+# Database Schema — v3
 
-**Database:** `forge_anchor` (PostgreSQL, local during build, server when live)
-**Schemas:** `backtest`, `live`, `reporting` + shared `market_data` / `timeframe_presets` tables
+**Database:** `forge_anchor` (PostgreSQL, local during development; Supabase for live)
+**Schemas:** `backtest`, `live`, `reporting` + shared `market_data` / `sentiment_data` / `timeframe_presets`
 
-> **Status:** v2 architecture. `live` schema is designed but not yet built.
+> **Current status:** v3 architecture. Local postgres fully migrated. Supabase migration (`migration_v3.sql`) deferred until Model 2 development starts — live executor uses `live.*` schema only and is unaffected.
+> Pre-v3 data is preserved in `backtest_bak.*` permanently.
 
 ---
 
-## Shared tables
+## Shared Tables
 
 ### market_data
+Raw BTC/USD price history. Lives outside both schemas — feeds everything.
+Single interval: 15-minute candles from January 1, 2017 → present (~332,000 rows).
 
-Stores all raw BTC/USD price history. Lives outside both schemas — feeds everything.
-Single interval: 15-minute candles from January 1, 2017 to present (~332,000 rows).
-See ADR 006 for the full reasoning behind interval and history decisions.
-
-```sql
+```
 market_data
-  candle_id     BIGSERIAL PRIMARY KEY
-  timestamp     TIMESTAMPTZ NOT NULL UNIQUE
-  open          NUMERIC(12,2) NOT NULL
-  high          NUMERIC(12,2) NOT NULL
-  low           NUMERIC(12,2) NOT NULL
-  close         NUMERIC(12,2) NOT NULL
-  volume        NUMERIC(20,8) NOT NULL
+  candle_id   BIGSERIAL PRIMARY KEY
+  timestamp   TIMESTAMPTZ NOT NULL UNIQUE
+  open        NUMERIC(12,2) NOT NULL
+  high        NUMERIC(12,2) NOT NULL
+  low         NUMERIC(12,2) NOT NULL
+  close       NUMERIC(12,2) NOT NULL
+  volume      NUMERIC(20,8) NOT NULL
 ```
 
 Index on `timestamp` — nearly every query filters by time range.
@@ -31,82 +30,156 @@ Index on `timestamp` — nearly every query filters by time range.
 ---
 
 ### sentiment_data
+Daily Fear & Greed Index. Backfilled Feb 2018 → present.
+Updated automatically via `market_data.yml` GitHub Actions workflow (runs `src.data.sentiment` every 15 min).
 
-Daily Fear & Greed Index values. Backfilled Feb 2018 → present via `python -m src.data.sentiment`. Feeds the sentiment gate attribute on any stream.
-
-```sql
+```
 sentiment_data
-  date        DATE PRIMARY KEY
-  fng_value   SMALLINT NOT NULL     -- 0 (Extreme Fear) → 100 (Extreme Greed)
-  fng_label   VARCHAR(30) NOT NULL  -- "Extreme Fear", "Fear", "Neutral", "Greed", "Extreme Greed"
+  date       DATE PRIMARY KEY
+  fng_value  SMALLINT NOT NULL     -- 0 (Extreme Fear) → 100 (Extreme Greed)
+  fng_label  VARCHAR(30) NOT NULL
 ```
 
-Candles before Feb 2018 have no corresponding row — the backtester skips the sentiment gate for those candles rather than blocking them.
+Candles before Feb 2018 skip the sentiment gate rather than blocking.
 
 ---
 
 ### timeframe_presets
+Standard date windows referenced by stream tests and model tests. Replaces free-text window names — tests use a preset FK so the window definition is consistent and queryable.
 
-Standard date windows used across stream tests and model tests. Replaces free-text `window_name` — tests reference a preset by FK so the window definition is consistent and queryable.
-
-```sql
+```
 timeframe_presets
-  preset_id    SERIAL PRIMARY KEY
-  name         VARCHAR(50) NOT NULL UNIQUE   -- "Primary Window", "Full History", etc.
-  start_date   DATE NOT NULL
-  end_date     DATE                          -- NULL = open-ended (runs to present)
-  description  TEXT
-  is_active    BOOLEAN NOT NULL DEFAULT TRUE
-  created_at   TIMESTAMPTZ DEFAULT NOW()
+  preset_id   SERIAL PRIMARY KEY
+  name        VARCHAR(50) NOT NULL UNIQUE
+  start_date  DATE NOT NULL
+  end_date    DATE             -- NULL = open-ended (runs to present)
+  description TEXT
+  is_active   BOOLEAN NOT NULL DEFAULT TRUE
+  created_at  TIMESTAMPTZ DEFAULT NOW()
 ```
 
-**Standard presets (seeded):**
+**Standard presets:**
 
-| Name | Start | End | Purpose |
-|---|---|---|---|
-| Primary Window | 2019-01-01 | 2023-12-31 | Main gate: varied regimes (bull/bear/recovery) |
-| Full History | 2018-01-01 | open | All available data including sentiment coverage |
-| Recent | 2024-01-01 | open | Post-halving behavior, 2025 ATH cycle |
-| 2026 YTD | 2026-01-01 | open | Current year performance |
-
-Custom date ranges are always available for one-off tests and are stored directly as `custom_start`/`custom_end` timestamps on the test row.
+| preset_id | Name | Start | End | Purpose |
+|---|---|---|---|---|
+| 1 | Primary Window | 2019-01-01 | 2023-12-31 | Legacy window. Use only for explicit cross-comparison with old results. |
+| 2 | Full History | 2018-01-01 | open | All regimes including 2018 bear, COVID, 2021 mania |
+| 3 | Recent | 2024-01-01 | open | Post-ETF approval regime only |
+| 4 | 2026 YTD | 2026-01-01 | open | Current year (thin data — context only) |
+| 5 | Primary v2 | 2022-01-01 | open | **Default for new builds.** Starts hard (2022 bear top). Modern cycle: crash → recovery → ETF bull → present. |
 
 ---
 
 ## backtest schema
 
-Two types of testing live here:
-- **Stream tests** — individual streams tested in isolation during design/tuning
-- **Model tests** — all streams running together as a full model, used to gate deployment
+All stream tuning and model validation lives here. Freely rebuilt during development. Never real money.
 
-Freely rebuilt during development. Never contains real money.
+Pre-v3 data is snapshotted to `backtest_bak.*` and preserved permanently.
 
 ---
 
-### backtest.stream_tests
+### backtest.streams — identity only
 
-Captures every stream tuning run you choose to save. One row per saved test.
-Stores the full parameter config and all key performance metrics for comparison.
+One row per named stream. Holds the identity (name, type) — NOT the configuration.
+Configurations are versioned in `backtest.stream_configs`.
 
-`run_number` groups tests with identical parameters (same config, different date windows). Date range is either a `preset_id` FK (standard window) or explicit `custom_start`/`custom_end` — exactly one must be set (CHECK constraint enforced).
+```
+backtest.streams
+  stream_id      SERIAL PRIMARY KEY
+  stream_name    VARCHAR(100) NOT NULL UNIQUE   -- "Momentum Rider", "Dip Hunter", "Breakout Scout"
+  strategy_type  VARCHAR(50) NOT NULL           -- "trend_following", "mean_reversion", "breakout"
+  description    TEXT
+  created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+```
 
-```sql
+---
+
+### backtest.stream_configs — versioned configurations
+
+One row per distinct parameter set. Version label is the version of that configuration: "v1", "v2", etc.
+(Migrated data from pre-v3 uses labels like "v1r1", "v1r2" where multiple run_numbers existed for one version.)
+
+Slot configuration lives here (and also in `parameters` JSONB under a `"slots"` key for full snapshot fidelity).
+
+```
+backtest.stream_configs
+  stream_config_id  SERIAL PRIMARY KEY
+  stream_id         INTEGER NOT NULL REFERENCES backtest.streams
+  version           VARCHAR(20) NOT NULL          -- "v1", "v2", "v1r1"...
+  parameters        JSONB NOT NULL                -- full strategy parameter snapshot
+  slot_count        SMALLINT NOT NULL DEFAULT 1   -- max concurrent positions
+  slot_mode         VARCHAR(30) NOT NULL DEFAULT 'single'
+                    -- 'single' | 'staggered' | 'scale_down' | 'scale_up'
+  notes             TEXT
+  created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  UNIQUE (stream_id, version)
+```
+
+**Slot modes:**
+- `single` — one slot, one position at a time
+- `staggered` — N independent slots consuming signals round-robin (longest-free slot gets next signal); enforces `slot_entry_gap_candles` between entries; supports `slot_capital_weight` for asymmetric sizing
+- `scale_down` — slot 2 adds when price drops `slot2_trigger_pct` below slot 1's entry (DH pattern)
+- `scale_up` — slot 2 adds when price rises `slot2_trigger_pct` above slot 1's entry and signal fires again (MR pattern)
+
+---
+
+### backtest.model_streams — model composition
+
+Records which stream configs make up a model version, and at what capital allocation.
+This is the single source of truth for "Model 1 used DH v2 at $33.33, MR v2 at $33.33, BS v2 at $33.33."
+
+```
+backtest.model_streams
+  id                SERIAL PRIMARY KEY
+  model_id          INTEGER NOT NULL REFERENCES backtest.models
+  stream_config_id  INTEGER NOT NULL REFERENCES backtest.stream_configs
+  lot_size_usd      NUMERIC(10,2) NOT NULL DEFAULT 10.00  -- $ per position; CHECK >= 10
+  UNIQUE (model_id, stream_config_id)
+```
+
+---
+
+### backtest.models — model version registry
+
+One row per model version. The `model_version` field is the version number (1, 2, 3...).
+A model row IS the config — it describes a specific composition of stream configs (see `model_streams`).
+
+```
+backtest.models
+  model_id       SERIAL PRIMARY KEY
+  model_version  INTEGER NOT NULL
+  description    TEXT
+  status         VARCHAR(20) NOT NULL DEFAULT 'active'
+                 -- 'active' | 'completed' | 'archived'
+  deployed_at    TIMESTAMPTZ
+  created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+```
+
+---
+
+### backtest.stream_tests — individual stream tuning results
+
+One saved result per (stream config × timeframe). Dedup key: `(stream_config_id, preset_id)` for preset runs, `(stream_config_id, custom_start, custom_end)` for custom. Re-running the same combo replaces the existing result (upsert).
+
+```
+backtest.stream_tests
   test_id               SERIAL PRIMARY KEY
-  stream_name           VARCHAR(100) NOT NULL     -- e.g. "Momentum Rider"
-  stream_version        VARCHAR(20) NOT NULL      -- "v1", "v2"
-  run_number            INTEGER                   -- groups same-config tests (1, 2, 3...)
-  preset_id             INTEGER REFERENCES timeframe_presets  -- standard window FK
-  custom_start          TIMESTAMPTZ               -- set only when not using a preset
-  custom_end            TIMESTAMPTZ               -- null = open-ended custom range
-  simulation_start      TIMESTAMPTZ               -- actual first candle after warmup clip
-  simulation_end        TIMESTAMPTZ               -- actual last candle
-  slot_count            SMALLINT NOT NULL DEFAULT 1  -- max concurrent positions
-  slot_mode             VARCHAR(30) NOT NULL DEFAULT 'single'  -- 'single' | 'scale_down' | 'scale_up'
-  parameters            JSONB NOT NULL            -- full config snapshot at test time
-  initial_capital       NUMERIC(10,2) NOT NULL    -- starting $ (lot_size_usd × slot_count)
-  ending_balance        NUMERIC(10,4)             -- final $ after all trades
+  stream_config_id      INTEGER NOT NULL REFERENCES backtest.stream_configs  -- primary FK
+  stream_name           VARCHAR(100) NOT NULL   -- denormalized for display (authoritative: stream_configs)
+  stream_version        VARCHAR(20) NOT NULL
+  run_number            INTEGER NOT NULL        -- legacy grouping field; always 1 for new rows
+  preset_id             INTEGER REFERENCES timeframe_presets
+  custom_start          TIMESTAMPTZ
+  custom_end            TIMESTAMPTZ
+  simulation_start      TIMESTAMPTZ             -- actual first candle after warmup clip
+  simulation_end        TIMESTAMPTZ
+  slot_count            SMALLINT NOT NULL DEFAULT 1
+  slot_mode             VARCHAR(30) NOT NULL DEFAULT 'single'
+  parameters            JSONB NOT NULL          -- snapshot of config at test time
+  initial_capital       NUMERIC(10,2) NOT NULL
+  ending_balance        NUMERIC(10,4)
   total_trades          INTEGER
-  win_rate              NUMERIC(5,4)              -- 0.0 to 1.0
+  win_rate              NUMERIC(5,4)
   total_pnl             NUMERIC(10,4)
   total_return_pct      NUMERIC(8,2)
   annualized_return_pct NUMERIC(8,2)
@@ -119,77 +192,30 @@ Stores the full parameter config and all key performance metrics for comparison.
   saved_at              TIMESTAMPTZ NOT NULL DEFAULT NOW()
 ```
 
-No per-trade detail here — just summary metrics. Designed for fast iteration and comparison.
-A full pkl payload is stored at `src/app/runs/{test_id}.pkl` for chart rendering in the stream tester.
-
-**`timeframe_label`** is computed at query time via `COALESCE(tp.name, formatted_custom_dates)` — not stored.
+A full pkl payload (trades + charts data) lives at `src/app/runs/{test_id}.pkl` for chart rendering.
+`timeframe_label` is computed at query time: `COALESCE(preset.name, formatted_custom_dates)`.
 
 ---
 
-### backtest.models
+### backtest.model_tests — full model backtests
 
-One row per model version defined for backtesting.
+All streams running together as a unit. Used to validate a model before live deployment.
 
-```sql
-  model_id        SERIAL PRIMARY KEY
-  model_version   INTEGER NOT NULL        -- 1, 2, 3...
-  description     TEXT
-  created_at      TIMESTAMPTZ DEFAULT NOW()
 ```
-
-### backtest.streams
-
-Streams locked into a model after validation. One row per stream per model.
-`locked_test_id` points to the `stream_tests` row (Primary window) that earned the lock.
-
-```sql
-  stream_id       SERIAL PRIMARY KEY
-  model_id        INTEGER NOT NULL REFERENCES backtest.models
-  stream_name     VARCHAR(100) NOT NULL   -- e.g. "Momentum Rider"
-  stream_version  VARCHAR(10) NOT NULL    -- "v1", "v2"
-  strategy_type   VARCHAR(50) NOT NULL
-  parameters      JSONB NOT NULL          -- all tunable thresholds
-  slot_count      SMALLINT NOT NULL DEFAULT 1   -- max concurrent positions
-  slot_mode       VARCHAR(30) NOT NULL DEFAULT 'single'  -- 'single' | 'scale_down' | 'scale_up'
-  lot_size_usd    NUMERIC(10,2) DEFAULT 10.00   -- $ per position; CHECK >= 10
-  locked_test_id  INTEGER REFERENCES backtest.stream_tests  -- winning Primary window run
-  grade           SMALLINT               -- 1–5
-  locked_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
-  description     TEXT                   -- plain-English explanation shown in Stream Tester sidebar
-  notes           TEXT                   -- key decisions / iteration summary
-```
-
-**Capital allocation:** Each stream owns its slice of model capital independently.
-Total model capital = Σ(lot_size_usd × slot_count) across all streams.
-A model can have 3–5 streams — not necessarily 5. High-conviction streams can get more capital or more slots.
-**Minimum lot_size_usd: $10.** Enforced via CHECK constraint.
-Allocation is decided at model assembly, not during stream tuning — locked streams get placeholder defaults until model-level testing finalizes weights.
-
-**Slot modes:**
-- `single` — only slot 1 runs; slot_count ignored for dispatch purposes
-- `scale_down` — slot 2 enters when slot 1 is open and price drops `slot2_trigger_pct` below entry (DH pattern: average down)
-- `scale_up` — slot 2 enters when slot 1 is open, price is up `slot2_trigger_pct`, and the original signal fires again (MR pattern: pyramid up)
-
-### backtest.model_tests
-
-A full model backtest run — all streams running together as a unit.
-Used to validate the complete model before live deployment.
-
-`run_number` groups runs with the same allocation config (same streams + weights, different date windows). Date range follows the same preset/custom FK pattern as stream_tests.
-
-```sql
+backtest.model_tests
   model_test_id            SERIAL PRIMARY KEY
   model_id                 INTEGER NOT NULL REFERENCES backtest.models
   run_type                 VARCHAR(20) NOT NULL   -- 'historical' | 'paper'
-  run_number               INTEGER                -- groups same-allocation runs
+  run_number               INTEGER
   preset_id                INTEGER REFERENCES timeframe_presets
   custom_start             TIMESTAMPTZ
   custom_end               TIMESTAMPTZ
   simulation_start         TIMESTAMPTZ NOT NULL
-  simulation_end           TIMESTAMPTZ            -- null if paper test still running
-  status                   VARCHAR(20) NOT NULL   -- 'running' | 'completed'
-  configuration            JSONB NOT NULL         -- {allocations: {stream: {lot_size_usd, slot_count, slot_mode}}}
-  total_capital            NUMERIC(10,2)          -- Σ(lot_size_usd × slot_count) across all streams
+  simulation_end           TIMESTAMPTZ
+  status                   VARCHAR(20) NOT NULL DEFAULT 'completed'  -- 'running' | 'completed'
+  selected_for_deployment  BOOLEAN NOT NULL DEFAULT FALSE
+  configuration            JSONB NOT NULL         -- {allocations: {stream: {lot_size_usd, ...}}}
+  total_capital            NUMERIC(10,2)
   ending_balance           NUMERIC(10,4)
   total_trades             INTEGER
   win_rate                 NUMERIC(5,4)
@@ -198,148 +224,88 @@ Used to validate the complete model before live deployment.
   annualized_return_pct    NUMERIC(8,2)
   max_drawdown_pct         NUMERIC(8,2)
   notes                    TEXT
-  created_at               TIMESTAMPTZ DEFAULT NOW()
+  created_at               TIMESTAMPTZ NOT NULL DEFAULT NOW()
 ```
 
-A full pkl payload is stored at `src/app/model_runs/{model_test_id}.pkl` for chart rendering in the Model Tester.
+Full pkl payload at `src/app/model_runs/{model_test_id}.pkl`.
 
-### backtest.lots
+---
 
-Every unit of capital moving through a slot in a model test. The full trade-level record.
+### backtest.lots — per-trade capital state machine
 
-```sql
-  lot_id           BIGSERIAL PRIMARY KEY
-  model_test_id    INTEGER NOT NULL REFERENCES backtest.model_tests
-  model_id         INTEGER NOT NULL REFERENCES backtest.models
-  stream_id        INTEGER NOT NULL REFERENCES backtest.streams
-  slot_number      SMALLINT NOT NULL              -- 1, 2, ...
-  lot_sequence     INTEGER NOT NULL               -- 1st lot this slot ever had, 2nd, etc.
-  status           VARCHAR(10) NOT NULL           -- 'CASH' | 'OPEN' | 'CLOSED'
-  opening_capital  NUMERIC(12,2) NOT NULL         -- $ at start of this lot
-  btc_quantity     NUMERIC(20,8)                  -- null if CASH
-  entry_price      NUMERIC(12,2)                  -- null if CASH
-  high_water_mark  NUMERIC(12,2)                  -- trailing stop ceiling, updated while OPEN
-  exit_price       NUMERIC(12,2)                  -- null if CASH or OPEN
-  closing_capital  NUMERIC(12,2)                  -- null until CLOSED
-  realized_pnl     NUMERIC(12,2)
-  entry_reason     TEXT
-  exit_reason      TEXT
-  opened_at        TIMESTAMPTZ
-  closed_at        TIMESTAMPTZ
+Every unit of capital in a model test. Full trade-level record.
+
+```
+backtest.lots
+  lot_id            BIGSERIAL PRIMARY KEY
+  model_test_id     INTEGER NOT NULL REFERENCES backtest.model_tests
+  model_id          INTEGER NOT NULL REFERENCES backtest.models
+  stream_config_id  INTEGER NOT NULL REFERENCES backtest.stream_configs
+  slot_number       SMALLINT NOT NULL
+  lot_sequence      INTEGER NOT NULL        -- 1st lot this slot had, 2nd, etc.
+  status            VARCHAR(10) NOT NULL    -- 'CASH' | 'OPEN' | 'CLOSED'
+  opening_capital   NUMERIC(12,2) NOT NULL  -- compounds: closing_capital of previous lot
+  btc_quantity      NUMERIC(20,8)
+  entry_price       NUMERIC(12,2)
+  high_water_mark   NUMERIC(12,2)           -- trailing stop ceiling, updated while OPEN
+  exit_price        NUMERIC(12,2)
+  closing_capital   NUMERIC(12,2)
+  realized_pnl      NUMERIC(12,2)
+  entry_reason      TEXT
+  exit_reason       TEXT
+  opened_at         TIMESTAMPTZ
+  closed_at         TIMESTAMPTZ
 ```
 
-**Lot state machine:**
-```
-CASH → OPEN → CLOSED → (new CASH lot, opening_capital = previous closing_capital)
-```
-
-Each slot has an independent `high_water_mark` — trailing stops fire independently per lot.
-Capital compounds within the slot.
+State machine: `CASH → OPEN → CLOSED → (new CASH lot)`
+Each slot has its own `high_water_mark` — trailing stops fire independently per slot.
 
 ---
 
 ## live schema
 
-Real money. Real Kraken orders. Precious — never touched carelessly.
+Real money. Real Kraken orders. Never touched carelessly.
+Hosted on Supabase. Contains `live.*` + `public.market_data` (60 days) + `public.sentiment_data`.
 
-**Safety rule:** `reset_backtest.sql` explicitly excludes all `live.*` tables. Any live schema change requires a dedicated, explicitly reviewed migration — never casual DDL.
+The live schema is completely independent of the backtest schema.
+Backtest schema migrations do NOT affect live — always verify before touching `live.*`.
 
-**Hosted on:** Supabase (free PostgreSQL). Contains only `live.*` + `public.market_data` (60 days only) + `public.sentiment_data`. No backtest data.
+**Safety rule:** `reset_backtest.sql` explicitly excludes all `live.*` tables.
 
----
-
-### live.models
-
-One row per deployed model.
-
-```sql
-live.models
-  model_id       SERIAL PRIMARY KEY
-  model_version  INTEGER NOT NULL
-  description    TEXT
-  status         VARCHAR(20) NOT NULL DEFAULT 'active'   -- 'active' | 'stopped'
-  deployed_at    TIMESTAMPTZ DEFAULT NOW()
+```
+live.models      -- one row per deployed model
+live.streams     -- stream configs for the deployed model (copied from stream_configs at deploy time)
+live.lots        -- per-trade record; mirrors backtest.lots + adds Kraken order IDs + PENDING status
+live.executor_state   -- single-row last_run_at for stateless executor
+live.executor_runs    -- one row per executor tick (for Live Monitor dashboard)
+live.market_data_runs -- one row per market data fetch (for Live Monitor dashboard)
 ```
 
-### live.streams
-
-Stream configs for the deployed model. Copied from `backtest.streams` at deploy time.
-
-```sql
-live.streams
-  stream_id       SERIAL PRIMARY KEY
-  model_id        INTEGER NOT NULL REFERENCES live.models
-  stream_name     VARCHAR(100) NOT NULL
-  stream_version  VARCHAR(10) NOT NULL
-  strategy_type   VARCHAR(50) NOT NULL
-  parameters      JSONB NOT NULL
-  slot_count      SMALLINT NOT NULL DEFAULT 1
-  slot_mode       VARCHAR(30) NOT NULL DEFAULT 'single'
-  lot_size_usd    NUMERIC(10,2) NOT NULL
-```
-
-### live.lots
-
-Every unit of capital in the live system. Mirrors `backtest.lots` with Kraken order IDs added.
-
-```sql
-live.lots
-  lot_id             BIGSERIAL PRIMARY KEY
-  model_id           INTEGER NOT NULL REFERENCES live.models
-  stream_id          INTEGER NOT NULL REFERENCES live.streams
-  slot_number        SMALLINT NOT NULL
-  lot_sequence       INTEGER NOT NULL
-  status             VARCHAR(10) NOT NULL   -- 'CASH' | 'PENDING' | 'OPEN' | 'CLOSED'
-  opening_capital    NUMERIC(12,2) NOT NULL
-  btc_quantity       NUMERIC(20,8)
-  entry_price        NUMERIC(12,2)
-  high_water_mark    NUMERIC(12,2)
-  exit_price         NUMERIC(12,2)
-  closing_capital    NUMERIC(12,2)
-  realized_pnl       NUMERIC(12,2)
-  entry_reason       TEXT
-  exit_reason        TEXT
-  kraken_entry_txid  VARCHAR(100)         -- Kraken order ID for entry
-  kraken_exit_txid   VARCHAR(100)         -- Kraken order ID for exit
-  entry_expiry_at    TIMESTAMPTZ          -- when limit order auto-cancels if unfilled
-  opened_at          TIMESTAMPTZ
-  closed_at          TIMESTAMPTZ
-```
-
-**Lot state machine (live — extends backtest):**
-```
-CASH → PENDING → OPEN → CLOSED → (new CASH lot)
-```
-`PENDING` is the new live-only state: limit order placed but not yet filled. `entry_expiry_at` defines when it auto-cancels.
-
-### live.executor_state
-
-Single-row table tracking when the executor last ran. Replaces the in-memory `last_tick` variable — required because the GitHub Actions executor is stateless (single-invocation, not a persistent loop).
-
-```sql
-live.executor_state
-  id           INTEGER PRIMARY KEY DEFAULT 1
-  last_run_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
-```
-
-Always has exactly one row (id=1). Updated at the end of each executor tick.
+**live.lots adds vs backtest.lots:**
+- Status includes `PENDING` (limit order placed, not yet filled)
+- `entry_order_id`, `exit_order_id` — Kraken txid
+- `entry_expiry_at` — when pending limit order auto-cancels
 
 ---
 
 ## reporting schema
 
-Views that union backtest and live data for cross-environment comparison.
-Analytics only queries reporting — never backtest or live directly.
+Views only — never raw data. Analytics queries always go through reporting, never directly to backtest or live.
 
 ### reporting.all_lots (view)
-Unions `backtest.lots` and `live.lots` with a source tag. This is the only view currently built.
+Unions `backtest.lots` and `live.lots` with a `source` tag. Currently the only view built.
+
+Additional views (`model_performance`, `stream_performance`, `benchmark_comparison`) are designed but not yet built — will be added when there's enough live data to make them useful.
 
 ---
 
 ## Key Design Decisions
 
-- **`timeframe_presets` FK over free-text window names** — consistent window definitions across all test runs; `timeframe_label` is computed at query time via COALESCE
-- **`slot_mode` per stream** — slot 2 entry behavior is intentional and stream-specific, not accidental
-- **Two test levels** — `stream_tests` for individual stream tuning (summary only), `model_tests` + `lots` for full model validation (per-trade detail)
-- **Capital compounds within a slot** — opening_capital of each new lot = closing_capital of the previous one
-- **Parameters are snapshotted** — both `stream_tests.parameters` and `model_tests.configuration` store a full JSONB copy of the config at test time. Historical runs are never affected by later parameter changes
+| Decision | Rationale |
+|---|---|
+| Stream identity separated from config | Eliminates duplicate dropdown entries ("MR v1", "MR v2") — app shows "Momentum Rider" and you pick the config version separately |
+| `stream_config_id` is the dedup key | One result row per (config × timeframe) — re-running replaces, not duplicates |
+| Model composition in `model_streams` | Explicit record of which configs make up a model at what allocation — survives future schema changes |
+| Parameters snapshotted in both `stream_tests` and `stream_configs` | Historical tests always describe exactly what ran, even if the config is later updated |
+| Capital compounds within a slot | `closing_capital` of each lot becomes `opening_capital` of the next — each slot is a self-contained compounding pool |
+| `slot_mode` per stream config | Slot 2 behavior is strategy-specific — staggered for DH/BS, single for MR |
