@@ -1,8 +1,8 @@
 # Model 1
 
-**Status:** Locked — all 3 streams at v2, ready for deployment decision  
+**Status:** Deployed — live on Kraken since 2026  
 **Capital:** $100 (3 streams × $33.33/lot × 1 slot)  
-**Architecture:** 3 streams, single-slot baseline
+**Architecture:** 3 streams, single-slot
 
 ## Purpose
 
@@ -16,8 +16,8 @@ Three streams cover three distinct market regimes with zero signal overlap:
 
 | Stream | Type | Timeframe | Trail | Active In | stream_id |
 |---|---|---|---|---|---|
-| [Momentum Rider v2](../streams/momentum-rider-v1.md) | Trend-following | 4h | 7% | Bull market, EMA momentum | 1 |
-| [Dip Hunter v2](../streams/dip-hunter-v1.md) | Fear bounce | 1h | 10% | Extreme fear, F&G ≤ 20, 25%+ drawdown | 2 |
+| [Momentum Rider v2](../streams/momentum-rider-v2.md) | Trend-following | 4h | 7% | Bull market, EMA momentum | 1 |
+| [Dip Hunter v2](../streams/dip-hunter-v2.md) | Fear bounce | 1h | 10% | Extreme fear, F&G ≤ 20, 25%+ drawdown | 2 |
 | [Breakout Scout v2](../streams/breakout-scout-v2.md) | Consolidation breakout | 1h | 10% | Greedy sentiment, SMA 200 above, squeeze | 3 |
 
 Surge Rider v1 and Steady Climber v1 were considered during design but never built or tested. Model 1 does not need 5 streams — 3 well-differentiated streams beat 5 redundant ones.
@@ -35,7 +35,7 @@ Allocation tested: weighting MR heavier (up to $60/$25/$15) increases PV2 return
 
 ## Model-Level Backtest Results
 
-### Run #4 — MR v2 + DH v2 + BS v2 (current, locked)
+### Run #4 — MR v2 + DH v2 + BS v2 (locked, deployed)
 
 | Window | Period | Ann. Return | Trades | Max DD |
 |---|---|---|---|---|
@@ -54,13 +54,13 @@ Allocation tested: weighting MR heavier (up to $60/$25/$15) increases PV2 return
 | #3 | MR v2 + DH v2 + BS v1 | +11.9% | +17.0% | +9.6% | +16.4% |
 | **#4** | **MR v2 + DH v2 + BS v2** | **+15.3%** | **+22.2%** | **+14.7%** | **+16.4%** |
 
-Each stream upgrade contributed meaningfully. MR v2 was the largest single lift (+8.5% → baseline). DH v2 fixed the 2026 YTD (-6.6% → +16.4%). BS v2 lifted the floor across all windows and compressed model DD.
+Each stream upgrade contributed meaningfully. MR v2 was the largest single lift. DH v2 fixed 2026 YTD (-6.6% → +16.4%). BS v2 lifted the floor across all windows and compressed model-level drawdown.
 
 ## Individual Stream Results (locked configs, $10 lot × 1 slot)
 
 | Stream | Primary v2 | Full History | Recent | 2026 YTD |
 |---|---|---|---|---|
-| Momentum Rider v2 | +21.5% | +25.9% | +16.9% | — |
+| Momentum Rider v2 | +21.5% | +25.9% | +16.9% | — (0 trades) |
 | Dip Hunter v2 | +11.7% | +12.1% | +10.5% | +53.0% |
 | Breakout Scout v2 | +11.6% | +25.1% | +16.6% | 0 trades |
 
@@ -72,14 +72,14 @@ Each stream upgrade contributed meaningfully. MR v2 was the largest single lift 
 - Trailing stops only — no fixed targets
 - Long-only (no shorting)
 
-## Deployment Gate
+## Deployment Gate (completed)
 
 - [x] All 3 streams tuned and locked at v2
 - [x] Model-level backtest Run #4 complete across 5 windows
 - [x] Primary v2 annualized return +15.3% — beats S&P 500 target (10%)
 - [x] All windows positive
 - [x] Equal $33.33 allocation confirmed vs weighted alternatives
-- [ ] Deployment decision — pending
+- [x] Deployed live on Kraken
 
 ## Benchmarks
 
@@ -103,12 +103,3 @@ Since there are no prior models, there is no head-to-head comparison for Model 1
 ## Model Commitment Rule
 
 Once deployed, Model 1 runs for the full duration of its experiment regardless of performance. It stops only if capital is exhausted or there is a critical system failure. The long-term data is worth more than the $100.
-
-## Future Slot Design (pre-deployment)
-
-Current slot mode is `single` across all streams. A staggered-slot redesign is planned before deployment:
-- Two independent capital buckets per stream
-- Slot 2 cannot enter the same signal as Slot 1 — must wait for the next signal
-- Allows catching consecutive signals when one slot is already occupied
-- Best fit for DH (sequential fear dips) and BS (consecutive squeeze breakouts)
-- MR less likely to benefit (sustained trends don't repeat entry signals quickly)

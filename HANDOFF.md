@@ -9,52 +9,45 @@ This reminder must stay at the top of every handoff until confirmed complete.
 
 ## Current State
 
-**Model 1 is LIVE** — executor running, Breakout Scout v2 has an open position.
+**Model 1 is LIVE** — executor running, cron on schedule.
 
-**Architecture Redesign v3 is in progress on `feature/architecture-redesign-v3`.**
-Branch is clean and tested locally — ready for browser review before merge.
+**`feature/architecture-redesign-v3` merged to `main`** — v3 schema, engine, and app are live on main.
 
 ## Done This Session
 
-### Live Monitor — Progress Bars
-Added visual progress bars to Stream Status section (`src/app/pages/live_monitor.py`).
-Each condition now shows how close it is to firing — color coded green/yellow/red.
-Committed to `main`.
+### Architecture Redesign v3 — merged to main
 
-### Architecture Redesign v3 — `feature/architecture-redesign-v3`
+**Schema (local postgres):**
+- `backtest.streams` — identity only; `backtest.stream_configs` — versioned params; `backtest.model_streams` — composition join
+- `migration_v3.sql` NOT yet run on Supabase — only needed when Model 2 dev starts
 
-#### Schema
-- Snapshotted full `backtest` schema → `backtest_bak` (permanent)
-- Created `backtest.stream_configs` — versioned params per stream (v1, v2, v1r1, etc.)
-- Created `backtest.model_streams` — join table (model_id, stream_config_id, lot_size_usd)
-- Stripped `backtest.streams` to identity only (stream_name, strategy_type, description)
-- Added `stream_config_id` FK to `stream_tests` and `lots`
-- Added `status` + `deployed_at` to `backtest.models`
-- Migration run on local postgres — 3 streams, 8 configs, 3 model_stream rows, 39 tests all linked
-- Migration file: `src/data/migration_v3.sql` (run this on Supabase before Model 2 dev starts)
+**Engine:**
+- Staggered slot mode added (`_run_staggered_slots()` in `engine.py`)
+- Round-robin dispatch to longest-free slot, `slot_entry_gap_candles`, `slot_capital_weight`
 
-#### Engine
-- Added `slot_mode='staggered'` to `src/backtester/engine.py`
-- `_run_staggered_slots()`: round-robin dispatch to longest-free slot, `slot_entry_gap_candles` cooldown, `slot_capital_weight` for asymmetric sizing
-- Smoke tested: DH v2, 2 slots, [70,30] weight → 32 trades, 0 same-candle entries, Slot 1=$14 Slot 2=$6 ✓
+**App:**
+- `stream_tester.py`: full rewrite — stream name selector → config version selector → "Run All Presets" auto-save
+- `db.py`: new `load_streams()`, `load_stream_configs()`, updated `save_stream_test()` with upsert on (config, preset)
+- Pages renamed: `pages/1_model_tester.py`, `pages/2_live_monitor.py` (fixes page order)
+- Use `localhost:8502` (app.py instance with `layout="wide"`)
 
-#### App
-- `src/app/db.py`: new `load_streams()`, `load_stream_configs()`, updated `load_stream_history()` to join via `stream_config_id`, new `save_stream_test()` with upsert on (config, preset)
-- `src/app/stream_tester.py`: full rewrite — stream selector shows names only ("Dip Hunter" not "Dip Hunter v2"), second selector for config version, "Run All Presets" button auto-runs + saves all presets in-app, per-preset badges in sidebar, Slot Position as 5th Parameter Reference category
+**Docs fully updated:**
+- ADRs 001, 004, 005 updated (Coinbase data source, 3-5 streams, removed mandatory paper testing)
+- Stream specs: BS v1 deleted; DH v2 and MR v2 created with locked params; v1 specs marked superseded
+- `model-1.md`: correct links, deployed status, completed gate checklist
+- `validation-workflow.md`: rewritten — reflects two-phase flow (stream tuning → model assembly → deploy)
 
 ## Next Session
 
-1. **Open the stream tester in browser** — verify new selector flow, "Run All Presets" button, tab results display
-2. **Run All Presets for each config** — DH v1/v2, MR v1/v2, BS v1/v2 — populate the DB for all configs
-3. **Model tester light update** (optional) — add model composition view from `model_streams`
-4. **Merge `feature/architecture-redesign-v3` → main** once browser-verified
-5. **Start Model 2 stream design** — leverage staggered slots, focus on regime gaps Model 1 misses
+1. **Run All Presets for each config** in Stream Tester — populate DB for DH v1/v2, MR v1/v2, BS v1/v2
+2. **Start Model 2 stream design** — leverage staggered slots, focus on regime gaps Model 1 misses
+3. **Run Supabase migration** (`src/data/migration_v3.sql`) when Model 2 dev starts
 
 ## Branch State
 
-- `main` — stable, live monitor progress bars, executor running
+- `main` — current, v3 architecture merged
 - `live-model-1` — production, runs executor via GitHub Actions — DO NOT TOUCH
-- `feature/architecture-redesign-v3` — v3 schema + engine + app rewrites (current work)
+- No active feature branches
 
 ## Pending: Supabase Migration
 
@@ -80,10 +73,10 @@ Committed to `main`.
 
 ### Streams (Model 1)
 - **Momentum Rider v2** (stream_id=1) — 4h \| EMA 30/120 \| 7% trail \| $33.33
-- **Dip Hunter v2** (stream_id=2) — 1h \| fear_dip \| RSI≥35 \| 10% trail \| $33.33
+- **Dip Hunter v2** (stream_id=2) — 1h \| RSI recovery, F&G≤20, 25% drawdown, RSI≥35, 10% trail \| $33.33
 - **Breakout Scout v2** (stream_id=3) — 1h \| range_breakout \| SMA200 \| F&G≥55 \| 10% trail \| $33.33
 
-### v3 Schema (local postgres only as of 2026-07-05)
+### v3 Schema (local postgres; Supabase migration pending)
 | Table | What it holds |
 |---|---|
 | `backtest.streams` | Identity only — name, strategy_type |
