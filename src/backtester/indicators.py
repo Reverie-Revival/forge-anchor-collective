@@ -46,6 +46,14 @@ def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     return true_range.ewm(com=period - 1, adjust=False).mean()
 
 
+def macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9) -> pd.DataFrame:
+    macd_line = ema(series, fast) - ema(series, slow)
+    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
+    histogram = macd_line - signal_line
+    return pd.DataFrame({"macd": macd_line, "macd_signal": signal_line, "macd_hist": histogram},
+                        index=series.index)
+
+
 def volume_sma(series: pd.Series, period: int) -> pd.Series:
     return series.rolling(window=period).mean()
 
@@ -89,6 +97,12 @@ def add_indicators(df: pd.DataFrame, params: dict) -> pd.DataFrame:
         lookback = core_p.get("breakout_lookback", 48)
         df["breakout_high"] = rolling_high(df["high"], lookback).shift(1)
 
+    if core == "macd_crossover":
+        fast = core_p.get("macd_fast", 12)
+        slow = core_p.get("macd_slow", 26)
+        signal_p = core_p.get("macd_signal", 9)
+        df = df.join(macd(df["close"], fast, slow, signal_p))
+
     if core == "volume_surge":
         avg_period = core_p.get("volume_avg_period", 20)
         df["volume_avg"] = volume_sma(df["volume"], avg_period)
@@ -114,6 +128,10 @@ def add_indicators(df: pd.DataFrame, params: dict) -> pd.DataFrame:
 
     if vol_f.get("avg_period") and "volume_avg" not in df.columns:
         df["volume_avg"] = volume_sma(df["volume"], vol_f["avg_period"])
+
+    pos = params.get("position", {})
+    if pos.get("trailing_stop_atr_multiplier") and "atr" not in df.columns:
+        df["atr"] = atr(df, pos.get("trailing_stop_atr_period", 14))
 
     if atr_f.get("period"):
         df["atr"] = atr(df, atr_f["period"])

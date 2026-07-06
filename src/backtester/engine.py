@@ -90,7 +90,8 @@ def _run_slot(df: pd.DataFrame, signals: pd.Series, params: dict, slot: int,
               initial_capital: float = 10.0, fee: float = MAKER_FEE) -> list[dict]:
     """Simulate a single slot. Returns a list of closed trade dicts."""
     position = params.get("position", {})
-    trail_pct = position.get("trailing_stop_pct", 3.0) / 100.0
+    trail_pct = position.get("trailing_stop_pct")
+    trail_atr_mult = position.get("trailing_stop_atr_multiplier")
     expiry = position.get("entry_expiry_candles", 2)
     min_hold = position.get("min_hold_candles") or 0
     max_hold = position.get("max_hold_candles")
@@ -126,7 +127,11 @@ def _run_slot(df: pd.DataFrame, signals: pd.Series, params: dict, slot: int,
         if open_trade:
             open_trade["highest_close"] = max(open_trade["highest_close"], row["close"])
             open_trade["candles_held"] += 1
-            stop_price = open_trade["highest_close"] * (1 - trail_pct)
+            if trail_atr_mult and "atr" in row.index and not pd.isna(row["atr"]):
+                stop_price = open_trade["highest_close"] - trail_atr_mult * row["atr"]
+            else:
+                pct = (trail_pct or 3.0) / 100.0
+                stop_price = open_trade["highest_close"] * (1 - pct)
 
             # partial exit
             if partial and not open_trade["partial_done"]:

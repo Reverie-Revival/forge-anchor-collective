@@ -27,6 +27,7 @@ Every stream has exactly one core signal. This is what the stream fundamentally 
 | Signal | Description |
 |---|---|
 | `ema_crossover` | Short EMA crosses above long EMA |
+| `macd_crossover` | MACD line crosses above signal line — momentum confirmation entry |
 | `rsi_recovery` | RSI crosses *back up* through threshold after being oversold — enters the bounce, not the fall |
 | `rsi_dip` | RSI drops below threshold while price is below SMA — continuous oversold entry |
 | `fear_dip` | Price drops N% below SMA (or prev candle) — no RSI required |
@@ -43,6 +44,18 @@ New core signals can be added without changing the attribute system.
   "ema_long": 21
 }
 ```
+
+**MACD params:**
+```json
+"core_signal": "macd_crossover",
+"core_params": {
+  "macd_fast": 12,
+  "macd_slow": 26,
+  "macd_signal": 9,
+  "require_growing_hist": false
+}
+```
+`require_growing_hist`: if true, also requires the MACD histogram to be growing on the crossover candle (stricter confirmation).
 
 ---
 
@@ -140,7 +153,9 @@ Controls how entries are made and exits are managed.
 
 | Attribute | Description |
 |---|---|
-| `trailing_stop_pct` | Trail stop N% below highest close since entry — required |
+| `trailing_stop_pct` | Trail stop N% below highest close since entry. Use this or ATR stop — not both. |
+| `trailing_stop_atr_multiplier` | Trail stop N × ATR below highest close — volatility-adaptive. Widens in volatile markets, tightens in calm ones. Use with `trailing_stop_atr_period` (default 14). |
+| `trailing_stop_atr_period` | ATR lookback period used when `trailing_stop_atr_multiplier` is set (default 14) |
 | `entry_order_type` | `limit` only (per system constraint) |
 | `entry_expiry_candles` | Cancel unfilled entry after N candles |
 | `partial_exit` | Take X% off position at Y% gain, trail the rest — fully implemented, use freely |
@@ -155,6 +170,16 @@ Controls how entries are made and exits are managed.
   "partial_exit": { "at_gain_pct": 5.0, "exit_pct": 50 },
   "max_hold_candles": null,
   "min_hold_candles": 2
+}
+```
+
+ATR stop alternative:
+```json
+"position": {
+  "trailing_stop_atr_multiplier": 2.5,
+  "trailing_stop_atr_period": 14,
+  "entry_order_type": "limit",
+  "entry_expiry_candles": 2
 }
 ```
 
@@ -268,6 +293,8 @@ The complete structure every stream's `parameters` column should conform to:
   "time_filters": null,
   "position": {
     "trailing_stop_pct": 3.0,
+    "trailing_stop_atr_multiplier": null,
+    "trailing_stop_atr_period": 14,
     "entry_order_type": "limit",
     "entry_expiry_candles": 2,
     "partial_exit": null,

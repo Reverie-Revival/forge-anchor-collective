@@ -34,7 +34,13 @@ GLOSSARY = {
         "0–100 score of momentum. Below 30 = oversold. Above 70 = overbought. "
         "45–65 is the active momentum zone.",
     "ATR (Average True Range)":
-        "How much BTC moves per candle on average. High ATR = volatile. Low ATR = consolidating.",
+        "How much BTC moves per candle on average. High ATR = volatile. Low ATR = consolidating. "
+        "Used in two ways: as a regime filter (don't enter if ATR is too high) or as an "
+        "adaptive trailing stop (stop = peak − N × ATR, widens in volatile markets).",
+    "MACD (Moving Average Convergence Divergence)":
+        "Difference between a fast and slow EMA, smoothed into a signal line. "
+        "When the MACD line crosses above the signal line, short-term momentum is accelerating — "
+        "a later but more confirmed entry than an EMA crossover.",
     "Primary Timeframe":
         "Candle size for signal evaluation. 15m = most signals, most noise. "
         "1h = 4× less frequent, cleaner. Raw data is always 15m — resampling happens at run time.",
@@ -66,6 +72,9 @@ with st.expander("🔧 Parameter Reference"):
     signal_rows = [
         ("**ema_crossover**",  "EMA short crosses above EMA long",
          "`ema_short` (default 20), `ema_long` (default 50)"),
+        ("**macd_crossover**", "MACD line crosses above signal line — momentum confirmation",
+         "`macd_fast` (default 12), `macd_slow` (default 26), `macd_signal` (default 9), "
+         "`require_growing_hist` (bool, default false — also require histogram growing on crossover candle)"),
         ("**rsi_recovery**",   "RSI crosses back *up* through threshold — enters the bounce",
          "`rsi_threshold` (default 30), `rsi_period` (default 14), "
          "`require_bullish_candle` (bool, default false — also require close > prev close)"),
@@ -125,7 +134,10 @@ with st.expander("🔧 Parameter Reference"):
     st.markdown("---")
     st.markdown("#### Position / Exit")
     position_rows = [
-        ("**trailing_stop_pct**",    "% drop from peak since entry to trigger exit", "e.g. 7.5"),
+        ("**trailing_stop_pct**",    "% drop from peak since entry to trigger exit. Use this or ATR stop — not both.", "e.g. 7.5"),
+        ("**trailing_stop_atr_multiplier**", "ATR-adaptive stop: exit if price drops N × ATR below peak. "
+         "Widens in volatile markets, tightens in calm ones. "
+         "Pair with `trailing_stop_atr_period` (default 14).", "e.g. 2.5"),
         ("**min_hold_candles**",     "Stop cannot fire before this many candles — lets the trade develop",
          "e.g. 48 (= 48 hours on 1h timeframe)"),
         ("**max_hold_candles**",     "Force-exit after N candles regardless of P&L", "optional"),

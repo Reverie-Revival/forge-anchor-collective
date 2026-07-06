@@ -117,6 +117,17 @@ def generate_signals(df: pd.DataFrame, params: dict) -> pd.Series:
             crossed = (prev["ema_short"] <= prev["ema_long"]) and (row["ema_short"] > row["ema_long"])
             fired = crossed
 
+        elif core == "macd_crossover":
+            if pd.isna(row.get("macd")) or pd.isna(row.get("macd_signal")):
+                continue
+            if pd.isna(prev.get("macd")) or pd.isna(prev.get("macd_signal")):
+                continue
+            crossed = (prev["macd"] <= prev["macd_signal"]) and (row["macd"] > row["macd_signal"])
+            # optional: require histogram is positive and growing
+            if crossed and core_p.get("require_growing_hist", False):
+                crossed = row["macd_hist"] > prev["macd_hist"]
+            fired = crossed
+
         elif core == "rsi_dip":
             if pd.isna(row.get("rsi")) or pd.isna(row.get("sma_dip")):
                 continue

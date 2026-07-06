@@ -15,6 +15,13 @@ This reminder must stay at the top of every handoff until confirmed complete.
 
 ## Done This Session
 
+### New indicators + signals (2026-07-06)
+
+- **MACD** (`macd_crossover`) — new core signal; indicator + signal handler + docs
+- **ATR trailing stop** (`trailing_stop_atr_multiplier`) — adaptive stop alternative to fixed %; engine + indicators + docs
+- Stream-attributes.md and stream_tester.py Parameter Reference / Glossary fully updated
+- HANDOFF stale task removed (stream tests were already populated)
+
 ### Architecture Redesign v3 — merged to main
 
 **Schema (local postgres):**
@@ -39,9 +46,8 @@ This reminder must stay at the top of every handoff until confirmed complete.
 
 ## Next Session
 
-1. **Run All Presets for each config** in Stream Tester — populate DB for DH v1/v2, MR v1/v2, BS v1/v2
-2. **Start Model 2 stream design** — leverage staggered slots, focus on regime gaps Model 1 misses
-3. **Run Supabase migration** (`src/data/migration_v3.sql`) when Model 2 dev starts
+1. **Start Model 2 stream design** — leverage staggered slots, focus on regime gaps Model 1 misses
+2. **Run Supabase migration** (`src/data/migration_v3.sql`) when Model 2 dev starts
 
 ## Branch State
 
