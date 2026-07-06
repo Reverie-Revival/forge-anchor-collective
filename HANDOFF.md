@@ -1,4 +1,4 @@
-# Handoff — 2026-07-04 (end of session)
+# Handoff — 2026-07-05 (end of session)
 
 ---
 ## ⚠️ ACTION REQUIRED BY AUG 1, 2026 — ORACLE ACCOUNT
@@ -9,55 +9,58 @@ This reminder must stay at the top of every handoff until confirmed complete.
 
 ## Current State
 
-**Model 1 is LIVE with its first open trade.**
+**Model 1 is LIVE** — executor running, Breakout Scout v2 has an open position.
 
-- **Breakout Scout v2** entered at **$62,710.10** on 2026-07-03 21:00 UTC
-- lot_id=2, stream_id=3, 0.00053149 BTC
-- HWM = $62,710.10 (entry price — no run-up yet)
-- 10% trailing stop → stop triggers if price drops to ~$56,439
-- Position is OPEN in Supabase `live.lots`
-- **Note:** F&G was 21 at entry — filter (≥55) was silently passing due to stale sentiment data. Sentiment fix is deployed; filter is now enforced going forward.
+**Architecture Redesign v3 is in progress on `feature/architecture-redesign-v3`.**
+Branch is clean and tested locally — ready for browser review before merge.
 
 ## Done This Session
 
-### Critical Bug Fix — Fill Detection
-Kraken's `QueryOrders` silently returns `{}` for limit orders that fill immediately as taker trades. This caused the first live trade to be detected as expired and deleted (lots went empty despite a confirmed Kraken purchase). Fixed in `src/live/kraken_client.py`: `get_order_status()` now falls back to `TradesHistory` when `QueryOrders` returns empty. **Committed and pushed to live-model-1.**
+### Live Monitor — Progress Bars
+Added visual progress bars to Stream Status section (`src/app/pages/live_monitor.py`).
+Each condition now shows how close it is to firing — color coded green/yellow/red.
+Committed to `main`.
 
-### Lot Restoration
-Manually re-inserted lot_id=2 into `live.lots` with correct values from Kraken `TradesHistory` data (txid=OF6YSN-4RZAY-LLJMSQ). lot_id is 2 not 1 because PostgreSQL SERIAL doesn't reset on row deletion.
+### Architecture Redesign v3 — `feature/architecture-redesign-v3`
 
-### Sentiment Data Gap Fixed
-`sentiment_data` in Supabase was stale (last date: 2026-06-28). The F&G ≥ 55 filter in Breakout Scout was silently doing nothing live (NaN comparison always passes). Fixed:
-- Backfilled July 1–4 manually
-- `src/data/sentiment.py` now incremental — checks DB max date, fetches only missing days (was fetching full 2000-row history every time, causing timeouts)
-- Sentiment step added to `market_data.yml` GitHub Actions workflow — runs every 15 min, no-ops when already current, no separate cron-job.org job needed
+#### Schema
+- Snapshotted full `backtest` schema → `backtest_bak` (permanent)
+- Created `backtest.stream_configs` — versioned params per stream (v1, v2, v1r1, etc.)
+- Created `backtest.model_streams` — join table (model_id, stream_config_id, lot_size_usd)
+- Stripped `backtest.streams` to identity only (stream_name, strategy_type, description)
+- Added `stream_config_id` FK to `stream_tests` and `lots`
+- Added `status` + `deployed_at` to `backtest.models`
+- Migration run on local postgres — 3 streams, 8 configs, 3 model_stream rows, 39 tests all linked
+- Migration file: `src/data/migration_v3.sql` (run this on Supabase before Model 2 dev starts)
 
-### Run Logging (from earlier in session)
-`executor.py` and `market_data_updater.py` now write one row per run to `live.executor_runs` and `live.market_data_runs`. 90-day retention enforced inline. Tables exist in Supabase and local postgres.
+#### Engine
+- Added `slot_mode='staggered'` to `src/backtester/engine.py`
+- `_run_staggered_slots()`: round-robin dispatch to longest-free slot, `slot_entry_gap_candles` cooldown, `slot_capital_weight` for asymmetric sizing
+- Smoke tested: DH v2, 2 slots, [70,30] weight → 32 trades, 0 same-candle entries, Slot 1=$14 Slot 2=$6 ✓
 
-### Live Monitor Dashboard
-Built `src/app/pages/live_monitor.py` on `feature/live-monitor` branch. Shows system status, open positions, executor/market_data run logs, closed trades. Registered in app.py nav. **Not yet merged to main — next session.**
+#### App
+- `src/app/db.py`: new `load_streams()`, `load_stream_configs()`, updated `load_stream_history()` to join via `stream_config_id`, new `save_stream_test()` with upsert on (config, preset)
+- `src/app/stream_tester.py`: full rewrite — stream selector shows names only ("Dip Hunter" not "Dip Hunter v2"), second selector for config version, "Run All Presets" button auto-runs + saves all presets in-app, per-preset badges in sidebar, Slot Position as 5th Parameter Reference category
 
-### Branch Cleanup
-Branches diverged badly during the session (feature work landed on live-model-1). Resolved: merged both directions, all conflicts resolved cleanly. As of session end:
-- `live-model-1` and `main` are in sync (main is one merge-commit ahead)
-- `feature/live-monitor` has the dashboard, one commit ahead of main
+## Next Session
 
-**Hard rule established going forward:** `live-model-1` is production. Only critical bug fixes go there. All other work on feature branches off `main`.
+1. **Open the stream tester in browser** — verify new selector flow, "Run All Presets" button, tab results display
+2. **Run All Presets for each config** — DH v1/v2, MR v1/v2, BS v1/v2 — populate the DB for all configs
+3. **Model tester light update** (optional) — add model composition view from `model_streams`
+4. **Merge `feature/architecture-redesign-v3` → main** once browser-verified
+5. **Start Model 2 stream design** — leverage staggered slots, focus on regime gaps Model 1 misses
 
-### Local DB Sync
-Synced local postgres market_data to match Supabase (568 candles upserted). `DATABASE_URL` added explicitly to `.env`.
+## Branch State
 
-## Next Session — In Order
+- `main` — stable, live monitor progress bars, executor running
+- `live-model-1` — production, runs executor via GitHub Actions — DO NOT TOUCH
+- `feature/architecture-redesign-v3` — v3 schema + engine + app rewrites (current work)
 
-1. **Review live-model-1** — confirm F&G fix is in place; verify open Breakout Scout position is being tracked correctly
-2. **Set up session-start local sync habit** — run `python -m src.data.downloader` + `python -m src.data.sentiment` at the start of every session
-3. **Reporting dashboard** — deferred until there are closed trades to verify with
+## Pending: Supabase Migration
 
-## Open Questions
-
-- Is the F&G ≥ 55 filter working correctly now that sentiment data is current? (Next signal from BS will be the real test)
-- When to start Model 2 build? (Suggested: after Model 1 has a few weeks of clean live data)
+`src/data/migration_v3.sql` has NOT been run on Supabase yet. Only needed when:
+- Model 2 development starts and needs the stream_configs / model_streams tables
+- No urgency — live executor uses `live.*` schema only, not `backtest.*`
 
 ---
 
@@ -75,10 +78,19 @@ Synced local postgres market_data to match Supabase (568 candles upserted). `DAT
 | `executor.yml` | Every 30 min | Runs `src.live.executor` tick |
 | `market_data.yml` | Every 15 min | Fetches candles + updates sentiment (incremental) |
 
-### Streams
+### Streams (Model 1)
 - **Momentum Rider v2** (stream_id=1) — 4h \| EMA 30/120 \| 7% trail \| $33.33
 - **Dip Hunter v2** (stream_id=2) — 1h \| fear_dip \| RSI≥35 \| 10% trail \| $33.33
 - **Breakout Scout v2** (stream_id=3) — 1h \| range_breakout \| SMA200 \| F&G≥55 \| 10% trail \| $33.33
+
+### v3 Schema (local postgres only as of 2026-07-05)
+| Table | What it holds |
+|---|---|
+| `backtest.streams` | Identity only — name, strategy_type |
+| `backtest.stream_configs` | Versioned params (v1/v2/etc.) + slot config |
+| `backtest.model_streams` | Model composition: which config at what lot_size |
+| `backtest.stream_tests` | Test results, dedup on (stream_config_id, preset_id) |
+| `backtest_bak.*` | Pre-v3 snapshot, permanent |
 
 ### Known Bugs Fixed (lifetime)
 | File | Bug | Fix |
