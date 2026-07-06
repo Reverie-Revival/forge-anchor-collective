@@ -125,6 +125,29 @@ def render_dashboard(payload: dict, show_save: bool = False, key_prefix: str = "
     s6.metric("Avg Loser",
               f"{metrics['avg_loser_pct']:.1f}%" if metrics["avg_loser_pct"] else "—")
 
+    # Risk-adjusted + MAE/MFE
+    st.markdown('<p class="section-label" style="margin-top:16px;">Risk Metrics</p>',
+                unsafe_allow_html=True)
+    r1, r2, r3, r4, r5, r6 = st.columns(6)
+    sharpe  = metrics.get("sharpe_ratio")
+    sortino = metrics.get("sortino_ratio")
+    calmar  = metrics.get("calmar_ratio")
+    avg_mae = metrics.get("avg_mae_pct")
+    avg_mfe = metrics.get("avg_mfe_pct")
+    max_cl  = metrics.get("max_consec_losses")
+    r1.metric("Sharpe Ratio",  f"{sharpe:.2f}"  if sharpe  is not None else "—",
+              help="Risk-adjusted return per unit of volatility (higher = better)")
+    r2.metric("Sortino Ratio", f"{sortino:.2f}" if sortino is not None else "—",
+              help="Like Sharpe but only penalises downside volatility")
+    r3.metric("Calmar Ratio",  f"{calmar:.2f}"  if calmar  is not None else "—",
+              help="Annualised return ÷ max drawdown (higher = better)")
+    r4.metric("Avg MAE",  f"{avg_mae:.1f}%" if avg_mae is not None else "—",
+              help="Avg Max Adverse Excursion — how far trades moved against you before closing")
+    r5.metric("Avg MFE",  f"{avg_mfe:.1f}%" if avg_mfe is not None else "—",
+              help="Avg Max Favorable Excursion — how far trades moved in your favour before closing")
+    r6.metric("Max Consec. Losses", str(max_cl) if max_cl is not None else "—",
+              help="Longest consecutive losing streak")
+
     # Equity curve
     equity     = initial_capital + closed["pnl"].cumsum()
     peak_val   = equity.max()

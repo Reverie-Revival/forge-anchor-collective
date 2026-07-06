@@ -140,9 +140,53 @@ def load_run_payload(test_id: int):
         return None
     try:
         with open(path, "rb") as f:
-            return pickle.load(f)
+            payload = pickle.load(f)
     except Exception:
         return None
+
+    # Old-format pkls (pre-v3) are the result dict itself — no wrapper keys.
+    # Normalize so render_dashboard always gets a consistent structure.
+    if "result" not in payload and "df" in payload:
+        from src.backtester.metrics import compute_metrics, btc_buy_and_hold
+        df      = payload["df"]
+        trades  = payload["trades"]
+        initial = 10.0
+        result  = {k: payload[k] for k in ("stream_name", "params", "df", "signals",
+                                            "trades", "start", "end", "slot_count", "slot_mode")
+                   if k in payload}
+        metrics = compute_metrics(trades, initial, payload.get("start"), payload.get("end"))
+        bh      = btc_buy_and_hold(df, initial)
+        payload = {
+            "stream_name":      payload.get("stream_name", ""),
+            "params":           payload.get("params", {}),
+            "result":           result,
+            "trades":           trades,
+            "df":               df,
+            "metrics":          metrics,
+            "bh":               bh,
+            "initial_capital":  initial,
+            "ending_balance":   initial + (metrics.get("total_pnl") or 0),
+            "slot_count":       payload.get("slot_count", 1),
+            "slot_mode":        payload.get("slot_mode", "single"),
+            "lot_size_usd":     initial,
+        }
+
+    # Heal 'unnamed' stream_name from DB if possible
+    if payload.get("stream_name") in (None, "", "unnamed"):
+        try:
+            with get_engine().connect() as conn:
+                row = conn.execute(
+                    text("SELECT stream_name FROM backtest.stream_tests WHERE test_id = :tid"),
+                    {"tid": test_id}
+                ).fetchone()
+            if row:
+                payload["stream_name"] = row[0]
+                if isinstance(payload.get("result"), dict):
+                    payload["result"]["stream_name"] = row[0]
+        except Exception:
+            pass
+
+    return payload
 
 
 @st.cache_data(ttl=60)

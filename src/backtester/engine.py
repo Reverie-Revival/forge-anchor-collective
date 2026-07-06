@@ -93,6 +93,8 @@ def _run_slot(df: pd.DataFrame, signals: pd.Series, params: dict, slot: int,
     trail_pct = position.get("trailing_stop_pct")
     trail_atr_mult = position.get("trailing_stop_atr_multiplier")
     stop_loss_pct = position.get("stop_loss_pct")
+    take_profit_pct = position.get("take_profit_pct")
+    trail_tighten = position.get("trail_step_tighten")  # {at_gain_pct, tighten_to_pct}
     expiry = position.get("entry_expiry_candles", 2)
     min_hold = position.get("min_hold_candles") or 0
     max_hold = position.get("max_hold_candles")
@@ -112,6 +114,8 @@ def _run_slot(df: pd.DataFrame, signals: pd.Series, params: dict, slot: int,
                     "entry_ts": ts,
                     "entry_price": limit_price,
                     "highest_close": limit_price,
+                    "lowest_low": limit_price,
+                    "highest_high": limit_price,
                     "candles_held": 0,
                     "partial_done": False,
                     "capital": entry_capital,
@@ -127,18 +131,29 @@ def _run_slot(df: pd.DataFrame, signals: pd.Series, params: dict, slot: int,
         # --- manage open trade ---
         if open_trade:
             open_trade["highest_close"] = max(open_trade["highest_close"], row["close"])
+            open_trade["lowest_low"]    = min(open_trade["lowest_low"],    row["low"])
+            open_trade["highest_high"]  = max(open_trade["highest_high"],  row["high"])
             open_trade["candles_held"] += 1
+
+            # Step-tighten: upgrade trail once trade reaches threshold gain
+            current_gain_pct = (open_trade["highest_close"] - open_trade["entry_price"]) / open_trade["entry_price"] * 100
+            if trail_tighten and not open_trade.get("trail_tightened") and current_gain_pct >= trail_tighten["at_gain_pct"]:
+                open_trade["trail_tightened"] = True
+            effective_trail = (trail_tighten["tighten_to_pct"] if open_trade.get("trail_tightened") and trail_tighten else trail_pct)
 
             # Trailing stop (from peak)
             if trail_atr_mult and "atr" in row.index and not pd.isna(row["atr"]):
                 trail_stop = open_trade["highest_close"] - trail_atr_mult * row["atr"]
-            elif trail_pct:
-                trail_stop = open_trade["highest_close"] * (1 - trail_pct / 100.0)
+            elif effective_trail:
+                trail_stop = open_trade["highest_close"] * (1 - effective_trail / 100.0)
             else:
                 trail_stop = None
 
             # Hard stop loss (from entry — never moves)
             hard_stop = open_trade["entry_price"] * (1 - stop_loss_pct / 100.0) if stop_loss_pct else None
+
+            # Take profit ceiling (from entry — exits when high touches target)
+            take_profit_price = open_trade["entry_price"] * (1 + take_profit_pct / 100.0) if take_profit_pct else None
 
             # Use the more protective (higher) of the two active stops
             candidates = [s for s in [trail_stop, hard_stop] if s is not None]
@@ -173,6 +188,9 @@ def _run_slot(df: pd.DataFrame, signals: pd.Series, params: dict, slot: int,
                 if max_hold and open_trade["candles_held"] >= max_hold:
                     exit_price = row["close"]
                     exit_reason = "max_hold"
+                elif take_profit_price and row["high"] >= take_profit_price:
+                    exit_price = take_profit_price
+                    exit_reason = "take_profit"
                 elif row["low"] <= stop_price:
                     exit_price = stop_price
                     # distinguish which stop fired
@@ -183,17 +201,20 @@ def _run_slot(df: pd.DataFrame, signals: pd.Series, params: dict, slot: int,
 
                 if exit_price:
                     gain = (exit_price - open_trade["entry_price"]) / open_trade["entry_price"]
-                    pnl = open_trade["capital"] * gain - open_trade["capital"] * fee * 2
+                    pnl  = open_trade["capital"] * gain - open_trade["capital"] * fee * 2
+                    ep   = open_trade["entry_price"]
                     trades.append({
-                        "slot": slot,
-                        "entry_ts": open_trade["entry_ts"],
-                        "exit_ts": ts,
-                        "entry_price": open_trade["entry_price"],
-                        "exit_price": exit_price,
-                        "capital": open_trade["capital"],
-                        "pnl": pnl,
-                        "exit_reason": exit_reason,
+                        "slot":         slot,
+                        "entry_ts":     open_trade["entry_ts"],
+                        "exit_ts":      ts,
+                        "entry_price":  ep,
+                        "exit_price":   exit_price,
+                        "capital":      open_trade["capital"],
+                        "pnl":          pnl,
+                        "exit_reason":  exit_reason,
                         "candles_held": open_trade["candles_held"],
+                        "mae_pct":      (ep - open_trade["lowest_low"])  / ep * 100,
+                        "mfe_pct":      (open_trade["highest_high"] - ep) / ep * 100,
                     })
                     open_trade = None
                     slot_capital += pnl
@@ -207,17 +228,20 @@ def _run_slot(df: pd.DataFrame, signals: pd.Series, params: dict, slot: int,
     if open_trade:
         last_row = df.iloc[-1]
         gain = (last_row["close"] - open_trade["entry_price"]) / open_trade["entry_price"]
-        pnl = open_trade["capital"] * gain - open_trade["capital"] * MAKER_FEE * 2
+        pnl  = open_trade["capital"] * gain - open_trade["capital"] * MAKER_FEE * 2
+        ep   = open_trade["entry_price"]
         trades.append({
-            "slot": slot,
-            "entry_ts": open_trade["entry_ts"],
-            "exit_ts": df.index[-1],
-            "entry_price": open_trade["entry_price"],
-            "exit_price": last_row["close"],
-            "capital": open_trade["capital"],
-            "pnl": pnl,
-            "exit_reason": "end_of_data",
+            "slot":         slot,
+            "entry_ts":     open_trade["entry_ts"],
+            "exit_ts":      df.index[-1],
+            "entry_price":  ep,
+            "exit_price":   last_row["close"],
+            "capital":      open_trade["capital"],
+            "pnl":          pnl,
+            "exit_reason":  "end_of_data",
             "candles_held": open_trade["candles_held"],
+            "mae_pct":      (ep - open_trade["lowest_low"])  / ep * 100,
+            "mfe_pct":      (open_trade["highest_high"] - ep) / ep * 100,
         })
 
     return trades
@@ -309,7 +333,9 @@ def _run_staggered_slots(
 
     all_trades = []
     position    = params.get("position", {})
-    trail_pct   = position.get("trailing_stop_pct", 3.0) / 100.0
+    trail_pct   = position.get("trailing_stop_pct")
+    trail_atr_mult = position.get("trailing_stop_atr_multiplier")
+    stop_loss_pct = position.get("stop_loss_pct")
     expiry      = position.get("entry_expiry_candles", 2)
     min_hold    = position.get("min_hold_candles") or 0
     max_hold    = position.get("max_hold_candles")
@@ -324,8 +350,8 @@ def _run_staggered_slots(
                 if row["low"] <= lp <= row["high"]:
                     slot["open_trade"] = {
                         "entry_ts": ts, "entry_price": lp,
-                        "highest_close": lp, "candles_held": 0,
-                        "partial_done": False, "capital": cap,
+                        "highest_close": lp, "lowest_low": lp, "highest_high": lp,
+                        "candles_held": 0, "partial_done": False, "capital": cap,
                     }
                     slot["pending_entry"] = None
                 else:
@@ -340,8 +366,20 @@ def _run_staggered_slots(
             if slot["open_trade"]:
                 t = slot["open_trade"]
                 t["highest_close"] = max(t["highest_close"], row["close"])
+                t["lowest_low"]    = min(t["lowest_low"],    row["low"])
+                t["highest_high"]  = max(t["highest_high"],  row["high"])
                 t["candles_held"] += 1
-                stop_price = t["highest_close"] * (1 - trail_pct)
+
+                if trail_atr_mult and "atr" in row.index and not pd.isna(row["atr"]):
+                    trail_stop = t["highest_close"] - trail_atr_mult * row["atr"]
+                elif trail_pct:
+                    trail_stop = t["highest_close"] * (1 - trail_pct / 100.0)
+                else:
+                    trail_stop = None
+
+                hard_stop = t["entry_price"] * (1 - stop_loss_pct / 100.0) if stop_loss_pct else None
+                candidates = [s for s in [trail_stop, hard_stop] if s is not None]
+                stop_price = max(candidates) if candidates else t["highest_close"] * 0.97
 
                 if partial_conf and not t["partial_done"]:
                     gain = (row["close"] - t["entry_price"]) / t["entry_price"]
@@ -364,17 +402,24 @@ def _run_staggered_slots(
                     if max_hold and t["candles_held"] >= max_hold:
                         exit_price, exit_reason = row["close"], "max_hold"
                     elif row["low"] <= stop_price:
-                        exit_price, exit_reason = stop_price, "trailing_stop"
+                        exit_price = stop_price
+                        if hard_stop and stop_price <= hard_stop:
+                            exit_reason = "stop_loss"
+                        else:
+                            exit_reason = "trailing_stop"
 
                     if exit_price:
                         gain = (exit_price - t["entry_price"]) / t["entry_price"]
                         pnl  = t["capital"] * gain - t["capital"] * fee * 2
+                        ep   = t["entry_price"]
                         all_trades.append({
                             "slot": slot["slot_number"], "entry_ts": t["entry_ts"],
-                            "exit_ts": ts, "entry_price": t["entry_price"],
+                            "exit_ts": ts, "entry_price": ep,
                             "exit_price": exit_price, "capital": t["capital"],
                             "pnl": pnl, "exit_reason": exit_reason,
                             "candles_held": t["candles_held"],
+                            "mae_pct": (ep - t["lowest_low"])  / ep * 100,
+                            "mfe_pct": (t["highest_high"] - ep) / ep * 100,
                         })
                         slot["capital"] += pnl
                         slot["open_trade"] = None
