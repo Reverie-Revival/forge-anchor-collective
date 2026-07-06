@@ -17,7 +17,7 @@ from src.app.db import (
 )
 from src.app.dashboard import render_dashboard
 from src.backtester.engine import run_backtest
-from src.backtester.metrics import compute_metrics
+from src.backtester.metrics import compute_metrics, btc_buy_and_hold
 
 st.title("⚓ Forge Anchor — Stream Tester")
 
@@ -295,21 +295,36 @@ with st.sidebar:
 # ── Run All Presets ──────────────────────────────────────────────────────────
 
 def _run_and_save(cfg: dict, preset: dict, initial_capital: float = 20.0) -> dict:
-    """Run one backtest for a stream config + preset and save it. Returns the payload."""
+    """Run one backtest for a stream config + preset, save to DB, return the payload."""
     p = cfg["params"]
     result = run_backtest(
-        params     = p,
-        start      = str(preset["start_date"]),
-        end        = str(preset["end_date"]) if preset.get("end_date") else None,
-        slot_count = cfg["slot_count"],
-        slot_mode  = cfg["slot_mode"],
-        stream_name= cfg["stream_name"],
+        params       = p,
+        start        = str(preset["start_date"]),
+        end          = str(preset["end_date"]) if preset.get("end_date") else None,
+        slot_count   = cfg["slot_count"],
+        slot_mode    = cfg["slot_mode"],
+        stream_name  = cfg["stream_name"],
         lot_size_usd = initial_capital,
     )
     metrics = compute_metrics(result["trades"], initial_capital, result["start"], result["end"])
     ending  = initial_capital + (metrics["total_pnl"] or 0)
-    payload = {**result, "initial_capital": initial_capital,
-               "stream_config_id": cfg["stream_config_id"]}
+    bh      = btc_buy_and_hold(result["df"], initial_capital)
+
+    payload = {
+        "stream_name":      cfg["stream_name"],
+        "stream_config_id": cfg["stream_config_id"],
+        "params":           p,
+        "result":           result,
+        "trades":           result["trades"],
+        "df":               result["df"],
+        "metrics":          metrics,
+        "bh":               bh,
+        "initial_capital":  initial_capital,
+        "ending_balance":   ending,
+        "slot_count":       cfg["slot_count"],
+        "slot_mode":        cfg["slot_mode"],
+        "lot_size_usd":     initial_capital,
+    }
     save_stream_test(
         stream_config_id = cfg["stream_config_id"],
         params           = p,
