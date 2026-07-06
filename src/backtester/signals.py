@@ -60,6 +60,15 @@ def _check_filters(row: pd.Series, prev_row: pd.Series, params: dict) -> bool:
         if row["drawdown_from_high_pct"] > -(dfh_f.get("min_drop_pct", 15.0)):
             return False
 
+    adx_f = filters.get("adx") or {}
+    if adx_f:
+        if "adx" not in row.index or pd.isna(row["adx"]):
+            return False
+        if adx_f.get("min") is not None and row["adx"] < adx_f["min"]:
+            return False
+        if adx_f.get("max") is not None and row["adx"] > adx_f["max"]:
+            return False
+
     bb_f = filters.get("bollinger") or {}
     if bb_f:
         if "bb_bandwidth" not in row.index or pd.isna(row["bb_bandwidth"]):

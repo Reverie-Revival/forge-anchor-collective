@@ -11,14 +11,26 @@ from .db import load_model_history, load_timeframe_presets, save_model_test
 
 # Stream colors — consistent across all charts
 STREAM_COLORS = {
-    "Momentum Rider v1": "#4ade80",   # green        — bull trending
-    "Momentum Rider v2": "#22c55e",   # green deeper — MR upgraded
-    "Dip Hunter v1":     "#f59e0b",   # amber        — bear recovery
-    "Dip Hunter v2":     "#f97316",   # orange       — DH upgraded
-    "Breakout Scout v1": "#60a5fa",   # blue         — breakout
-    "Breakout Scout v2": "#a78bfa",   # violet       — BS upgraded
+    # Momentum Rider — greens
+    "Momentum Rider v1":   "#4ade80",
+    "Momentum Rider v1r1": "#4ade80",
+    "Momentum Rider v1r2": "#4ade80",
+    "Momentum Rider v1r3": "#4ade80",
+    "Momentum Rider v2":   "#22c55e",
+    "Momentum Rider v3":   "#16a34a",
+    # Dip Hunter — ambers/oranges
+    "Dip Hunter v1":       "#f59e0b",
+    "Dip Hunter v2":       "#f97316",
+    "Dip Hunter v3":       "#ea580c",
+    # Breakout Scout — blues/violets
+    "Breakout Scout v1":   "#60a5fa",
+    "Breakout Scout v2":   "#a78bfa",
+    "Breakout Scout v3":   "#818cf8",
+    # Volume Raider — pinks/roses
+    "Volume Raider v1":    "#f472b6",
+    "Volume Raider v2":    "#ec4899",
 }
-DEFAULT_COLORS = ["#a78bfa", "#f472b6", "#34d399"]
+DEFAULT_COLORS = ["#94a3b8", "#fb923c", "#34d399", "#e879f9"]
 
 
 def _stream_color(name: str, idx: int = 0) -> str:

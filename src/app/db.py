@@ -171,6 +171,22 @@ def load_run_payload(test_id: int):
             "lot_size_usd":     initial,
         }
 
+    # Patch old pkls missing new metric keys — recompute on the fly from stored trades
+    if "metrics" in payload and "sharpe_ratio" not in payload["metrics"]:
+        from src.backtester.metrics import compute_metrics as _cm
+        trades = payload.get("trades")
+        if trades is not None and not trades.empty:
+            result = payload.get("result", {})
+            fresh = _cm(
+                trades,
+                payload.get("initial_capital", 10.0),
+                result.get("start"),
+                result.get("end"),
+            )
+            for _k in ("sharpe_ratio", "sortino_ratio", "calmar_ratio",
+                       "avg_mae_pct", "avg_mfe_pct", "max_consec_losses"):
+                payload["metrics"][_k] = fresh.get(_k)
+
     # Heal 'unnamed' stream_name from DB if possible
     if payload.get("stream_name") in (None, "", "unnamed"):
         try:
@@ -436,11 +452,25 @@ def load_last_model_run():
 
 
 @st.cache_data(ttl=60)
-def load_model_history() -> pd.DataFrame:
+def load_models() -> list:
+    """Return all model versions from backtest.models."""
+    try:
+        with get_engine().connect() as conn:
+            rows = conn.execute(text(
+                "SELECT model_id, model_version, description FROM backtest.models ORDER BY model_id"
+            )).fetchall()
+        return [{"model_id": r[0], "model_version": r[1], "description": r[2]} for r in rows]
+    except Exception:
+        return []
+
+
+def load_model_history(model_id: int = None) -> pd.DataFrame:
     try:
         engine = get_engine()
+        where  = "WHERE mt.model_id = :mid" if model_id is not None else ""
+        params = {"mid": model_id} if model_id is not None else {}
         with engine.connect() as conn:
-            return pd.read_sql(text("""
+            return pd.read_sql(text(f"""
                 SELECT
                     mt.model_test_id, mt.model_id, mt.run_type, mt.run_number,
                     mt.preset_id, mt.custom_start, mt.custom_end,
@@ -457,8 +487,9 @@ def load_model_history() -> pd.DataFrame:
                     ) AS timeframe_label
                 FROM backtest.model_tests mt
                 LEFT JOIN timeframe_presets tp ON mt.preset_id = tp.preset_id
+                {where}
                 ORDER BY mt.run_number ASC, mt.created_at ASC
-            """), conn)
+            """), conn, params=params)
     except Exception:
         return pd.DataFrame()
 

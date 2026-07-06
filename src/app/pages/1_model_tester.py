@@ -9,13 +9,14 @@ import pandas as pd
 from src.app.utils import grade_info, label_window, _compact_config
 from src.app.db import (
     MODEL_LAST_RUN_PATH, MODEL_RUNS_DIR,
-    load_model_history, load_locked_streams_full,
+    load_models, load_model_history, load_locked_streams_full,
     load_pending_model_runs, load_last_model_run,
     next_model_run_number, load_model_run_payload,
     _pending_model_for_hash, _alloc_hash,
 )
 from src.app.model_dashboard import render_model_dashboard, STREAM_COLORS
 
+st.set_page_config(layout="wide")
 st.title("⚓ Forge Anchor — Model Tester")
 
 # ── Glossary ──────────────────────────────────────────────────────────────────
@@ -85,27 +86,37 @@ with st.expander("🔒 Stream Reference — locked configs used in this model"):
                 with st.expander("Full config"):
                     st.caption(_compact_config(p))
 
-# ── Load data ─────────────────────────────────────────────────────────────────
-
-history = load_model_history()
-
-run_groups = {}
-if not history.empty:
-    for _, row in history.iterrows():
-        rnum = int(row["run_number"]) if pd.notna(row.get("run_number")) else 0
-        run_groups.setdefault(rnum, []).append(row)
-
 # ── Sidebar ────────────────────────────────────────────────────────────────────
 
 with st.sidebar:
     st.header("Model Tester")
-    st.caption("Triggered from Claude Code · Save to record here")
 
-    st.markdown('<p class="config-group-header" style="margin-top:14px;">Test Run</p>',
+    all_models = load_models()
+    model_options = {m["model_id"]: f"Model {m['model_version']}" for m in all_models}
+    selected_model_id = st.selectbox(
+        "Model",
+        options=list(model_options.keys()),
+        format_func=lambda mid: model_options[mid],
+        index=len(model_options) - 1,
+    )
+    selected_model_version = model_options.get(selected_model_id, "Model ?")
+
+    st.markdown('<p class="config-group-header" style="margin-top:4px;">Test Run</p>',
                 unsafe_allow_html=True)
+
+    history = load_model_history(model_id=selected_model_id)
+    run_groups = {}
+    if not history.empty:
+        for _, row in history.iterrows():
+            rnum = int(row["run_number"]) if pd.notna(row.get("run_number")) else 0
+            run_groups.setdefault(rnum, []).append(row)
 
     run_options = []
     run_labels  = {}
+
+    def _abbrev(name):
+        parts = name.split()
+        return f"{''.join(w[0] for w in parts[:-1])} {parts[-1]}"
 
     for rnum in sorted(run_groups.keys()):
         rows = run_groups[rnum]
@@ -113,17 +124,11 @@ with st.sidebar:
             (r["annualized_return_pct"] for r in rows if pd.notna(r["annualized_return_pct"])),
             default=None,
         )
-        # Build a short stream-version tag from the alloc config (e.g. "MR v2 · DH v1 · BS v1")
         try:
             cfg = rows[0]["configuration"]
             if isinstance(cfg, str):
                 cfg = json.loads(cfg)
             alloc_keys = list(cfg.get("allocations", {}).keys())
-            def _abbrev(name):
-                parts = name.split()
-                # e.g. "Momentum Rider v2" → "MR v2", "Dip Hunter v1" → "DH v1"
-                initials = "".join(w[0] for w in parts[:-1])
-                return f"{initials} {parts[-1]}"
             stream_tag = " · ".join(_abbrev(k) for k in alloc_keys)
         except Exception:
             stream_tag = ""
@@ -196,7 +201,7 @@ with st.sidebar:
             alloc = {}
 
         total_cap = rows[0].get("total_capital")
-        st.markdown(f"**Model 1  ·  {len(alloc)} streams**")
+        st.markdown(f"**{selected_model_version}  ·  {len(alloc)} streams**")
         if total_cap and pd.notna(total_cap):
             st.caption(f"Total capital: ${total_cap:.0f}")
 
@@ -217,7 +222,6 @@ with st.sidebar:
         for row in rows:
             win = row.get("timeframe_label") or label_window(row["simulation_start"], row["simulation_end"])
             ann = row["annualized_return_pct"]
-            pf  = row.get("profit_factor")
             _, gl, gc = grade_info(ann if pd.notna(ann) else None)
             st.markdown(
                 f'<span class="grade-badge" style="background:{gc}20;color:{gc};'
@@ -232,8 +236,6 @@ with st.sidebar:
             wr = row.get("win_rate")
             tt = row.get("total_trades")
             parts = []
-            if pd.notna(pf) if pf is not None else False:
-                parts.append(f"PF {pf:.2f}")
             if dd is not None and pd.notna(dd):
                 parts.append(f"DD {dd:.1f}%")
             if wr is not None and pd.notna(wr):
@@ -313,7 +315,7 @@ elif selected_run is not None and selected_run in run_groups:
                     win = row.get("timeframe_label") or (
                         f"{str(row['simulation_start'])[:10]} → {str(row['simulation_end'])[:10]}"
                     )
-                    st.caption(f"Model 1  ·  {win}")
+                    st.caption(f"{selected_model_version}  ·  {win}")
                     st.divider()
                     c1, c2, c3 = st.columns(3)
                     c1.metric("Annualized Return", f"{ann:+.1f}%" if pd.notna(ann) else "—")

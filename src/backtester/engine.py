@@ -62,6 +62,9 @@ def _warmup_days(params: dict) -> int:
     bb_f = filters.get("bollinger") or {}
     if bb_f.get("period"):
         candles = max(candles, int(bb_f["period"]))
+    adx_f = filters.get("adx") or {}
+    if adx_f.get("period"):
+        candles = max(candles, int(adx_f["period"]) * 3)  # ADX needs ~3x period to stabilize
 
     return math.ceil(candles / cpd) + 1  # +1 day safety buffer
 

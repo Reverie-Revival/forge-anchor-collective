@@ -252,6 +252,115 @@ def render_dashboard(payload: dict, show_save: bool = False, key_prefix: str = "
             else "Each bar is one trade. Green = win, red = loss."
         )
 
+    # ── Monthly return heatmap ───────────────────────────────────────────────
+    monthly = (
+        closed.assign(_year=closed["exit_ts"].dt.year, _month=closed["exit_ts"].dt.month)
+        .groupby(["_year", "_month"])["pnl"].sum()
+        .reset_index()
+        .rename(columns={"_year": "year", "_month": "month"})
+    )
+    monthly["ret_pct"] = monthly["pnl"] / initial_capital * 100
+    years        = sorted(monthly["year"].unique())
+    month_labels = ["Jan","Feb","Mar","Apr","May","Jun",
+                    "Jul","Aug","Sep","Oct","Nov","Dec"]
+    z_heat, text_heat = [], []
+    for y in years:
+        row_z, row_t = [], []
+        for m in range(1, 13):
+            match = monthly[(monthly["year"] == y) & (monthly["month"] == m)]
+            if len(match):
+                v = match.iloc[0]["ret_pct"]
+                row_z.append(v)
+                row_t.append(f"{v:+.1f}%")
+            else:
+                row_z.append(None)
+                row_t.append("")
+        z_heat.append(row_z)
+        text_heat.append(row_t)
+
+    fig_heat = go.Figure(go.Heatmap(
+        z=z_heat, x=month_labels, y=[str(y) for y in years],
+        text=text_heat, texttemplate="%{text}",
+        colorscale=[[0, "#f87171"], [0.5, "#1e293b"], [1, "#4ade80"]],
+        zmid=0, showscale=False,
+        hovertemplate="<b>%{y} %{x}</b><br>%{text}<extra></extra>",
+    ))
+    fig_heat.update_layout(
+        template="plotly_dark", title="Monthly Returns (% of starting capital)",
+        height=max(180, 60 + len(years) * 44),
+        margin=dict(t=40, b=20, l=50, r=10),
+        plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+    )
+    st.plotly_chart(fig_heat, use_container_width=True, key=f"{key_prefix}_heat")
+
+    # ── Return distribution + MAE/MFE scatter ───────────────────────────────
+    col_hist, col_scatter = st.columns(2)
+
+    with col_hist:
+        wins_r = closed.loc[closed["return_pct"] >= 0, "return_pct"]
+        loss_r = closed.loc[closed["return_pct"] <  0, "return_pct"]
+        fig_hist = go.Figure()
+        fig_hist.add_vline(x=0, line=dict(color="#555", width=1))
+        fig_hist.add_trace(go.Histogram(
+            x=loss_r, nbinsx=12, name="Losses",
+            marker_color="#f87171", opacity=0.85,
+        ))
+        fig_hist.add_trace(go.Histogram(
+            x=wins_r, nbinsx=12, name="Winners",
+            marker_color="#4ade80", opacity=0.85,
+        ))
+        med = closed["return_pct"].median()
+        fig_hist.add_vline(x=med, line=dict(color="#f59e0b", dash="dot"),
+                           annotation_text=f"median {med:+.1f}%",
+                           annotation_font_color="#f59e0b")
+        fig_hist.update_layout(
+            template="plotly_dark", title="Return Distribution",
+            barmode="overlay",
+            xaxis_title="Return (%)", yaxis_title="# Trades",
+            height=280, margin=dict(t=40, b=20, l=10, r=10),
+            showlegend=False,
+            plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+        )
+        st.plotly_chart(fig_hist, use_container_width=True, key=f"{key_prefix}_hist")
+
+    with col_scatter:
+        has_mae = "mae_pct" in closed.columns and closed["mae_pct"].notna().any()
+        if has_mae:
+            dot_colors = ["#4ade80" if p > 0 else "#f87171" for p in closed["pnl"]]
+            fig_mf = go.Figure()
+            fig_mf.add_trace(go.Scatter(
+                x=closed["mae_pct"], y=closed["mfe_pct"],
+                mode="markers",
+                marker=dict(color=dot_colors, size=8, opacity=0.8,
+                            line=dict(color="#1e293b", width=0.5)),
+                hovertemplate=(
+                    "MAE: %{x:.1f}%<br>MFE: %{y:.1f}%<extra></extra>"
+                ),
+            ))
+            ts_pct = params.get("position", {}).get("trailing_stop_pct")
+            sl_pct = params.get("position", {}).get("stop_loss_pct")
+            if sl_pct:
+                fig_mf.add_vline(x=sl_pct,
+                                 line=dict(color="#f87171", dash="dash", width=1.5),
+                                 annotation_text=f"hard stop {sl_pct}%",
+                                 annotation_font_color="#f87171")
+            if ts_pct:
+                fig_mf.add_vline(x=ts_pct,
+                                 line=dict(color="#f59e0b", dash="dot", width=1.5),
+                                 annotation_text=f"trail {ts_pct}%",
+                                 annotation_font_color="#f59e0b")
+            fig_mf.update_layout(
+                template="plotly_dark", title="MAE vs MFE per Trade",
+                xaxis_title="Max Adverse Excursion (%)",
+                yaxis_title="Max Favorable Excursion (%)",
+                height=280, margin=dict(t=40, b=20, l=10, r=10),
+                showlegend=False,
+                plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+            )
+            st.plotly_chart(fig_mf, use_container_width=True, key=f"{key_prefix}_mf")
+        else:
+            st.info("MAE/MFE data not available for this run — use ↺ Re-run All Presets to generate it.")
+
     with st.expander(f"Trade Log ({len(closed)} trades)", expanded=False):
         log = closed.copy()
         log["btc_bought"]   = (log["capital"] / log["entry_price"]).round(6)

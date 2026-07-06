@@ -19,6 +19,7 @@ from src.app.dashboard import render_dashboard
 from src.backtester.engine import run_backtest
 from src.backtester.metrics import compute_metrics, btc_buy_and_hold
 
+st.set_page_config(layout="wide")
 st.title("⚓ Forge Anchor — Stream Tester")
 
 # ── Glossary ──────────────────────────────────────────────────────────────────

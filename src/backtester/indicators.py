@@ -54,6 +54,32 @@ def macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9) -> 
                         index=series.index)
 
 
+def adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    """Average Directional Index — measures trend strength (not direction). 0–100."""
+    high, low, close = df["high"], df["low"], df["close"]
+    prev_high  = high.shift(1)
+    prev_low   = low.shift(1)
+    prev_close = close.shift(1)
+
+    plus_dm  = (high - prev_high).clip(lower=0)
+    minus_dm = (prev_low - low).clip(lower=0)
+    # where the other move is larger, zero out
+    plus_dm  = plus_dm.where(plus_dm > minus_dm, 0.0)
+    minus_dm = minus_dm.where(minus_dm > plus_dm, 0.0)
+
+    tr = pd.concat([high - low,
+                    (high - prev_close).abs(),
+                    (low  - prev_close).abs()], axis=1).max(axis=1)
+
+    # Wilder smoothing
+    atr_s   = tr.ewm(com=period - 1, adjust=False).mean()
+    plus_di  = 100 * plus_dm.ewm(com=period - 1, adjust=False).mean() / atr_s
+    minus_di = 100 * minus_dm.ewm(com=period - 1, adjust=False).mean() / atr_s
+
+    dx  = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+    return dx.ewm(com=period - 1, adjust=False).mean()
+
+
 def volume_sma(series: pd.Series, period: int) -> pd.Series:
     return series.rolling(window=period).mean()
 
@@ -147,6 +173,10 @@ def add_indicators(df: pd.DataFrame, params: dict) -> pd.DataFrame:
     if bb_f:
         bb = bollinger_bands(df["close"], bb_f.get("period", 20), bb_f.get("std_dev", 2.0))
         df = df.join(bb)
+
+    adx_f = filters.get("adx") or {}
+    if adx_f:
+        df["adx"] = adx(df, adx_f.get("period", 14))
 
     if tf_conf.get("sma_period"):
         col = f"tf_sma_{tf_conf['sma_period']}"

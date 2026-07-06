@@ -1,22 +1,19 @@
 """
 Programmatic entry point for model-level backtesting.
-Run from Claude Code — results are written to model_runs/ for Model Tester to display.
+Loads stream configs from backtest.model_streams (v3 schema) and runs them combined.
+Results are written to model_runs/ for the Model Tester page to display.
 
 Usage:
     from src.backtester.model_runner import run_model
 
-    # Equal allocation across locked streams
-    result = run_model(start="2019-01-01", end="2023-12-31")
+    # Run model 2 on Primary v2 window
+    result = run_model(model_id=2, start="2022-01-01", end=None)
 
-    # Custom allocation
+    # Override allocations (keys are full stream names e.g. "Volume Raider v1")
     result = run_model(
-        allocations={
-            "Momentum Rider v1": {"lot_size_usd": 20.0, "slot_count": 2, "slot_mode": "scale_up"},
-            "Dip Hunter v1":     {"lot_size_usd": 10.0, "slot_count": 2, "slot_mode": "scale_down"},
-            "Breakout Scout v1": {"lot_size_usd": 20.0, "slot_count": 1, "slot_mode": "single"},
-        },
-        start="2019-01-01",
-        end="2023-12-31",
+        model_id=2,
+        allocations={"Volume Raider v1": {"lot_size_usd": 40.0}},
+        start="2022-01-01",
     )
 """
 import hashlib
@@ -62,11 +59,15 @@ def _load_locked_streams(model_id: int = 1) -> list:
     engine = _get_engine()
     with engine.connect() as conn:
         rows = pd.read_sql(text("""
-            SELECT stream_id, stream_name, stream_version, parameters,
-                   lot_size_usd, slot_count, slot_mode
-            FROM backtest.streams
-            WHERE model_id = :model_id
-            ORDER BY stream_id
+            SELECT
+                ms.lot_size_usd,
+                sc.stream_config_id, sc.version, sc.parameters, sc.slot_count, sc.slot_mode,
+                s.stream_id, s.stream_name
+            FROM backtest.model_streams ms
+            JOIN backtest.stream_configs sc ON ms.stream_config_id = sc.stream_config_id
+            JOIN backtest.streams s ON sc.stream_id = s.stream_id
+            WHERE ms.model_id = :model_id
+            ORDER BY s.stream_name
         """), conn, params={"model_id": model_id})
     configs = []
     for _, row in rows.iterrows():
@@ -74,7 +75,7 @@ def _load_locked_streams(model_id: int = 1) -> list:
                  else json.loads(row["parameters"])
         configs.append({
             "stream_id":    int(row["stream_id"]),
-            "stream_name":  f"{row['stream_name']} {row['stream_version']}",
+            "stream_name":  f"{row['stream_name']} {row['version']}",
             "params":       params,
             "lot_size_usd": float(row["lot_size_usd"]),
             "slot_count":   int(row["slot_count"]),
