@@ -18,6 +18,7 @@ STREAM_COLORS = {
     "Momentum Rider v1r3": "#4ade80",
     "Momentum Rider v2":   "#22c55e",
     "Momentum Rider v3":   "#16a34a",
+    "Momentum Rider v4":   "#15803d",
     # Dip Hunter — ambers/oranges
     "Dip Hunter v1":       "#f59e0b",
     "Dip Hunter v2":       "#f97316",
@@ -29,6 +30,11 @@ STREAM_COLORS = {
     # Volume Raider — pinks/roses
     "Volume Raider v1":    "#f472b6",
     "Volume Raider v2":    "#ec4899",
+    # SMA Pullback — teals
+    "SMA Pullback v1":     "#2dd4bf",
+    # Cascade DCA — cyans/sky blues
+    "Cascade DCA v1":      "#38bdf8",
+    "Cascade DCA v2":      "#0ea5e9",
 }
 DEFAULT_COLORS = ["#94a3b8", "#fb923c", "#34d399", "#e879f9"]
 
@@ -420,3 +426,140 @@ def render_model_dashboard(payload: dict, show_save: bool = True, key_prefix: st
 
     if show_save:
         _render_model_save(payload, key_prefix)
+
+
+# ── Overview dashboard ────────────────────────────────────────────────────────
+
+def render_overview_dashboard(entries: list, key_prefix: str = "overview"):
+    """
+    Comparative view across multiple saved test windows.
+
+    entries: list of dicts with keys:
+        label, type, ann, dd, wr, trades, start, end, notes
+    """
+    import statistics
+
+    if not entries:
+        st.info("Select at least one window above.")
+        return
+
+    anns    = [e["ann"]    for e in entries if e["ann"]    is not None]
+    dds     = [abs(e["dd"]) for e in entries if e["dd"]    is not None]
+    trades  = [e["trades"] for e in entries if e["trades"] is not None]
+    n       = len(entries)
+    wins    = sum(1 for a in anns if a > 0)
+    losses  = len(anns) - wins
+
+    # ── Summary row ───────────────────────────────────────────────────────────
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    c1.metric("Windows Tested", str(n))
+    c2.metric("Positive / Negative", f"{wins} ✓  /  {losses} ✗")
+    c3.metric("Avg Return",    f"{sum(anns)/len(anns):+.1f}%" if anns else "—")
+    c4.metric("Median Return", f"{statistics.median(anns):+.1f}%" if anns else "—")
+    c5.metric("Best Window",   f"{max(anns):+.1f}%" if anns else "—")
+    c6.metric("Worst Window",  f"{min(anns):+.1f}%" if anns else "—")
+
+    st.divider()
+
+    # ── Bar chart — return per window ─────────────────────────────────────────
+    bar_colors = [
+        "#4ade80" if (e["ann"] or 0) > 10
+        else "#facc15" if (e["ann"] or 0) > 0
+        else "#f87171"
+        for e in entries
+    ]
+    ann_vals = [round(e["ann"], 1) if e["ann"] is not None else 0 for e in entries]
+    labels   = [e["label"] for e in entries]
+
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        x=labels,
+        y=ann_vals,
+        marker_color=bar_colors,
+        text=[f"{a:+.1f}%" for a in ann_vals],
+        textposition="outside",
+        cliponaxis=False,
+    ))
+    fig.add_hline(y=10,  line_dash="dash", line_color="#94a3b8",
+                  annotation_text="S&P 500 (10%)", annotation_position="top right",
+                  annotation_font_color="#94a3b8")
+    fig.add_hline(y=0, line_color="#555555", line_width=1)
+    fig.update_layout(
+        yaxis_title="Annualized Return (%)",
+        template="plotly_dark",
+        height=420,
+        margin=dict(t=20, b=80, l=60, r=20),
+        showlegend=False,
+        xaxis=dict(tickangle=-40),
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    # ── Max drawdown bar chart ─────────────────────────────────────────────────
+    if any(e["dd"] is not None for e in entries):
+        dd_vals = [abs(e["dd"]) if e["dd"] is not None else 0 for e in entries]
+        fig_dd  = go.Figure()
+        fig_dd.add_trace(go.Bar(
+            x=labels,
+            y=dd_vals,
+            marker_color="#f97316",
+            text=[f"{v:.1f}%" for v in dd_vals],
+            textposition="outside",
+            cliponaxis=False,
+        ))
+        fig_dd.update_layout(
+            yaxis_title="Max Drawdown (%)",
+            template="plotly_dark",
+            height=280,
+            margin=dict(t=10, b=80, l=60, r=20),
+            showlegend=False,
+            xaxis=dict(tickangle=-40),
+        )
+        st.plotly_chart(fig_dd, use_container_width=True)
+
+    # ── Grade distribution ────────────────────────────────────────────────────
+    st.divider()
+    grade_counts = {5: 0, 4: 0, 3: 0, 2: 0, 1: 0}
+    for e in entries:
+        gnum, _, _ = grade_info(e["ann"])
+        if gnum:
+            grade_counts[gnum] = grade_counts.get(gnum, 0) + 1
+
+    GRADE_META = {
+        5: ("Elite  ≥20%",   "#00d4aa"),
+        4: ("Strong 10-19%", "#4ade80"),
+        3: ("Passing 8-9%",  "#facc15"),
+        2: ("Weak  >0%",     "#fb923c"),
+        1: ("Poor  ≤0%",     "#f87171"),
+    }
+    gcols = st.columns(5)
+    for col, gnum in zip(gcols, [5, 4, 3, 2, 1]):
+        label_g, color_g = GRADE_META[gnum]
+        count = grade_counts.get(gnum, 0)
+        col.markdown(
+            f'<div style="text-align:center;padding:10px 4px;border-radius:8px;'
+            f'background:{color_g}18;border:1px solid {color_g}44;">'
+            f'<span style="color:{color_g};font-size:1.6rem;font-weight:700;">{count}</span><br>'
+            f'<span style="color:{color_g};font-size:0.7rem;">{label_g}</span>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+    # ── Detail table ──────────────────────────────────────────────────────────
+    st.divider()
+    st.markdown('<p class="section-label">Window Detail</p>', unsafe_allow_html=True)
+
+    table_rows = []
+    for e in entries:
+        ann = e["ann"]
+        _, gl, gc = grade_info(ann)
+        table_rows.append({
+            "Window":   e["label"],
+            "Period":   f"{str(e['start'])[:10]} → {str(e['end'])[:10]}",
+            "Ann %":    f"{ann:+.1f}%" if ann is not None else "—",
+            "Max DD":   f"{e['dd']:.1f}%" if e["dd"] is not None else "—",
+            "Win Rate": f"{e['wr']*100:.0f}%" if e["wr"] is not None else "—",
+            "Trades":   int(e["trades"]) if e["trades"] is not None else "—",
+            "Grade":    gl.split(" · ")[-1] if " · " in gl else gl,
+        })
+
+    st.dataframe(pd.DataFrame(table_rows), use_container_width=True, hide_index=True)

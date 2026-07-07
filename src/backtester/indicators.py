@@ -145,6 +145,12 @@ def add_indicators(df: pd.DataFrame, params: dict) -> pd.DataFrame:
     if core == "sma_pullback":
         df["sma_pullback"] = sma(df["close"], core_p.get("pullback_sma", 50))
 
+    if core == "pullback_from_high":
+        lookback = core_p.get("lookback_bars", 48)
+        df["pullback_high"] = rolling_high(df["high"], lookback).shift(1)
+        if "rsi" not in df.columns:
+            df["rsi"] = rsi(df["close"], core_p.get("rsi_period", 14))
+
     if tc.get("sma_period"):
         col = f"trend_sma_{tc['sma_period']}"
         df[col] = sma(df["close"], tc["sma_period"])

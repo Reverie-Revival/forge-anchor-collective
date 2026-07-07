@@ -16,7 +16,7 @@ MAKER_FEE = 0.0025  # 0.25% per side
 # Valid slot modes. 'single' = one slot only.
 # 'scale_down' = slot 2 adds when price drops below slot 1's entry (DH pattern).
 # 'scale_up'   = slot 2 adds when price rises above slot 1's entry + original signal fires (MR pattern).
-SLOT_MODES = ('single', 'staggered', 'scale_down', 'scale_up')
+SLOT_MODES = ('single', 'staggered', 'scale_down', 'scale_up', 'cascade')
 
 
 def _warmup_days(params: dict) -> int:
@@ -48,6 +48,8 @@ def _warmup_days(params: dict) -> int:
         candles = max(candles, int(core_p.get("ema_long", 50)))
     elif core == "range_breakout":
         candles = max(candles, int(core_p.get("breakout_lookback", 48)))
+    elif core == "pullback_from_high":
+        candles = max(candles, int(core_p.get("lookback_bars", 48)))
     elif core == "sma_pullback":
         candles = max(candles, int(core_p.get("pullback_sma", 50)))
         candles = max(candles, int(core_p.get("trend_sma", 200)))
@@ -460,6 +462,161 @@ def _run_staggered_slots(
     return all_trades
 
 
+def _run_cascade_slots(
+    df: pd.DataFrame,
+    signals: pd.Series,
+    params: dict,
+    slot_count: int,
+    total_capital: float,
+    fee: float = MAKER_FEE,
+) -> list[dict]:
+    """
+    Cascade DCA entry: Slot 1 fires on the base signal.
+    Each subsequent slot auto-enters when the previous slot is open AND price
+    drops cascade_drop_pct below that slot's entry price.
+    Each slot has its own trailing stop and hard stop — exits are independent.
+    When a slot exits its position, the cascade trigger for the next slot is cleared.
+    """
+    position        = params.get("position", {})
+    trail_pct       = position.get("trailing_stop_pct")
+    stop_loss_pct   = position.get("stop_loss_pct")
+    cascade_drop    = position.get("cascade_drop_pct", 5.0) / 100.0
+    expiry          = position.get("entry_expiry_candles", 2)
+    min_hold        = position.get("min_hold_candles") or 0
+    max_hold        = position.get("max_hold_candles")
+    slot_capital    = total_capital / slot_count
+
+    slots = [
+        {
+            "idx":              i,
+            "slot_number":      i + 1,
+            "open_trade":       None,
+            "pending_entry":    None,
+            "capital":          slot_capital,
+            "cascade_trigger":  None,   # price level that auto-fires this slot
+        }
+        for i in range(slot_count)
+    ]
+
+    all_trades = []
+
+    for i, (ts, row) in enumerate(df.iterrows()):
+
+        # ── 1. Fill pending entries + manage open trades ─────────────────────
+        for slot in slots:
+            # try to fill pending limit order
+            if slot["pending_entry"] and slot["open_trade"] is None:
+                lp, ttl, cap = slot["pending_entry"]
+                if row["low"] <= lp <= row["high"]:
+                    slot["open_trade"] = {
+                        "entry_ts":     ts,
+                        "entry_price":  lp,
+                        "highest_close": lp,
+                        "lowest_low":   lp,
+                        "highest_high": lp,
+                        "candles_held": 0,
+                        "capital":      cap,
+                    }
+                    slot["pending_entry"] = None
+                    # arm the cascade trigger for the next slot
+                    nxt = slot["idx"] + 1
+                    if nxt < slot_count:
+                        slots[nxt]["cascade_trigger"] = lp * (1 - cascade_drop)
+                else:
+                    ttl -= 1
+                    slot["pending_entry"] = (lp, ttl, cap) if ttl > 0 else None
+
+            # manage open trade
+            if slot["open_trade"]:
+                t = slot["open_trade"]
+                t["highest_close"] = max(t["highest_close"], row["close"])
+                t["lowest_low"]    = min(t["lowest_low"],    row["low"])
+                t["highest_high"]  = max(t["highest_high"],  row["high"])
+                t["candles_held"] += 1
+
+                trail_stop = t["highest_close"] * (1 - trail_pct / 100.0) if trail_pct else None
+                hard_stop  = t["entry_price"]   * (1 - stop_loss_pct / 100.0) if stop_loss_pct else None
+                candidates = [s for s in [trail_stop, hard_stop] if s is not None]
+                stop_price = max(candidates) if candidates else t["highest_close"] * 0.97
+
+                if t["candles_held"] >= min_hold:
+                    exit_price = exit_reason = None
+                    if max_hold and t["candles_held"] >= max_hold:
+                        exit_price, exit_reason = row["close"], "max_hold"
+                    elif row["low"] <= stop_price:
+                        exit_price = stop_price
+                        exit_reason = "stop_loss" if (hard_stop and stop_price <= hard_stop) else "trailing_stop"
+
+                    if exit_price:
+                        gain = (exit_price - t["entry_price"]) / t["entry_price"]
+                        pnl  = t["capital"] * gain - t["capital"] * fee * 2
+                        ep   = t["entry_price"]
+                        all_trades.append({
+                            "slot":         slot["slot_number"],
+                            "entry_ts":     t["entry_ts"],
+                            "exit_ts":      ts,
+                            "entry_price":  ep,
+                            "exit_price":   exit_price,
+                            "capital":      t["capital"],
+                            "pnl":          pnl,
+                            "exit_reason":  exit_reason,
+                            "candles_held": t["candles_held"],
+                            "mae_pct":      (ep - t["lowest_low"])  / ep * 100,
+                            "mfe_pct":      (t["highest_high"] - ep) / ep * 100,
+                        })
+                        slot["capital"]    += pnl
+                        slot["open_trade"]  = None
+                        # disarm cascade trigger for the next slot
+                        nxt = slot["idx"] + 1
+                        if nxt < slot_count:
+                            slots[nxt]["cascade_trigger"] = None
+
+        # ── 2. Slot 0: base signal entry ─────────────────────────────────────
+        s0 = slots[0]
+        if (signals.iloc[i]
+                and s0["open_trade"] is None
+                and s0["pending_entry"] is None
+                and s0["capital"] > 0.01):
+            s0["pending_entry"] = (row["close"], expiry, s0["capital"])
+
+        # ── 3. Slots 1+: cascade trigger check ───────────────────────────────
+        for idx in range(1, slot_count):
+            slot      = slots[idx]
+            prev_slot = slots[idx - 1]
+            if (slot["cascade_trigger"] is not None
+                    and prev_slot["open_trade"] is not None   # anchor must still be open
+                    and slot["open_trade"] is None
+                    and slot["pending_entry"] is None
+                    and slot["capital"] > 0.01
+                    and row["close"] <= slot["cascade_trigger"]):
+                slot["pending_entry"]   = (row["close"], expiry, slot["capital"])
+                slot["cascade_trigger"] = None  # consumed; will re-arm on fill
+
+    # ── Close any open trades at end of data ─────────────────────────────────
+    for slot in slots:
+        if slot["open_trade"]:
+            t        = slot["open_trade"]
+            last_row = df.iloc[-1]
+            gain     = (last_row["close"] - t["entry_price"]) / t["entry_price"]
+            pnl      = t["capital"] * gain - t["capital"] * MAKER_FEE * 2
+            ep       = t["entry_price"]
+            all_trades.append({
+                "slot":         slot["slot_number"],
+                "entry_ts":     t["entry_ts"],
+                "exit_ts":      df.index[-1],
+                "entry_price":  ep,
+                "exit_price":   last_row["close"],
+                "capital":      t["capital"],
+                "pnl":          pnl,
+                "exit_reason":  "end_of_data",
+                "candles_held": t["candles_held"],
+                "mae_pct":      (ep - t["lowest_low"])  / ep * 100,
+                "mfe_pct":      (t["highest_high"] - ep) / ep * 100,
+            })
+
+    return all_trades
+
+
 def run_backtest(
     params: dict,
     start: str = None,
@@ -509,6 +666,8 @@ def run_backtest(
     # --- Slot dispatch ---
     if slot_mode == 'staggered' and slot_count >= 2:
         all_trades = _run_staggered_slots(df, signals, params, slot_count, lot_size_usd)
+    elif slot_mode == 'cascade' and slot_count >= 2:
+        all_trades = _run_cascade_slots(df, signals, params, slot_count, lot_size_usd)
     else:
         slot1_trades = _run_slot(df, signals, params, slot=1, initial_capital=lot_size_usd)
         all_trades = slot1_trades

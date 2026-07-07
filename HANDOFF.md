@@ -1,4 +1,4 @@
-# Handoff — 2026-07-06 (end of session)
+# Handoff — 2026-07-06 (updated mid-session)
 
 ---
 ## ⚠️ ACTION REQUIRED BY AUG 1, 2026 — ORACLE ACCOUNT
@@ -80,13 +80,83 @@ Model 2 is NOT deployed. Design and backtesting complete. Before going live:
 
 ---
 
+## Model 2 — Test Configurations
+
+Four configs tested and saved to DB (model_id=2). **Test 4 is the current leader. Not finalizing yet.**
+
+| Test | Config | MR | Primary v2 | Full Hist | Recent | 2026 YTD | Primary v1 |
+|---|---|---|---|---|---|---|---|
+| Run 1 | Config A — 4-stream $25 each | v3 staggered 7% | +17.5% | +19.4% | +18.8% | +18.3% | +22.7% |
+| Run 2 | Config B — 5-stream $20 each | v3 staggered 7% | +18.6% | +19.5% | +20.2% | +12.3% | +21.3% |
+| Run 3 | Config A — 4-stream $25 each | **v4 single 8%** | +19.2% | +21.7% | +20.9% | +17.8% | +25.4% |
+| **Run 4** | **Config B — 5-stream $20 each** | **v4 single 8%** | **+20.0%** | **+21.4%** | **+21.9%** | +11.9% | **+26.9%** |
+
+Run 4 = all 5 streams (VR v1, DH v3, BS v3, MR v4, SMA Pullback v1) at $20/lot each. Wins on 4 of 5 windows.
+2026 YTD dip (+11.9%) is expected — SMA Pullback needs extended uptrends; choppy partial year hurts it.
+MR v4 = single slot $25→$20 (removed stagger), 8% trailing stop, EMA 30/120. Saved as stream_config_id=16.
+
+**Next step before finalizing:** Regime robustness test (see below).
+
+---
+
 ## What's Next
 
-### High priority
-- **DH regime filter** — test `trend_context: above 200 SMA` on DH v3. Only buy dips in bull markets. Quick test, might improve the weakest stream. If it helps → DH v4, re-run model backtest.
-- **5th stream design** — SMA Pullback is the top candidate (`sma_pullback` core signal already exists). Would diversify Model 2 or seed Model 3. Not urgent.
+### Regime Robustness Test — START HERE NEXT SESSION
+Run Test 3 (Config A with MR v4) across year-by-year slices + random windows. Goal: confirm consistency across market regimes before finalizing Model 2.
 
-### When ready to deploy
+Year slices to run: 2019, 2020, 2021, 2022, 2023, 2024, 2025, 2026 (partial)
+Also: ~20 random 6-month windows for Monte Carlo-style consistency check.
+Output: share-ready table + summary (ChatGPT/Claude review format).
+Auto-save all results to DB with save_model_test(). Do not leave as pending pkl.
+
+### Stream Lab — Results
+
+Goal was 30%+ annual on Primary v2, or to beat Volume Raider's +26.2%.
+Stream lab complete. SMA Pullback is the one candidate. Everything else rejected.
+
+| # | Stream Name | Status | Primary v2 Result | Reason |
+|---|---|---|---|---|
+| — | **Capitulation Catcher** | ❌ Rejected | 43% WR, carried by 2 outlier trades | Counter-trend can't achieve high WR in BTC |
+| 1 | **Volatility Breakout** | ❌ Rejected | ~14% Ann best case | ATR squeeze bug masked initial results; even fixed, couldn't match VR |
+| 2 | **MACD + Volume Surge** | ❌ Rejected | 24-28% WR regardless of tuning | MACD too noisy in BTC's high-volatility env; confirmed prior failure |
+| 3 | **Volume Raider 1h** | ❌ Rejected | More noise, worse signal quality | VR 4h is already the optimized version; 1h adds noise |
+| 4 | **SMA Pullback** | ✅ Candidate | 37% WR, **22.9% Ann**, -23.6% MaxDD | Fills genuine gap — no Model 2 stream covers healthy-bull pullback regime |
+| 5 | **Greed Rider** | ❌ Rejected | Best variant: 31% WR, +3.5% Ann | Redundant with BS+VR; F&G≥70 zone is peak-cycle danger, buys the top |
+
+**SMA Pullback saved** as stream_id=7, config_id=15 (4h, SMA100, 3% tol, RSI<55, 15% trail, 6% SL).
+
+**Complementarity verdict:** SMA Pullback wins. It fires in the one regime none of the 4 Model 2 streams cover (above SMA200, RSI cooling, near SMA100 bounce). Greed Rider overlaps heavily with BS v3 (both: breakout + greed sentiment) and underperforms it badly.
+
+**If you can only pick 5 total streams:** keep the 4 Model 2 streams + SMA Pullback. Greed Rider sits out — rejected on both performance AND redundancy grounds.
+
+### Cascade DCA v1 — NEW STREAM (stream_id=8, config_id=17)
+New slot_mode `cascade` added to engine. Slots auto-enter as price falls — Slot 1 fires on signal, Slot 2+  
+auto-fire when price drops `cascade_drop_pct` below previous slot's entry price.
+
+Config v1 (config_id=17): 4h, pullback_from_high (10% drop from 48-bar high), SMA200 above, RSI<50, 5% cascade gaps, 12% trail, 15% SL, 3 slots.
+
+Stream tester results (5 presets, test_ids 70–74):
+| Window | Ann% | Trades |
+|---|---|---|
+| Full History | +8.4% | 60 |
+| Primary Window | +16.7% | 40 |
+| Primary v2 | +7.3% | 14 |
+| Recent | +14.4% | 9 |
+| 2026 YTD | — | 0 (no signal yet) |
+
+**Character:** Bull market specialist. Exceptional in strong uptrends (2020 +42%, 2024 +40%). Selective — only fires on real 10% dips above SMA200. 2026 YTD = 0 trades because BTC hasn't pulled back 10% from a recent high while above SMA200 + RSI<50.
+
+**Status:** Stream saved and viewable in Stream Tester. NOT locked for any model yet. More tuning possible — wider cascade gaps, different initial drop %, or sentiment filters.
+
+### Possible next ideas (if you want to keep exploring)
+- **Cascade DCA v2** — try 7% cascade gaps (Config H), fewer adds but fires on bigger dips. 2022 goes positive.
+- **Sentiment Momentum** — enter when F&G crosses above 50 (neutral → greed transition). Not tried yet.
+- **Multi-timeframe confirmation** — 4h trend + 1h entry signal. Not tried yet.
+
+### DH regime filter — tested and closed
+Adding `trend_context: above SMA200` to DH v3 kills it — only 1-2 trades ever fire. F&G≤20 (extreme fear) and price above SMA200 are nearly mutually exclusive. DH v3 stays as-is.
+
+### When ready to deploy Model 2
 - Run Supabase migration, create feature branch, deploy Model 2 with $100
 
 ---

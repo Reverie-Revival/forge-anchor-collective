@@ -3,6 +3,7 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', '..'))
 
 import json
+import re
 import streamlit as st
 import pandas as pd
 
@@ -14,7 +15,7 @@ from src.app.db import (
     next_model_run_number, load_model_run_payload,
     _pending_model_for_hash, _alloc_hash,
 )
-from src.app.model_dashboard import render_model_dashboard, STREAM_COLORS
+from src.app.model_dashboard import render_model_dashboard, render_overview_dashboard, STREAM_COLORS
 
 st.set_page_config(layout="wide")
 st.title("⚓ Forge Anchor — Model Tester")
@@ -272,29 +273,116 @@ elif selected_run is not None and selected_run in run_groups:
     saved_rows   = run_groups[selected_run]
     pending_runs = load_pending_model_runs(saved_rows)
 
-    saved_entries = []
-    for row in saved_rows:
-        lbl = row.get("timeframe_label") or label_window(row["simulation_start"], row["simulation_end"])
-        saved_entries.append({"label": lbl, "type": "saved", "data": row})
-    saved_entries.sort(key=lambda e: e["label"])
+    # ── Classify and order saved entries ────────────────────────────────────
+    def _classify_entry(row):
+        """Return (tab_label, sort_key, entry_type) for a saved row."""
+        notes = (row.get("notes") or "").strip()
+        if notes.startswith("regime-robustness:"):
+            tag = notes[len("regime-robustness:"):].strip()
+            # Year slice: "2019", "2020 YTD", etc.
+            if re.match(r"^\d{4}", tag):
+                tab_lbl = f"Robust Test - {tag}"
+                sort_k  = (2, str(row["simulation_start"]))
+            else:
+                # Random window: "Random 01 (2020-04-01→2020-09-30)"
+                m = re.search(r"Random (\d+)", tag)
+                num = m.group(1) if m else "??"
+                tab_lbl = f"Rnd {num} — {pd.Timestamp(row['simulation_start']).strftime('%b %Y')}"
+                sort_k  = (3, str(row["simulation_start"]))
+            return tab_lbl, sort_k, "robust"
+        elif pd.notna(row.get("preset_id")):
+            lbl    = row.get("timeframe_label", "")
+            preset = int(row["preset_id"])
+            return lbl, (1, f"{preset:04d}"), "preset"
+        else:
+            lbl = row.get("timeframe_label") or label_window(
+                row["simulation_start"], row["simulation_end"]
+            )
+            return lbl, (1, lbl), "custom"
 
-    tab_entries = saved_entries
+    classified = []
+    for row in saved_rows:
+        lbl, sort_k, etype = _classify_entry(row)
+        classified.append({
+            "label": lbl, "sort_key": sort_k, "entry_type": etype,
+            "type": "saved", "data": row,
+        })
+    classified.sort(key=lambda e: e["sort_key"])
+
+    # Deduplicate labels
+    seen_lbl = {}
+    for entry in classified:
+        lbl = entry["label"]
+        seen_lbl[lbl] = seen_lbl.get(lbl, 0) + 1
+        if seen_lbl[lbl] > 1:
+            entry["label"] = f"{lbl} ({seen_lbl[lbl]})"
+
+    # Pending runs go at the end
+    tab_entries = [{"label": "Overview", "type": "overview"}] + classified
     for pr in pending_runs:
         lbl = label_window(pr["start"], pr["end"])
         tab_entries.append({"label": f"⏳ {lbl}", "type": "pending", "data": pr})
-
-    seen = {}
-    for entry in tab_entries:
-        lbl = entry["label"]
-        seen[lbl] = seen.get(lbl, 0) + 1
-        if seen[lbl] > 1:
-            entry["label"] = f"{lbl} ({seen[lbl]})"
 
     tabs = st.tabs([e["label"] for e in tab_entries])
 
     for tab, entry in zip(tabs, tab_entries):
         with tab:
-            if entry["type"] == "saved":
+            if entry["type"] == "overview":
+                # ── Overview: multi-select + comparative dashboard ─────────
+                saved_only = [e for e in classified if e["type"] == "saved"]
+                all_labels       = [e["label"] for e in saved_only]
+                preset_labels    = [e["label"] for e in saved_only if e["entry_type"] == "preset"]
+                robust_labels    = [e["label"] for e in saved_only if e["entry_type"] == "robust"]
+
+                qf_key = f"{selected_run}_qf"
+                ms_key = f"{selected_run}_ms"
+
+                # Seed multiselect on first render
+                if ms_key not in st.session_state:
+                    st.session_state[ms_key] = all_labels
+
+                def _sync_filter():
+                    qf = st.session_state[qf_key]
+                    if qf == "Presets":
+                        st.session_state[ms_key] = preset_labels
+                    elif qf == "Robust Tests":
+                        st.session_state[ms_key] = robust_labels
+                    else:
+                        st.session_state[ms_key] = all_labels
+
+                qf_col, ms_col = st.columns([1, 3])
+                qf_col.radio(
+                    "Quick filter",
+                    ["All", "Presets", "Robust Tests"],
+                    horizontal=False,
+                    key=qf_key,
+                    on_change=_sync_filter,
+                )
+                selected_labels = ms_col.multiselect(
+                    "Windows",
+                    options=all_labels,
+                    key=ms_key,
+                )
+
+                selected_entries = [e for e in saved_only if e["label"] in selected_labels]
+                overview_data = []
+                for e in selected_entries:
+                    row = e["data"]
+                    overview_data.append({
+                        "label":  e["label"],
+                        "type":   e["entry_type"],
+                        "ann":    row["annualized_return_pct"] if pd.notna(row.get("annualized_return_pct")) else None,
+                        "dd":     row["max_drawdown_pct"]      if pd.notna(row.get("max_drawdown_pct"))      else None,
+                        "wr":     row["win_rate"]              if pd.notna(row.get("win_rate"))              else None,
+                        "trades": row["total_trades"]          if pd.notna(row.get("total_trades"))          else None,
+                        "start":  row["simulation_start"],
+                        "end":    row["simulation_end"],
+                        "notes":  row.get("notes") or "",
+                    })
+
+                render_overview_dashboard(overview_data, key_prefix=f"ov_{selected_run}")
+
+            elif entry["type"] == "saved":
                 row           = entry["data"]
                 model_test_id = int(row["model_test_id"])
                 payload       = load_model_run_payload(model_test_id)
@@ -302,7 +390,6 @@ elif selected_run is not None and selected_run in run_groups:
                     render_model_dashboard(payload, show_save=False,
                                            key_prefix=f"run_{model_test_id}")
                 else:
-                    # Saved before pkl storage — show DB summary only
                     ann = row["annualized_return_pct"]
                     dd  = row["max_drawdown_pct"]
                     wr  = row["win_rate"]

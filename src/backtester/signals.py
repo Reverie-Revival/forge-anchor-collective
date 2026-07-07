@@ -92,9 +92,11 @@ def _check_filters(row: pd.Series, prev_row: pd.Series, params: dict) -> bool:
                     return False
 
     if atr_f.get("min_consecutive_candles"):
-        if "atr_low_streak" not in row.index or pd.isna(row["atr_low_streak"]):
+        # Check prev_row: the breakout candle itself has high ATR (streak resets to 0),
+        # so the squeeze must be confirmed on the candle before the breakout fires.
+        if "atr_low_streak" not in prev_row.index or pd.isna(prev_row["atr_low_streak"]):
             return False
-        if row["atr_low_streak"] < atr_f["min_consecutive_candles"]:
+        if prev_row["atr_low_streak"] < atr_f["min_consecutive_candles"]:
             return False
 
     return True
@@ -186,6 +188,12 @@ def generate_signals(df: pd.DataFrame, params: dict) -> pd.Series:
                 if pd.isna(prev.get("close")):
                     continue
                 fired = row["close"] < prev["close"] * (1 - dip_pct)
+
+        elif core == "pullback_from_high":
+            if pd.isna(row.get("pullback_high")):
+                continue
+            drop_pct = core_p.get("initial_drop_pct", 6.0) / 100.0
+            fired = row["close"] <= row["pullback_high"] * (1 - drop_pct)
 
         elif core == "sma_pullback":
             if pd.isna(row.get("sma_pullback")):
