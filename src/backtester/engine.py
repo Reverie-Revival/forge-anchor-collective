@@ -482,6 +482,7 @@ def _run_cascade_slots(
     """
     position        = params.get("position", {})
     trail_pct       = position.get("trailing_stop_pct")
+    trail_steps     = position.get("trailing_stop_steps")  # [[gain_pct, trail_pct], ...] ascending
     stop_loss_pct   = position.get("stop_loss_pct")
     cascade_drop    = position.get("cascade_drop_pct", 5.0) / 100.0
     expiry          = position.get("entry_expiry_candles", 2)
@@ -537,7 +538,16 @@ def _run_cascade_slots(
                 t["highest_high"]  = max(t["highest_high"],  row["high"])
                 t["candles_held"] += 1
 
-                trail_stop = t["highest_close"] * (1 - trail_pct / 100.0) if trail_pct else None
+                if trail_pct:
+                    eff_trail = trail_pct
+                    if trail_steps:
+                        gain_pct = (t["highest_close"] - t["entry_price"]) / t["entry_price"] * 100
+                        for threshold, tighter in sorted(trail_steps, key=lambda x: x[0]):
+                            if gain_pct >= threshold:
+                                eff_trail = tighter
+                    trail_stop = t["highest_close"] * (1 - eff_trail / 100.0)
+                else:
+                    trail_stop = None
                 hard_stop  = t["entry_price"]   * (1 - stop_loss_pct / 100.0) if stop_loss_pct else None
                 candidates = [s for s in [trail_stop, hard_stop] if s is not None]
                 stop_price = max(candidates) if candidates else t["highest_close"] * 0.97

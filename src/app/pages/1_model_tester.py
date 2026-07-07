@@ -76,7 +76,7 @@ with st.expander("🔒 Stream Reference — locked configs used in this model"):
                 p = sc["params"]
                 if p.get("core_signal"):
                     st.caption(f"Signal: `{p['core_signal']}`")
-                sentiment = p.get("sentiment", {}).get("fear_greed", {})
+                sentiment = (p.get("sentiment") or {}).get("fear_greed", {})
                 if sentiment.get("min"):
                     st.caption(f"F&G ≥ {sentiment['min']}")
                 if sentiment.get("max"):

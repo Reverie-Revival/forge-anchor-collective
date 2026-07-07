@@ -1,4 +1,4 @@
-# Handoff — 2026-07-06 (updated mid-session)
+# Handoff — 2026-07-07
 
 ---
 ## ⚠️ ACTION REQUIRED BY AUG 1, 2026 — ORACLE ACCOUNT
@@ -15,7 +15,49 @@ This reminder must stay at the top of every handoff until confirmed complete.
 
 ---
 
-## Done This Session (2026-07-06)
+## Done This Session (2026-07-07)
+
+### Volume Raider v3 + v4 — saved and viewable in Stream Tester
+
+Two additional VR configs locked for comparison:
+
+| Config | config_id | Trail | test_ids | P2v | Full Hist | Recent | 2026 YTD | DD |
+|---|---|---|---|---|---|---|---|---|
+| VR v2 (trail=10) | 19 | 10% | 80–84 | +27.5% | +25.5% | +28.3% | -13.0% | -23.2% |
+| VR v3 (trail=8)  | 20 | 8%  | 85–89 | **+31.0%** | +19.9% | **+34.5%** | -23.9% | -18.6% |
+| VR v4 (trail=12) | 21 | 12% | 90–94 | +28.9% | **+30.9%** | +22.7% | -35.3% | -24.9% |
+
+All 5 presets saved. Viewable in Stream Tester under Volume Raider stream.
+
+VR v2/v3/v4 all share: volume_mult=2.0, RSI 30-60, SMA200 above, trig=3%, SL=8%, 2 slots scale_up.
+The 2026 YTD drag is structural — VR is a bull-market stream (momentum + confirmation). Not a tuning problem.
+**Not substituting into Model 2 yet.** Run 4 still uses VR v1 (single slot, 10% trail).
+
+### Tiered Trailing Stop — implemented in cascade mode
+
+`trailing_stop_steps` added to `_run_cascade_slots` in engine.py. Optional param under `params["position"]`:
+```python
+"trailing_stop_steps": [[10, 8], [20, 5]]  # gain% threshold → tighter trail%
+```
+Tightens stop automatically as trade grows. Only wired for cascade mode (not single/staggered/scale).
+
+### Phase 3 (RSI Recovery + Range Breakout) — complete, results in
+
+- **RSI Recovery** — weak. Best: +11.5% P2v / +22.3% FH (trail=15, no DD filter). Not model material.
+- **Range Breakout single** — decent: lb=48 4h trail=8 → +14.6% P2v / +18.2% FH, 43 trades, 37% WR, -24.7% DD.
+- **Range Breakout + scale_up** — best of phase: lb=48 4h scale_up trig=3 → **+19.5% P2v / +22.7% FH**, 74 trades, -38.8% DD. Complementary to VR but DD is a concern at model level.
+
+Not locking any of these. Regime coverage is already solid with current Model 2 streams.
+
+### Model Tester bug — fixed
+
+`p.get("sentiment", {}).get(...)` failed when `sentiment` was stored as `False` bool.
+Fixed to: `(p.get("sentiment") or {}).get("fear_greed", {})` in `1_model_tester.py` line 79.
+
+### Data sync — added to HANDOFF as first step every session
+
+Local postgres was 4 days behind on candles and 9 days behind on sentiment. Synced.
+Data sync block now at the top of "What's Next" in this HANDOFF.
 
 ### Stream Tester — Risk Metrics + new charts
 - **Risk Metrics section** added to stream dashboard: Sharpe, Sortino, Calmar, Avg MAE, Avg MFE, Max Consec. Losses
@@ -101,16 +143,65 @@ MR v4 = single slot $25→$20 (removed stagger), 8% trailing stop, EMA 30/120. S
 
 ## What's Next
 
-### Cascade DCA Tuning — START HERE NEXT SESSION
+### ⚡ DATA SYNC — RUN THIS FIRST EVERY SESSION
 
-Cascade DCA v1 is built and saved. Next session: tune and explore.
+```bash
+source .venv/bin/activate
+python -m src.data.downloader   # market_data (15m candles, Kraken)
+python -m src.data.sentiment    # sentiment_data (F&G index)
+```
 
-Priority order:
-1. **Try Config H** — 7% cascade gaps instead of 5%. 2022 expected to go positive. Fewer adds but on bigger dips. Compare Full History + Primary v2 + regime splits against v1.
-2. **Explore sentiment filter** — try F&G > 25 guard (avoid extreme fear entries). Does it improve 2022? Does it hurt 2020/2024?
-3. **Try different initial drop** — what does 8% initial drop do? More trades, lower quality? Trade-off worth checking.
-4. **Regime robustness** — once satisfied with a config, run the full year-by-year + 20 random windows test. Save to DB. Make it viewable in Model Tester.
-5. **Lock decision** — is Cascade DCA a Model 3 candidate, a Model 2 addition, or just an exploration?
+Both are incremental and safe to re-run. Local postgres is the backtesting copy — it doesn't auto-update like Supabase does.
+
+---
+
+### Live Dashboard — BUILD THIS NEXT SESSION (feature branch)
+
+**Goal:** Build a Model 2 live monitoring dashboard using backtest data as a stand-in. When Model 2 goes live, it just switches data source. Same page, same queries.
+
+**Architecture decided:**
+- `backtest.lots` + `live.lots` both feed into `reporting.all_lots` (view already exists, unions both with `source` col)
+- Schema isolation: single `live` schema, `model_id` is the firewall between Model 1 and Model 2. NO separate schemas.
+- Dashboard reads from `reporting.all_lots` filtered by model_id + source toggle
+
+**Step 1 — populate backtest.lots:**
+Modify `model_runner.py` to write each individual trade as a row in `backtest.lots` when saving a model test. Then re-run Model 2 Run 4 (Full History, model_test_id=36) to seed real simulated data. This is additive — existing aggregate metrics in `model_tests` are unchanged.
+
+Trade fields to map into `backtest.lots`:
+- `model_test_id`, `model_id`, `stream_id` (look up from stream_name via `live.streams` or a name→id map)
+- `slot_number`, `lot_sequence` (from trade record)
+- `status` = 'CLOSED' for all backtest trades (no open positions in historical tests)
+- `opening_capital`, `closing_capital`, `realized_pnl`
+- `entry_price`, `exit_price`
+- `opened_at`, `closed_at` (entry_time, exit_time from trade record)
+- `entry_reason`, `exit_reason`
+
+**Step 2 — new Streamlit page `3_model_dashboard.py`:**
+
+Sections:
+1. **Sidebar** — Model selector (Model 1 / Model 2) + Data Source toggle (Backtest Run 4 | Live)
+2. **Portfolio Summary** — total capital, current value, total P&L, annualized return, days running, win rate
+3. **Open Positions** — entry price, high water mark, trail stop price, unrealized P&L, stream, time open (live only — blank in backtest mode since all trades are closed)
+4. **Equity Curve** — cumulative P&L over time, per-stream colored lines
+5. **Stream Scoreboard** — per-stream: trades, WR, total P&L, avg gain/loss, max DD
+6. **Trade Log** — sortable table of all closed trades with stream color coding
+
+**Data source toggle behavior:**
+- `Backtest (Run 4)`: queries `reporting.all_lots WHERE source='backtest' AND model_id=2 AND model_test_id=36`
+- `Live`: queries `reporting.all_lots WHERE source='live' AND model_id=2`
+- Open positions: always from `live.lots WHERE status='OPEN'` (skip in backtest mode)
+
+**Live position display** (already validated manually):
+- Trail stop price = `high_water_mark × (1 - trailing_stop_pct/100)` — pull `trailing_stop_pct` from `live.streams.parameters->>'position'->>'trailing_stop_pct'`
+- Current BTC price from `public.market_data ORDER BY timestamp DESC LIMIT 1` (Supabase)
+
+**Works for live too:** When Model 2 deploys, executor writes to `live.lots`. Toggle to Live, same page shows real trades. No code changes needed at deploy time.
+
+**Feature branch:** Create `feature/model2-live-dashboard` off `main` before starting.
+
+### Cascade DCA Tuning — deferred (explore when Model 2 is locked)
+
+Cascade DCA v1 is built and saved (config_id=17). Not locked for any model. Defer tuning until Model 2 finalization is complete.
 
 Config reference (v1, config_id=17):
 - Signal: pullback_from_high, 10% drop from 48-bar high
