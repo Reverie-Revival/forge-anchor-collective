@@ -101,13 +101,26 @@ MR v4 = single slot $25→$20 (removed stagger), 8% trailing stop, EMA 30/120. S
 
 ## What's Next
 
-### Regime Robustness Test — START HERE NEXT SESSION
-Run Test 3 (Config A with MR v4) across year-by-year slices + random windows. Goal: confirm consistency across market regimes before finalizing Model 2.
+### Cascade DCA Tuning — START HERE NEXT SESSION
 
-Year slices to run: 2019, 2020, 2021, 2022, 2023, 2024, 2025, 2026 (partial)
-Also: ~20 random 6-month windows for Monte Carlo-style consistency check.
-Output: share-ready table + summary (ChatGPT/Claude review format).
-Auto-save all results to DB with save_model_test(). Do not leave as pending pkl.
+Cascade DCA v1 is built and saved. Next session: tune and explore.
+
+Priority order:
+1. **Try Config H** — 7% cascade gaps instead of 5%. 2022 expected to go positive. Fewer adds but on bigger dips. Compare Full History + Primary v2 + regime splits against v1.
+2. **Explore sentiment filter** — try F&G > 25 guard (avoid extreme fear entries). Does it improve 2022? Does it hurt 2020/2024?
+3. **Try different initial drop** — what does 8% initial drop do? More trades, lower quality? Trade-off worth checking.
+4. **Regime robustness** — once satisfied with a config, run the full year-by-year + 20 random windows test. Save to DB. Make it viewable in Model Tester.
+5. **Lock decision** — is Cascade DCA a Model 3 candidate, a Model 2 addition, or just an exploration?
+
+Config reference (v1, config_id=17):
+- Signal: pullback_from_high, 10% drop from 48-bar high
+- Filters: SMA200 above, RSI < 50
+- Position: 5% cascade gaps, 12% trail, 15% SL, 3 slots, 4h timeframe
+
+### Regime Robustness Test — ✅ COMPLETE (2026-07-07)
+Run 3 and Run 4 both tested — 56 total windows saved to DB. Viewable in Model Tester under each run's Robust Test tabs.
+
+**Summary:** R3 wins 16 windows, R4 wins 11, 1 tie. R3 more consistent in weak/choppy markets; R4 wins big bull runs. Both strong. Not finalizing Model 2 yet — exploring Cascade DCA first.
 
 ### Stream Lab — Results
 

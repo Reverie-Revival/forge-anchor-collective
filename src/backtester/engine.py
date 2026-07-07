@@ -14,8 +14,11 @@ load_dotenv()
 MAKER_FEE = 0.0025  # 0.25% per side
 
 # Valid slot modes. 'single' = one slot only.
-# 'scale_down' = slot 2 adds when price drops below slot 1's entry (DH pattern).
-# 'scale_up'   = slot 2 adds when price rises above slot 1's entry + original signal fires (MR pattern).
+# 'staggered'  = N independent slots, round-robin dispatch, optional gap + capital weights.
+# 'scale_down' = slot 2 adds when price drops below slot 1's entry (2-slot only).
+# 'scale_up'   = slot 2 adds when price rises above slot 1's entry + signal fires (2-slot only).
+# 'cascade'    = N slots; slot 1 fires on signal, each subsequent slot auto-fires when price
+#                drops cascade_drop_pct below the previous slot's entry (params.position).
 SLOT_MODES = ('single', 'staggered', 'scale_down', 'scale_up', 'cascade')
 
 
