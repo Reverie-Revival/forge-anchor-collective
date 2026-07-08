@@ -74,12 +74,13 @@ def _load_locked_streams(model_id: int = 1) -> list:
         params = row["parameters"] if isinstance(row["parameters"], dict) \
                  else json.loads(row["parameters"])
         configs.append({
-            "stream_id":    int(row["stream_id"]),
-            "stream_name":  f"{row['stream_name']} {row['version']}",
-            "params":       params,
-            "lot_size_usd": float(row["lot_size_usd"]),
-            "slot_count":   int(row["slot_count"]),
-            "slot_mode":    str(row["slot_mode"]),
+            "stream_id":        int(row["stream_id"]),
+            "stream_config_id": int(row["stream_config_id"]),
+            "stream_name":      f"{row['stream_name']} {row['version']}",
+            "params":           params,
+            "lot_size_usd":     float(row["lot_size_usd"]),
+            "slot_count":       int(row["slot_count"]),
+            "slot_mode":        str(row["slot_mode"]),
         })
     return configs
 

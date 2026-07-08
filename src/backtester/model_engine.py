@@ -51,8 +51,9 @@ def run_model_backtest(stream_configs: list, start: str = None, end: str = None)
             all_trade_frames.append(t)
 
         stream_results.append({
-            "stream_id":       sc["stream_id"],
-            "stream_name":     sc["stream_name"],
+            "stream_id":        sc["stream_id"],
+            "stream_config_id": sc.get("stream_config_id"),
+            "stream_name":      sc["stream_name"],
             "lot_size_usd":    sc["lot_size_usd"],
             "slot_count":      sc["slot_count"],
             "slot_mode":       sc.get("slot_mode", "single"),
