@@ -11,6 +11,7 @@ from datetime import datetime, timezone, timedelta
 from sqlalchemy import text
 
 from src.live.kraken_client import KrakenClient
+from src.live import notifier
 
 log = logging.getLogger(__name__)
 
@@ -115,8 +116,11 @@ def check_pending(conn, kraken: KrakenClient, dry_run: bool = False) -> tuple[in
     now = datetime.now(timezone.utc)
     pending = conn.execute(
         text("""
-            SELECT lot_id, stream_id, entry_order_id, entry_expiry_at, btc_quantity
-            FROM live.lots WHERE status = 'PENDING'
+            SELECT ll.lot_id, ll.stream_id, ll.model_id, ls.stream_name,
+                   ll.entry_order_id, ll.entry_expiry_at, ll.btc_quantity, ll.opening_capital
+            FROM live.lots ll
+            JOIN live.streams ls ON ls.stream_id = ll.stream_id
+            WHERE ll.status = 'PENDING'
         """)
     ).fetchall()
 
@@ -149,6 +153,7 @@ def check_pending(conn, kraken: KrakenClient, dry_run: bool = False) -> tuple[in
                 """),
                 {"price": fill_price, "qty": vol_exec, "lid": lot.lot_id},
             )
+            notifier.alert_opened(lot.stream_name, lot.model_id, float(lot.opening_capital), fill_price, vol_exec)
             fills += 1
 
         elif status in ("canceled", "expired") or (
@@ -168,7 +173,7 @@ def check_pending(conn, kraken: KrakenClient, dry_run: bool = False) -> tuple[in
     return fills, expirations
 
 
-def place_exit(conn, lot, current_price: float, kraken: KrakenClient, dry_run: bool = False) -> None:
+def place_exit(conn, lot, current_price: float, kraken: KrakenClient, dry_run: bool = False, stream_name: str = "", model_id: int = 0) -> None:
     """
     Place a market sell order to exit an OPEN lot and mark it CLOSED.
     lot: Row with lot_id, btc_quantity, entry_price, opening_capital
@@ -214,3 +219,6 @@ def place_exit(conn, lot, current_price: float, kraken: KrakenClient, dry_run: b
             "lid":     lot.lot_id,
         },
     )
+    if not dry_run:
+        notifier.alert_closed(stream_name, model_id, float(lot.entry_price), exit_price,
+                              capital, round(capital + pnl, 2), round(pnl, 2))

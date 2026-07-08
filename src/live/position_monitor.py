@@ -85,7 +85,8 @@ def check_all(
                 f"Trailing stop triggered — lot {lot.lot_id} ({stream['stream_name']}): "
                 f"low={low:.2f} <= stop={stop_price:.2f} (hwm={new_hwm:.2f}, trail={trail_pct*100:.1f}%)"
             )
-            order_manager.place_exit(conn, lot, stop_price, kraken, dry_run)
+            order_manager.place_exit(conn, lot, stop_price, kraken, dry_run,
+                                     stream_name=stream["stream_name"], model_id=stream["model_id"])
             stops_triggered += 1
         else:
             log.debug(
