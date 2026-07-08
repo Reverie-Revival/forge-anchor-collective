@@ -23,7 +23,7 @@ import pandas as pd
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
 
-from src.live import order_manager, position_monitor, signal_engine
+from src.live import notifier, order_manager, position_monitor, signal_engine
 from src.live.kraken_client import KrakenClient
 
 load_dotenv()
@@ -256,6 +256,11 @@ def run(dry_run: bool = False) -> None:
         log.info(f"Loaded {len(streams)} streams: {[s['stream_name'] for s in streams.values()]}")
 
         last_tick = _read_last_run(conn)
+
+        gap_hours = (now - last_tick).total_seconds() / 3600
+        if gap_hours > 2:
+            log.warning(f"Executor gap detected: {gap_hours:.1f}h since last tick — firing system-down alert")
+            notifier.alert_system_down(gap_hours)
 
         issues = _preflight_check(conn)
         if issues:

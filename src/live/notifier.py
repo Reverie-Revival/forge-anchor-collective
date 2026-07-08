@@ -36,6 +36,50 @@ def _dispatch(email_subject: str, email_body: str, sms_body: str) -> None:
         log.error(f"Alert failed: {e}")
 
 
+def alert_order_placed(stream_name: str, model_id: int, usd_in: float, limit_price: float, qty: float, expiry_at: str) -> None:
+    _dispatch(
+        email_subject=f"Forge: Order Placed - Model {model_id} | {stream_name}",
+        email_body=(
+            f"Forge | Model {model_id} | {stream_name}\n"
+            f"Limit buy placed @ ${limit_price:,.2f}\n"
+            f"BTC: {qty:.6f}\n"
+            f"Capital: ${usd_in:.2f}\n"
+            f"Expires: {expiry_at}"
+        ),
+        sms_body=(
+            f"Model {model_id} | {stream_name}\n"
+            f"ORDER @ ${limit_price:,.0f} | {qty:.6f} BTC | expires {expiry_at}"
+        ),
+    )
+
+
+def alert_order_expired(stream_name: str, model_id: int, limit_price: float) -> None:
+    _dispatch(
+        email_subject=f"Forge: Order Expired - Model {model_id} | {stream_name}",
+        email_body=(
+            f"Forge | Model {model_id} | {stream_name}\n"
+            f"Limit buy expired unfilled @ ${limit_price:,.2f}\n"
+            f"Slot is now free."
+        ),
+        sms_body=(
+            f"Model {model_id} | {stream_name}\n"
+            f"ORDER EXPIRED @ ${limit_price:,.0f} — never filled"
+        ),
+    )
+
+
+def alert_system_down(hours: float) -> None:
+    _dispatch(
+        email_subject=f"Forge: Executor Silent {hours:.1f}h",
+        email_body=(
+            f"Forge executor has not run in {hours:.1f} hours.\n"
+            f"Expected cadence: every 30 minutes.\n"
+            f"Check cron-job.org and GitHub Actions for failures."
+        ),
+        sms_body=f"Forge executor SILENT {hours:.1f}h — check cron-job.org",
+    )
+
+
 def alert_opened(stream_name: str, model_id: int, usd_in: float, fill_price: float, qty: float) -> None:
     _dispatch(
         email_subject=f"Forge: Opened - Model {model_id} | {stream_name}",

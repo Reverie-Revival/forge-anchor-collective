@@ -77,6 +77,9 @@ def place_entry(
             txid = kraken.place_order("buy", btc_qty, limit_price, "limit")
             log.info(f"Placed limit buy: {stream['stream_name']} "
                      f"${lot_size_usd:.2f} @ ${limit_price:.2f} ({btc_qty:.8f} BTC) txid={txid}")
+            expiry_str = expiry_at.strftime("%Y-%m-%d %H:%M UTC")
+            notifier.alert_order_placed(stream["stream_name"], model_id, lot_size_usd,
+                                        limit_price, btc_qty, expiry_str)
         except Exception as e:
             log.error(f"Failed to place entry order for {stream['stream_name']}: {e}")
             return
@@ -117,7 +120,8 @@ def check_pending(conn, kraken: KrakenClient, dry_run: bool = False) -> tuple[in
     pending = conn.execute(
         text("""
             SELECT ll.lot_id, ll.stream_id, ll.model_id, ls.stream_name,
-                   ll.entry_order_id, ll.entry_expiry_at, ll.btc_quantity, ll.opening_capital
+                   ll.entry_order_id, ll.entry_expiry_at, ll.btc_quantity,
+                   ll.opening_capital, ll.entry_price
             FROM live.lots ll
             JOIN live.streams ls ON ls.stream_id = ll.stream_id
             WHERE ll.status = 'PENDING'
@@ -130,6 +134,20 @@ def check_pending(conn, kraken: KrakenClient, dry_run: bool = False) -> tuple[in
     for lot in pending:
         if dry_run:
             log.debug(f"[DRY RUN] Skipping fill check for lot_id={lot.lot_id}")
+            continue
+
+        expiry_ts = lot.entry_expiry_at.replace(tzinfo=timezone.utc) if lot.entry_expiry_at else None
+        our_expiry_passed = expiry_ts and now > expiry_ts
+
+        if our_expiry_passed:
+            log.info(f"Lot {lot.lot_id} past expiry — cancelling order {lot.entry_order_id}")
+            try:
+                kraken.cancel_order(lot.entry_order_id)
+            except Exception as e:
+                log.warning(f"Cancel attempt for {lot.entry_order_id} raised: {e}")
+            conn.execute(text("DELETE FROM live.lots WHERE lot_id = :lid"), {"lid": lot.lot_id})
+            notifier.alert_order_expired(lot.stream_name, lot.model_id, float(lot.entry_price))
+            expirations += 1
             continue
 
         try:
@@ -156,18 +174,10 @@ def check_pending(conn, kraken: KrakenClient, dry_run: bool = False) -> tuple[in
             notifier.alert_opened(lot.stream_name, lot.model_id, float(lot.opening_capital), fill_price, vol_exec)
             fills += 1
 
-        elif status in ("canceled", "expired") or (
-            lot.entry_expiry_at and now > lot.entry_expiry_at.replace(tzinfo=timezone.utc)
-        ):
-            log.info(f"Lot {lot.lot_id} entry expired/cancelled — cancelling order {lot.entry_order_id}")
-            try:
-                kraken.cancel_order(lot.entry_order_id)
-            except Exception as e:
-                log.warning(f"Cancel attempt for {lot.entry_order_id} raised: {e}")
-            conn.execute(
-                text("DELETE FROM live.lots WHERE lot_id = :lid"),
-                {"lid": lot.lot_id},
-            )
+        elif status in ("canceled", "expired"):
+            log.info(f"Lot {lot.lot_id} cancelled/expired on Kraken — freeing slot")
+            conn.execute(text("DELETE FROM live.lots WHERE lot_id = :lid"), {"lid": lot.lot_id})
+            notifier.alert_order_expired(lot.stream_name, lot.model_id, float(lot.entry_price))
             expirations += 1
 
     return fills, expirations
