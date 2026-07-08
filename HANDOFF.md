@@ -1,4 +1,4 @@
-# Handoff — 2026-07-07
+# Handoff — 2026-07-08
 
 ---
 ## ⚠️ ACTION REQUIRED BY AUG 1, 2026 — ORACLE ACCOUNT
@@ -11,133 +11,64 @@ This reminder must stay at the top of every handoff until confirmed complete.
 
 **Model 1 is LIVE** — executor running, cron on schedule.
 
-**Model 2 is assembled and backtested.** 4 streams locked, model registered in DB, 5-preset backtest run and saved. Not yet deployed — at least a month away from going live.
+**Model 2 is assembled and backtested.** Not yet deployed — at least a month away from going live.
+
+**Model Dashboard is BUILT** — `3_model_dashboard.py` live in the multipage app (port 8504). backtest.lots seeded for Model 1 and Model 2 (multiple configs + timeframes). Feature branch merged to main.
 
 ---
 
-## Done This Session (2026-07-07)
+## Done This Session (2026-07-08)
 
-### Volume Raider v3 + v4 — saved and viewable in Stream Tester
+### Model Dashboard — built and shipped
 
-Two additional VR configs locked for comparison:
+New Streamlit page `src/app/pages/3_model_dashboard.py`. Added to `src/app/app.py` navigation.
 
-| Config | config_id | Trail | test_ids | P2v | Full Hist | Recent | 2026 YTD | DD |
-|---|---|---|---|---|---|---|---|---|
-| VR v2 (trail=10) | 19 | 10% | 80–84 | +27.5% | +25.5% | +28.3% | -13.0% | -23.2% |
-| VR v3 (trail=8)  | 20 | 8%  | 85–89 | **+31.0%** | +19.9% | **+34.5%** | -23.9% | -18.6% |
-| VR v4 (trail=12) | 21 | 12% | 90–94 | +28.9% | **+30.9%** | +22.7% | -35.3% | -24.9% |
+**What it shows:**
+- Portfolio snapshot: starting capital, current value, total return, annualized return (compound), YTD P&L, win rate
+- Stream status cards: open positions per stream with unrealized P&L + trail stop; last closed trade summary; YTD P&L
+- Equity curve: per-stream cumulative P&L lines + dotted "Avg Stream" baseline (not a sum — lets you see which streams are above/below average)
+- Period tabs: All Time / YTD / 90 Days / 30 Days
+- Monthly P&L breakdown table
+- Open Positions: entry price, current BTC value, unrealized P&L, trail stop price, days open
+- Trade Log: formatted table, sorted by close date, stream filter multiselect
 
-All 5 presets saved. Viewable in Stream Tester under Volume Raider stream.
+**Key design points:**
+- `end_of_data` exit reason = still-open simulated positions → shown in Open Positions with live BTC price
+- Backtest mode uses local postgres; Live mode will use Supabase
+- Annualized return uses compound formula matching `compute_metrics()` — matches the dropdown label
+- Equity chart "Avg Stream" line = average of per-stream cumulative P&L at each timestamp (not sum)
+- `src/app/db.py`: `get_local_engine()` always uses `DB_*` env vars for backtest schema; `get_engine()` uses `DATABASE_URL` (Supabase) for live schema. All backtest functions now call `get_local_engine()`.
 
-VR v2/v3/v4 all share: volume_mult=2.0, RSI 30-60, SMA200 above, trig=3%, SL=8%, 2 slots scale_up.
-The 2026 YTD drag is structural — VR is a bull-market stream (momentum + confirmation). Not a tuning problem.
-**Not substituting into Model 2 yet.** Run 4 still uses VR v1 (single slot, 10% trail).
+### backtest.lots — seeded for all model comparisons
 
-### Tiered Trailing Stop — implemented in cascade mode
+Seeded via Python (not the UI) using `run_model_backtest()` + `save_model_test()`:
 
-`trailing_stop_steps` added to `_run_cascade_slots` in engine.py. Optional param under `params["position"]`:
-```python
-"trailing_stop_steps": [[10, 8], [20, 5]]  # gain% threshold → tighter trail%
-```
-Tightens stop automatically as trade grows. Only wired for cascade mode (not single/staggered/scale).
-
-### Phase 3 (RSI Recovery + Range Breakout) — complete, results in
-
-- **RSI Recovery** — weak. Best: +11.5% P2v / +22.3% FH (trail=15, no DD filter). Not model material.
-- **Range Breakout single** — decent: lb=48 4h trail=8 → +14.6% P2v / +18.2% FH, 43 trades, 37% WR, -24.7% DD.
-- **Range Breakout + scale_up** — best of phase: lb=48 4h scale_up trig=3 → **+19.5% P2v / +22.7% FH**, 74 trades, -38.8% DD. Complementary to VR but DD is a concern at model level.
-
-Not locking any of these. Regime coverage is already solid with current Model 2 streams.
-
-### Model Tester bug — fixed
-
-`p.get("sentiment", {}).get(...)` failed when `sentiment` was stored as `False` bool.
-Fixed to: `(p.get("sentiment") or {}).get("fear_greed", {})` in `1_model_tester.py` line 79.
-
-### Data sync — added to HANDOFF as first step every session
-
-Local postgres was 4 days behind on candles and 9 days behind on sentiment. Synced.
-Data sync block now at the top of "What's Next" in this HANDOFF.
-
-### Stream Tester — Risk Metrics + new charts
-- **Risk Metrics section** added to stream dashboard: Sharpe, Sortino, Calmar, Avg MAE, Avg MFE, Max Consec. Losses
-- **MAE/MFE tracking** added to engine.py — every trade record now carries `mae_pct` and `mfe_pct` (lowest_low and highest_high tracked per candle)
-- **On-the-fly metrics patch** in `load_run_payload` — old pkls missing new metric keys get them recomputed from stored trades on load (no re-run required)
-- **Monthly return heatmap** — full-width green/red calendar grid per year × month
-- **Return distribution histogram** — green/red overlaid, median line
-- **MAE vs MFE scatter** — each trade as a dot, hard stop + trail stop reference lines. Shows `—` for old runs; Re-run All Presets populates it.
-- **Wide layout** set on both stream_tester.py and model_tester page
-- **Re-run All Presets button** added (↺) — forces fresh backtest even if preset already saved
-
-### Model 2 — fully assembled
-4 streams locked in `backtest.stream_configs`:
-
-| Stream | config_id | Slots | lot_size_usd | Total | Key params |
+| model_test_id | Model | Run | Window | Trades | Ann% |
 |---|---|---|---|---|---|
-| Volume Raider v1 | 10 | 1 single | $25.00 | $25 | volume_surge 4h, RSI 30-60, 10% trail |
-| Dip Hunter v3 | 11 | 1 single | $25.00 | $25 | rsi_recovery 1h, SL 6%, 10% trail |
-| Breakout Scout v3 | 12 | 1 single | $25.00 | $25 | range_breakout 1h, SL 3%, 10% trail |
-| Momentum Rider v3 | 9 | 2 staggered [70/30] | $12.50 | $25 | ema_crossover 4h, 7% trail |
-| **Total** | | | | **$100** | |
+| 97 | Model 1 | 1 | Full History | 225 | +19.4% |
+| 99 | Model 2 | 3 | Full History | 218 | +21.7% |
+| 100 | Model 2 | 4 | Full History | 268 | +21.4% |
+| 101 | Model 1 | 4 | Full History | 142 | +22.4% |
+| 102 | Model 1 | 4 | Primary v2 | 66 | +15.6% |
+| 103 | Model 2 | 3 | Primary v2 | 107 | +19.4% |
+| 104 | Model 2 | 4 | Primary v2 | 126 | +20.1% |
 
-Model registered as model_id=2 in `backtest.models`. Composition in `backtest.model_streams`.
+**Key insight from Primary v2 comparison (the right window):**
+- Model 1: 15.6% — underperforms S&P on this window (designed pre-2022)
+- Model 2 Run 3: 19.4%
+- Model 2 Run 4: 20.1% — clearly the better model on the period it was designed for
 
-**Model 2 backtest results (model_test_ids 20–24):**
+**VR v1 note:** Only 6.4% annualized on Full History. Looks good on Primary v2 (26.2%) because it was designed/tuned on 2022+ data. 2018–2021 was drag. This is expected and correct.
 
-| Window | Ann% | Trades | DD% | WR |
-|---|---|---|---|---|
-| Full History (2018→) | +19.4% | 225 | -14.1% | 43% |
-| Primary Window (2019→2023) | +22.7% | 124 | -10.4% | 42% |
-| Primary v2 (2022→now) | +17.5% | 111 | -11.8% | 46% |
-| Recent (2024→now) | +18.8% | 67 | -11.5% | 48% |
-| 2026 YTD | +18.3% | 13 | -2.9% | 69% |
+### engine.py — highest_close added to trade records
 
-Grade 4 (Strong) across all windows. Beats BTC buy-and-hold (+6.7% same period) and S&P avg.
+All 6 trade close points (single/staggered/cascade × main exit + end_of_data) now include `"highest_close"` in the trade dict, enabling `high_water_mark` to be populated in `backtest.lots`.
 
-Per-stream on Primary v2: VR +26.2%, BS +16.8%, DH +12.7%, MR +12.4%.
-VR is the standout performer — runs better alone but the group provides drawdown control and regime diversity.
+### DB engine split — critical bug fix
 
-### Model Tester — multi-model support
-- Model selector dropdown added to sidebar — switches between Model 1 and Model 2
-- `load_models()` added to db.py; `load_model_history(model_id)` now filters by model
-- `model_runner.py` fixed to load from v3 schema (`backtest.model_streams` → `backtest.stream_configs`) instead of old `backtest.streams` table
-- `STREAM_COLORS` in model_dashboard.py updated with all v3 stream versions (MR, DH, BS all shades of their family color; VR = pink)
+`DATABASE_URL` in `.env` is the Supabase URL. Before this fix, every backtest query (`backtest.*`) was silently failing and returning empty results because `get_engine()` always used `DATABASE_URL`.
 
-### ADX indicator added (not used in production)
-- `adx()` added to `indicators.py` — Wilder smoothing, correct +DM/-DM zero-out
-- Filter wired into `signals.py` (`adx` filter key) and `engine.py` (warmup days = period × 3)
-- Tested on MR v3: ADX≥20 improves win rate (44%→50%) and drawdown but costs -2.8% annualized on Primary v2. Not worth the trade. MR v3 kept as-is.
-
----
-
-## Model 2 Deployment Status
-
-Model 2 is NOT deployed. Design and backtesting complete. Before going live:
-1. ✅ All 4 streams locked with backtest results in stream_tests
-2. ✅ Model assembled in backtest.model_streams
-3. ✅ Model backtested across 5 presets (model_tests)
-4. ⬜ Run Supabase migration (`src/data/migration_v3.sql`) — needed before live schema exists
-5. ⬜ Create feature branch, wire up live.models/streams, deploy executor
-6. ⬜ Throw $100 at it — at least 1 month from now
-
----
-
-## Model 2 — Test Configurations
-
-Four configs tested and saved to DB (model_id=2). **Test 4 is the current leader. Not finalizing yet.**
-
-| Test | Config | MR | Primary v2 | Full Hist | Recent | 2026 YTD | Primary v1 |
-|---|---|---|---|---|---|---|---|
-| Run 1 | Config A — 4-stream $25 each | v3 staggered 7% | +17.5% | +19.4% | +18.8% | +18.3% | +22.7% |
-| Run 2 | Config B — 5-stream $20 each | v3 staggered 7% | +18.6% | +19.5% | +20.2% | +12.3% | +21.3% |
-| Run 3 | Config A — 4-stream $25 each | **v4 single 8%** | +19.2% | +21.7% | +20.9% | +17.8% | +25.4% |
-| **Run 4** | **Config B — 5-stream $20 each** | **v4 single 8%** | **+20.0%** | **+21.4%** | **+21.9%** | +11.9% | **+26.9%** |
-
-Run 4 = all 5 streams (VR v1, DH v3, BS v3, MR v4, SMA Pullback v1) at $20/lot each. Wins on 4 of 5 windows.
-2026 YTD dip (+11.9%) is expected — SMA Pullback needs extended uptrends; choppy partial year hurts it.
-MR v4 = single slot $25→$20 (removed stagger), 8% trailing stop, EMA 30/120. Saved as stream_config_id=16.
-
-**Next step before finalizing:** Regime robustness test (see below).
+Fix: `get_local_engine()` builds connection from `DB_HOST/PORT/NAME/USER/PASSWORD` env vars (always local postgres). All backtest functions use it. `get_engine()` (Supabase) reserved for live schema only.
 
 ---
 
@@ -151,125 +82,40 @@ python -m src.data.downloader   # market_data (15m candles, Kraken)
 python -m src.data.sentiment    # sentiment_data (F&G index)
 ```
 
-Both are incremental and safe to re-run. Local postgres is the backtesting copy — it doesn't auto-update like Supabase does.
+### Deploy Model 2
 
----
+Model 2 is ready from a backtest perspective. Run 4 (5-stream, $20 each) leads on Primary v2.
 
-### Live Dashboard — BUILD THIS NEXT SESSION (feature branch)
+Before going live:
+1. ✅ All streams locked with backtest results
+2. ✅ Model assembled in backtest.model_streams
+3. ✅ Model backtested across multiple presets and regimes
+4. ⬜ Run Supabase migration (`src/data/migration_v3.sql`) — needed for live schema
+5. ⬜ Create feature branch, wire up live.models/streams, deploy executor
+6. ⬜ Throw $100 at it
 
-**Goal:** Build a Model 2 live monitoring dashboard using backtest data as a stand-in. When Model 2 goes live, it just switches data source. Same page, same queries.
+### Model 2 — Test Configurations
 
-**Architecture decided:**
-- `backtest.lots` + `live.lots` both feed into `reporting.all_lots` (view already exists, unions both with `source` col)
-- Schema isolation: single `live` schema, `model_id` is the firewall between Model 1 and Model 2. NO separate schemas.
-- Dashboard reads from `reporting.all_lots` filtered by model_id + source toggle
+| Test | Config | MR | Primary v2 | Full Hist | Recent | 2026 YTD |
+|---|---|---|---|---|---|---|
+| Run 1 | Config A — 4-stream $25 each | v3 staggered 7% | +17.5% | +19.4% | +18.8% | +18.3% |
+| Run 2 | Config B — 5-stream $20 each | v3 staggered 7% | +18.6% | +19.5% | +20.2% | +12.3% |
+| Run 3 | Config A — 4-stream $25 each | **v4 single 8%** | +19.2% | +21.7% | +20.9% | +17.8% |
+| **Run 4** | **Config B — 5-stream $20 each** | **v4 single 8%** | **+20.0%** | **+21.4%** | **+21.9%** | +11.9% |
 
-**Step 1 — populate backtest.lots:**
-Modify `model_runner.py` to write each individual trade as a row in `backtest.lots` when saving a model test. Then re-run Model 2 Run 4 (Full History, model_test_id=36) to seed real simulated data. This is additive — existing aggregate metrics in `model_tests` are unchanged.
+Run 4 = DH v3 + VR v1 + BS v3 + MR v4 + SMA Pullback v1, all $20/lot.
 
-Trade fields to map into `backtest.lots`:
-- `model_test_id`, `model_id`, `stream_id` (look up from stream_name via `live.streams` or a name→id map)
-- `slot_number`, `lot_sequence` (from trade record)
-- `status` = 'CLOSED' for all backtest trades (no open positions in historical tests)
-- `opening_capital`, `closing_capital`, `realized_pnl`
-- `entry_price`, `exit_price`
-- `opened_at`, `closed_at` (entry_time, exit_time from trade record)
-- `entry_reason`, `exit_reason`
-
-**Step 2 — new Streamlit page `3_model_dashboard.py`:**
-
-Sections:
-1. **Sidebar** — Model selector (Model 1 / Model 2) + Data Source toggle (Backtest Run 4 | Live)
-2. **Portfolio Summary** — total capital, current value, total P&L, annualized return, days running, win rate
-3. **Open Positions** — entry price, high water mark, trail stop price, unrealized P&L, stream, time open (live only — blank in backtest mode since all trades are closed)
-4. **Equity Curve** — cumulative P&L over time, per-stream colored lines
-5. **Stream Scoreboard** — per-stream: trades, WR, total P&L, avg gain/loss, max DD
-6. **Trade Log** — sortable table of all closed trades with stream color coding
-
-**Data source toggle behavior:**
-- `Backtest (Run 4)`: queries `reporting.all_lots WHERE source='backtest' AND model_id=2 AND model_test_id=36`
-- `Live`: queries `reporting.all_lots WHERE source='live' AND model_id=2`
-- Open positions: always from `live.lots WHERE status='OPEN'` (skip in backtest mode)
-
-**Live position display** (already validated manually):
-- Trail stop price = `high_water_mark × (1 - trailing_stop_pct/100)` — pull `trailing_stop_pct` from `live.streams.parameters->>'position'->>'trailing_stop_pct'`
-- Current BTC price from `public.market_data ORDER BY timestamp DESC LIMIT 1` (Supabase)
-
-**Works for live too:** When Model 2 deploys, executor writes to `live.lots`. Toggle to Live, same page shows real trades. No code changes needed at deploy time.
-
-**Feature branch:** Create `feature/model2-live-dashboard` off `main` before starting.
-
-### Cascade DCA Tuning — deferred (explore when Model 2 is locked)
-
-Cascade DCA v1 is built and saved (config_id=17). Not locked for any model. Defer tuning until Model 2 finalization is complete.
-
-Config reference (v1, config_id=17):
-- Signal: pullback_from_high, 10% drop from 48-bar high
-- Filters: SMA200 above, RSI < 50
-- Position: 5% cascade gaps, 12% trail, 15% SL, 3 slots, 4h timeframe
-
-### Regime Robustness Test — ✅ COMPLETE (2026-07-07)
-Run 3 and Run 4 both tested — 56 total windows saved to DB. Viewable in Model Tester under each run's Robust Test tabs.
-
-**Summary:** R3 wins 16 windows, R4 wins 11, 1 tie. R3 more consistent in weak/choppy markets; R4 wins big bull runs. Both strong. Not finalizing Model 2 yet — exploring Cascade DCA first.
-
-### Stream Lab — Results
-
-Goal was 30%+ annual on Primary v2, or to beat Volume Raider's +26.2%.
-Stream lab complete. SMA Pullback is the one candidate. Everything else rejected.
-
-| # | Stream Name | Status | Primary v2 Result | Reason |
-|---|---|---|---|---|
-| — | **Capitulation Catcher** | ❌ Rejected | 43% WR, carried by 2 outlier trades | Counter-trend can't achieve high WR in BTC |
-| 1 | **Volatility Breakout** | ❌ Rejected | ~14% Ann best case | ATR squeeze bug masked initial results; even fixed, couldn't match VR |
-| 2 | **MACD + Volume Surge** | ❌ Rejected | 24-28% WR regardless of tuning | MACD too noisy in BTC's high-volatility env; confirmed prior failure |
-| 3 | **Volume Raider 1h** | ❌ Rejected | More noise, worse signal quality | VR 4h is already the optimized version; 1h adds noise |
-| 4 | **SMA Pullback** | ✅ Candidate | 37% WR, **22.9% Ann**, -23.6% MaxDD | Fills genuine gap — no Model 2 stream covers healthy-bull pullback regime |
-| 5 | **Greed Rider** | ❌ Rejected | Best variant: 31% WR, +3.5% Ann | Redundant with BS+VR; F&G≥70 zone is peak-cycle danger, buys the top |
-
-**SMA Pullback saved** as stream_id=7, config_id=15 (4h, SMA100, 3% tol, RSI<55, 15% trail, 6% SL).
-
-**Complementarity verdict:** SMA Pullback wins. It fires in the one regime none of the 4 Model 2 streams cover (above SMA200, RSI cooling, near SMA100 bounce). Greed Rider overlaps heavily with BS v3 (both: breakout + greed sentiment) and underperforms it badly.
-
-**If you can only pick 5 total streams:** keep the 4 Model 2 streams + SMA Pullback. Greed Rider sits out — rejected on both performance AND redundancy grounds.
-
-### Cascade DCA v1 — NEW STREAM (stream_id=8, config_id=17)
-New slot_mode `cascade` added to engine. Slots auto-enter as price falls — Slot 1 fires on signal, Slot 2+  
-auto-fire when price drops `cascade_drop_pct` below previous slot's entry price.
-
-Config v1 (config_id=17): 4h, pullback_from_high (10% drop from 48-bar high), SMA200 above, RSI<50, 5% cascade gaps, 12% trail, 15% SL, 3 slots.
-
-Stream tester results (5 presets, test_ids 70–74):
-| Window | Ann% | Trades |
-|---|---|---|
-| Full History | +8.4% | 60 |
-| Primary Window | +16.7% | 40 |
-| Primary v2 | +7.3% | 14 |
-| Recent | +14.4% | 9 |
-| 2026 YTD | — | 0 (no signal yet) |
-
-**Character:** Bull market specialist. Exceptional in strong uptrends (2020 +42%, 2024 +40%). Selective — only fires on real 10% dips above SMA200. 2026 YTD = 0 trades because BTC hasn't pulled back 10% from a recent high while above SMA200 + RSI<50.
-
-**Status:** Stream saved and viewable in Stream Tester. NOT locked for any model yet. More tuning possible — wider cascade gaps, different initial drop %, or sentiment filters.
-
-### Possible next ideas (if you want to keep exploring)
-- **Cascade DCA v2** — try 7% cascade gaps (Config H), fewer adds but fires on bigger dips. 2022 goes positive.
-- **Sentiment Momentum** — enter when F&G crosses above 50 (neutral → greed transition). Not tried yet.
-- **Multi-timeframe confirmation** — 4h trend + 1h entry signal. Not tried yet.
-
-### DH regime filter — tested and closed
-Adding `trend_context: above SMA200` to DH v3 kills it — only 1-2 trades ever fire. F&G≤20 (extreme fear) and price above SMA200 are nearly mutually exclusive. DH v3 stays as-is.
-
-### When ready to deploy Model 2
-- Run Supabase migration, create feature branch, deploy Model 2 with $100
+### Possible future explorations
+- **Cascade DCA v2** — wider cascade gaps (7%), fewer adds but fires on bigger dips
+- **Sentiment Momentum** — enter when F&G crosses above 50 (neutral → greed transition)
+- **Multi-timeframe confirmation** — 4h trend + 1h entry signal
 
 ---
 
 ## Branch State
 
-- `main` — current, all development
+- `main` — current, all development, Model Dashboard shipped
 - `live-model-1` — production, GitHub Actions executor — DO NOT TOUCH
-- No active feature branches
 
 ## Pending: Supabase Migration
 
@@ -297,7 +143,18 @@ Live executor uses `live.*` schema only — not affected.
 - **Breakout Scout v2** (stream_id=3) — 1h | range_breakout | SMA200 | F&G≥55 | 10% trail | $33.33
 
 ### Model 2 Streams (BACKTESTED, NOT LIVE)
-See stream table above. model_id=2 in backtest.models.
+- **Volume Raider v1** (config_id=10): volume_surge 4h, 1 slot single, $20/lot
+- **Dip Hunter v3** (config_id=11): rsi_recovery 1h, SL 6%, 1 slot, $20/lot
+- **Breakout Scout v3** (config_id=12): range_breakout 1h, SL 3%, 1 slot, $20/lot
+- **Momentum Rider v4** (config_id=16): ema_crossover 4h, single slot, 8% trail, $20/lot
+- **SMA Pullback v1** (config_id=15): SMA100 pullback 4h, 15% trail, $20/lot
+
+### App Architecture
+- Multipage app: `src/app/app.py` — port 8504 in dev
+- Pages: Stream Tester, Model Tester, Live Monitor, Model Dashboard
+- `src/app/db.py` DB pattern:
+  - `get_local_engine()` — always local postgres via `DB_*` env vars — use for all `backtest.*` queries
+  - `get_engine()` — uses `DATABASE_URL` (Supabase in production) — use for `live.*` queries only
 
 ### v3 Schema (local postgres; Supabase migration pending)
 | Table | What it holds |
@@ -307,6 +164,7 @@ See stream table above. model_id=2 in backtest.models.
 | `backtest.model_streams` | Model composition: which config at what lot_size |
 | `backtest.stream_tests` | Test results, dedup on (stream_config_id, preset_id) |
 | `backtest.model_tests` | Model-level backtests; configuration JSONB, full metrics |
+| `backtest.lots` | Per-trade rows for model-level tests (seeded from Python, not UI) |
 | `backtest.models` | Model version registry (model_id, model_version, status) |
 | `backtest_bak.*` | Pre-v3 snapshot, permanent |
 
@@ -320,3 +178,4 @@ See stream table above. model_id=2 in backtest.models.
 | `market_data_updater.py` | Fixed 2h lookback; gaps never self-healed | Fetch from latest DB timestamp |
 | `executor.py` | tz-naive/aware in `_latest_candle_for_stream` | `.replace(tzinfo=None)` |
 | `kraken_client.py` | `QueryOrders` returns `{}` for taker fills | Fall back to `TradesHistory` |
+| `db.py` | `get_engine()` routed backtest queries to Supabase silently | Split into `get_local_engine()` + `get_engine()` |

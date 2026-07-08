@@ -25,17 +25,23 @@ MODEL_RUNS_DIR      = Path(__file__).parent / "model_runs"
 MODEL_RUNS_DIR.mkdir(exist_ok=True)
 
 
+def get_local_engine():
+    """Always connect to local postgres using DB_* env vars. Used for backtest schema."""
+    host = os.getenv("DB_HOST", "localhost")
+    port = os.getenv("DB_PORT", "5432")
+    name = os.getenv("DB_NAME", "forge_anchor")
+    user = os.getenv("DB_USER", "")
+    pwd  = os.getenv("DB_PASSWORD", "")
+    auth = f"{user}:{pwd}@" if user else ""
+    return create_engine(f"postgresql+psycopg2://{auth}{host}:{port}/{name}")
+
+
 def get_engine():
+    """Connect to the configured database (Supabase when DATABASE_URL is set). Used for live schema."""
     db_url = os.getenv("DATABASE_URL")
     if not db_url:
-        host = os.getenv("DB_HOST", "localhost")
-        port = os.getenv("DB_PORT", "5432")
-        name = os.getenv("DB_NAME", "forge_anchor")
-        user = os.getenv("DB_USER", "")
-        pwd  = os.getenv("DB_PASSWORD", "")
-        auth = f"{user}:{pwd}@" if user else ""
-        db_url = f"postgresql+psycopg2://{auth}{host}:{port}/{name}"
-    elif db_url.startswith("postgresql://") and "+psycopg2" not in db_url:
+        return get_local_engine()
+    if db_url.startswith("postgresql://") and "+psycopg2" not in db_url:
         db_url = db_url.replace("postgresql://", "postgresql+psycopg2://", 1)
     return create_engine(db_url)
 
@@ -46,7 +52,7 @@ def get_engine():
 def load_timeframe_presets() -> list:
     """Returns active presets as a list of dicts."""
     try:
-        engine = get_engine()
+        engine = get_local_engine()
         with engine.connect() as conn:
             rows = pd.read_sql(text("""
                 SELECT preset_id, name, start_date, end_date, description
@@ -60,7 +66,7 @@ def load_timeframe_presets() -> list:
 
 
 def save_timeframe_preset(name: str, start_date, end_date, description: str = "") -> int:
-    engine = get_engine()
+    engine = get_local_engine()
     with engine.connect() as conn:
         row = conn.execute(text("""
             INSERT INTO timeframe_presets (name, start_date, end_date, description)
@@ -80,7 +86,7 @@ def save_timeframe_preset(name: str, start_date, end_date, description: str = ""
 def load_streams() -> list:
     """Load all stream identities from backtest.streams."""
     try:
-        engine = get_engine()
+        engine = get_local_engine()
         with engine.connect() as conn:
             rows = pd.read_sql(text("""
                 SELECT stream_id, stream_name, strategy_type, description
@@ -99,7 +105,7 @@ def load_stream_configs(stream_id: int = None) -> list:
     Returns list of dicts with parsed params.
     """
     try:
-        engine = get_engine()
+        engine = get_local_engine()
         where  = "WHERE sc.stream_id = :sid" if stream_id is not None else ""
         params = {"sid": stream_id} if stream_id is not None else {}
         with engine.connect() as conn:
@@ -190,7 +196,7 @@ def load_run_payload(test_id: int):
     # Heal 'unnamed' stream_name from DB if possible
     if payload.get("stream_name") in (None, "", "unnamed"):
         try:
-            with get_engine().connect() as conn:
+            with get_local_engine().connect() as conn:
                 row = conn.execute(
                     text("SELECT stream_name FROM backtest.stream_tests WHERE test_id = :tid"),
                     {"tid": test_id}
@@ -212,7 +218,7 @@ def load_stream_history(stream_config_id: int = None) -> pd.DataFrame:
     Includes a computed timeframe_label column.
     """
     try:
-        engine = get_engine()
+        engine = get_local_engine()
         where  = "AND st.stream_config_id = :cid" if stream_config_id is not None else ""
         params = {"cid": stream_config_id} if stream_config_id is not None else {}
         with engine.connect() as conn:
@@ -261,7 +267,7 @@ def save_stream_test(
                (stream_config_id, custom_start, custom_end) for custom.
     Returns test_id.
     """
-    engine     = get_engine()
+    engine     = get_local_engine()
     slot_count = payload.get("slot_count", 1)
     slot_mode  = payload.get("slot_mode", "single")
 
@@ -455,7 +461,7 @@ def load_last_model_run():
 def load_models() -> list:
     """Return all model versions from backtest.models."""
     try:
-        with get_engine().connect() as conn:
+        with get_local_engine().connect() as conn:
             rows = conn.execute(text(
                 "SELECT model_id, model_version, description FROM backtest.models ORDER BY model_id"
             )).fetchall()
@@ -466,7 +472,7 @@ def load_models() -> list:
 
 def load_model_history(model_id: int = None) -> pd.DataFrame:
     try:
-        engine = get_engine()
+        engine = get_local_engine()
         where  = "WHERE mt.model_id = :mid" if model_id is not None else ""
         params = {"mid": model_id} if model_id is not None else {}
         with engine.connect() as conn:
@@ -498,7 +504,7 @@ def load_model_history(model_id: int = None) -> pd.DataFrame:
 def load_model_composition(model_id: int) -> list:
     """Load the stream configs that make up a model version."""
     try:
-        engine = get_engine()
+        engine = get_local_engine()
         with engine.connect() as conn:
             rows = pd.read_sql(text("""
                 SELECT
@@ -535,7 +541,7 @@ def load_model_composition(model_id: int) -> list:
 def load_locked_streams_full() -> list:
     """Load locked stream configs with params — for model tester."""
     try:
-        engine = get_engine()
+        engine = get_local_engine()
         with engine.connect() as conn:
             rows = pd.read_sql(text("""
                 SELECT
@@ -608,7 +614,7 @@ def _pending_model_for_hash(ah: str, exclude: set = None) -> list:
 
 
 def next_model_run_number(model_id: int, alloc_h: str) -> int:
-    engine = get_engine()
+    engine = get_local_engine()
     with engine.connect() as conn:
         rows = conn.execute(text("""
             SELECT run_number, configuration
@@ -629,6 +635,89 @@ def next_model_run_number(model_id: int, alloc_h: str) -> int:
     return max(int(r[0]) for r in rows) + 1
 
 
+def load_dashboard_lots(model_id: int, source: str, model_test_id: int = None) -> pd.DataFrame:
+    """Load per-trade lot rows for the model dashboard."""
+    try:
+        engine = get_local_engine() if source == "backtest" else get_engine()
+        if source == "backtest":
+            where = "bl.model_id = :mid AND bl.model_test_id = :mtid"
+            params = {"mid": model_id, "mtid": model_test_id}
+            query = f"""
+                SELECT
+                    bl.lot_id, bl.slot_number, bl.lot_sequence, bl.status,
+                    bl.opening_capital, bl.closing_capital, bl.realized_pnl,
+                    bl.entry_price, bl.exit_price, bl.high_water_mark,
+                    bl.opened_at, bl.closed_at, bl.exit_reason,
+                    s.stream_name, sc.version,
+                    s.stream_name || ' ' || sc.version AS full_stream_name,
+                    (sc.parameters->'position'->>'trailing_stop_pct')::float AS trailing_stop_pct
+                FROM backtest.lots bl
+                JOIN backtest.streams s ON bl.stream_id = s.stream_id
+                JOIN backtest.stream_configs sc ON bl.stream_config_id = sc.stream_config_id
+                WHERE {where}
+                ORDER BY bl.opened_at
+            """
+        else:
+            query = """
+                SELECT
+                    ll.lot_id, ll.slot_number, ll.lot_sequence, ll.status,
+                    ll.opening_capital, ll.closing_capital, ll.realized_pnl,
+                    ll.entry_price, ll.exit_price, ll.high_water_mark,
+                    ll.opened_at, ll.closed_at, ll.exit_reason,
+                    ls.stream_name, NULL::text AS version,
+                    ls.stream_name AS full_stream_name,
+                    (ls.parameters->'position'->>'trailing_stop_pct')::float AS trailing_stop_pct
+                FROM live.lots ll
+                JOIN live.streams ls ON ll.stream_id = ls.stream_id
+                WHERE ll.model_id = :mid
+                ORDER BY ll.opened_at
+            """
+            params = {"mid": model_id}
+        with engine.connect() as conn:
+            return pd.read_sql(text(query), conn, params=params)
+    except Exception:
+        return pd.DataFrame()
+
+
+def load_current_btc_price(source: str = "local"):
+    """Fetch the most recent BTC close price. source='local' uses local postgres; 'supabase' uses Supabase."""
+    try:
+        eng = get_engine() if source == "supabase" else get_local_engine()
+        with eng.connect() as conn:
+            row = conn.execute(text(
+                "SELECT close, timestamp FROM market_data ORDER BY timestamp DESC LIMIT 1"
+            )).fetchone()
+        return float(row[0]) if row else None
+    except Exception:
+        return None
+
+
+def load_dashboard_model_tests(model_id: int) -> pd.DataFrame:
+    """Return saved model tests for a given model (for the run selector)."""
+    try:
+        engine = get_local_engine()
+        with engine.connect() as conn:
+            return pd.read_sql(text("""
+                SELECT
+                    mt.model_test_id, mt.run_number,
+                    COALESCE(tp.name,
+                        TO_CHAR(mt.simulation_start, 'Mon YYYY') || ' → ' ||
+                        COALESCE(TO_CHAR(mt.simulation_end, 'Mon YYYY'), 'present')
+                    ) AS timeframe_label,
+                    mt.annualized_return_pct, mt.total_trades, mt.total_pnl,
+                    mt.simulation_start, mt.simulation_end, mt.notes,
+                    EXISTS (
+                        SELECT 1 FROM backtest.lots bl WHERE bl.model_test_id = mt.model_test_id
+                    ) AS has_lots
+                FROM backtest.model_tests mt
+                LEFT JOIN timeframe_presets tp ON mt.preset_id = tp.preset_id
+                WHERE mt.model_id = :mid AND mt.status = 'completed'
+                ORDER BY mt.run_number, mt.created_at DESC
+            """), conn, params={"mid": model_id})
+    except Exception:
+        return pd.DataFrame()
+
+
 def save_model_test(
     payload: dict,
     preset_id: int = None,
@@ -637,7 +726,7 @@ def save_model_test(
     notes: str = "",
     history: pd.DataFrame = None,
 ) -> tuple:
-    engine   = get_engine()
+    engine   = get_local_engine()
     cm       = payload["combined_metrics"]
     alloc    = payload["allocations"]
     ah       = _alloc_hash(alloc)
@@ -685,6 +774,7 @@ def save_model_test(
             "notes":                notes,
         })
         model_test_id = row.scalar()
+        _save_lots(conn, model_test_id, model_id, payload.get("stream_results", []))
         conn.commit()
 
     pkl_path = MODEL_RUNS_DIR / f"{model_test_id}.pkl"
@@ -696,3 +786,66 @@ def save_model_test(
         pending.unlink()
 
     return model_test_id, run_num
+
+
+def _save_lots(conn, model_test_id: int, model_id: int, stream_results: list):
+    # Build stream_id → strategy_type map for entry_reason
+    strategy_map = {}
+    try:
+        sr_ids = [sr["stream_id"] for sr in stream_results if sr.get("stream_id")]
+        if sr_ids:
+            placeholders = ",".join(str(i) for i in sr_ids)
+            rows_raw = conn.execute(text(
+                f"SELECT stream_id, strategy_type FROM backtest.streams WHERE stream_id IN ({placeholders})"
+            )).fetchall()
+            strategy_map = {r[0]: r[1] for r in rows_raw}
+    except Exception:
+        pass
+
+    rows = []
+    for sr in stream_results:
+        trades = sr.get("trades")
+        if trades is None or trades.empty:
+            continue
+        stream_id        = sr["stream_id"]
+        stream_config_id = sr.get("stream_config_id")
+        entry_reason     = strategy_map.get(stream_id, "signal")
+        for seq, (_, t) in enumerate(trades.iterrows(), start=1):
+            ep = float(t["entry_price"])
+            rows.append({
+                "model_test_id":    model_test_id,
+                "model_id":         model_id,
+                "stream_id":        stream_id,
+                "stream_config_id": stream_config_id,
+                "slot_number":      int(t.get("slot", 1)),
+                "lot_sequence":     seq,
+                "status":           "CLOSED",
+                "opening_capital":  float(t["capital"]),
+                "btc_quantity":     float(t["capital"]) / ep,
+                "entry_price":      ep,
+                "high_water_mark":  float(t["highest_close"]) if "highest_close" in t.index and pd.notna(t.get("highest_close")) else None,
+                "exit_price":       float(t["exit_price"]),
+                "closing_capital":  float(t["capital"]) + float(t["pnl"]),
+                "realized_pnl":     float(t["pnl"]),
+                "entry_reason":     entry_reason,
+                "exit_reason":      str(t.get("exit_reason", "")),
+                "opened_at":        t["entry_ts"],
+                "closed_at":        t["exit_ts"],
+            })
+    if not rows:
+        return
+    conn.execute(text("""
+        INSERT INTO backtest.lots (
+            model_test_id, model_id, stream_id, stream_config_id,
+            slot_number, lot_sequence, status,
+            opening_capital, btc_quantity, entry_price, high_water_mark, exit_price,
+            closing_capital, realized_pnl,
+            entry_reason, exit_reason, opened_at, closed_at
+        ) VALUES (
+            :model_test_id, :model_id, :stream_id, :stream_config_id,
+            :slot_number, :lot_sequence, :status,
+            :opening_capital, :btc_quantity, :entry_price, :high_water_mark, :exit_price,
+            :closing_capital, :realized_pnl,
+            :entry_reason, :exit_reason, :opened_at, :closed_at
+        )
+    """), rows)

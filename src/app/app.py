@@ -52,5 +52,6 @@ pg = st.navigation([
     st.Page("stream_tester.py", title="Stream Tester", icon="📡"),
     st.Page("pages/1_model_tester.py", title="Model Tester", icon="🏆"),
     st.Page("pages/2_live_monitor.py", title="Live Monitor", icon="🔴"),
+    st.Page("pages/3_model_dashboard.py", title="Model Dashboard", icon="📊"),
 ])
 pg.run()
