@@ -9,9 +9,9 @@ This reminder must stay at the top of every handoff until confirmed complete.
 
 ## Current State
 
-**Model 1 is LIVE** — executor running, cron on schedule.
+**Model 1 is LIVE** — executor running, cron on schedule. Trade alerting active (email + SMS on fill and close).
 
-**Model 2 is assembled and backtested.** Not yet deployed — at least a month away from going live.
+**Model 2 is assembled and backtested.** Run 3 selected as deployment config. Not yet deployed — at least a month away from going live.
 
 **Model Dashboard is BUILT** — `3_model_dashboard.py` live in the multipage app (port 8504). backtest.lots seeded for Model 1 and Model 2 (multiple configs + timeframes). Feature branch merged to main.
 
@@ -70,6 +70,22 @@ All 6 trade close points (single/staggered/cascade × main exit + end_of_data) n
 
 Fix: `get_local_engine()` builds connection from `DB_HOST/PORT/NAME/USER/PASSWORD` env vars (always local postgres). All backtest functions use it. `get_engine()` (Supabase) reserved for live schema only.
 
+### Trade Alerting — built and shipped
+
+`src/live/notifier.py` — new module. Gmail SMTP, separate sends to email and SMS so T-Mobile gateway works.
+
+**Events:**
+- **Opened** — fires when limit buy order fills (not when placed). Includes model, stream, fill price, BTC qty, capital in.
+- **Closed** — fires when trailing stop triggers. Includes model, stream, entry→exit price, cash in→out, P&L.
+
+**Setup:** 4 env vars in `.env` + 4 GitHub Actions secrets (ALERT_FROM_EMAIL, ALERT_APP_PASSWORD, ALERT_TO_EMAIL, ALERT_TO_SMS). See `.env.example`.
+
+**Test:** `python -m src.live.notifier` — sends sample opened + closed alerts.
+
+**SMS note:** T-Mobile rate-limits if you send many test messages in a short window. Wait ~1 hour between test bursts.
+
+Cherry-picked to `live-model-1` — active on next real trade.
+
 ---
 
 ## What's Next
@@ -84,7 +100,10 @@ python -m src.data.sentiment    # sentiment_data (F&G index)
 
 ### Deploy Model 2
 
-Model 2 is ready from a backtest perspective. Run 4 (5-stream, $20 each) leads on Primary v2.
+**Selected config (as of 2026-07-08): Run 3** — Config A, 4-stream, $25/lot each.
+Rationale: strongest YTD (+17.8% vs +11.9%), best Full History result, and cleaner than Run 4.
+SMA Pullback v1 (the 5th stream in Run 4) showed meaningful 2026 drag — excluded for now.
+This can be revisited before deployment; if no changes, Run 3 is what goes live.
 
 Before going live:
 1. ✅ All streams locked with backtest results
@@ -100,9 +119,10 @@ Before going live:
 |---|---|---|---|---|---|---|
 | Run 1 | Config A — 4-stream $25 each | v3 staggered 7% | +17.5% | +19.4% | +18.8% | +18.3% |
 | Run 2 | Config B — 5-stream $20 each | v3 staggered 7% | +18.6% | +19.5% | +20.2% | +12.3% |
-| Run 3 | Config A — 4-stream $25 each | **v4 single 8%** | +19.2% | +21.7% | +20.9% | +17.8% |
-| **Run 4** | **Config B — 5-stream $20 each** | **v4 single 8%** | **+20.0%** | **+21.4%** | **+21.9%** | +11.9% |
+| **Run 3 ✓ SELECTED** | **Config A — 4-stream $25 each** | **v4 single 8%** | **+19.2%** | **+21.7%** | **+20.9%** | **+17.8%** |
+| Run 4 | Config B — 5-stream $20 each | v4 single 8% | +20.0% | +21.4% | +21.9% | +11.9% |
 
+Run 3 = DH v3 + VR v1 + BS v3 + MR v4, all $25/lot.
 Run 4 = DH v3 + VR v1 + BS v3 + MR v4 + SMA Pullback v1, all $20/lot.
 
 ### Possible future explorations
@@ -114,8 +134,8 @@ Run 4 = DH v3 + VR v1 + BS v3 + MR v4 + SMA Pullback v1, all $20/lot.
 
 ## Branch State
 
-- `main` — current, all development, Model Dashboard shipped
-- `live-model-1` — production, GitHub Actions executor — DO NOT TOUCH
+- `main` — current, all development
+- `live-model-1` — production, GitHub Actions executor — DO NOT TOUCH (alerting cherry-picked here 2026-07-08)
 
 ## Pending: Supabase Migration
 
@@ -142,12 +162,13 @@ Live executor uses `live.*` schema only — not affected.
 - **Dip Hunter v2** (stream_id=2) — 1h | RSI recovery, F&G≤20, 25% drawdown, RSI≥35, 10% trail | $33.33
 - **Breakout Scout v2** (stream_id=3) — 1h | range_breakout | SMA200 | F&G≥55 | 10% trail | $33.33
 
-### Model 2 Streams (BACKTESTED, NOT LIVE)
-- **Volume Raider v1** (config_id=10): volume_surge 4h, 1 slot single, $20/lot
-- **Dip Hunter v3** (config_id=11): rsi_recovery 1h, SL 6%, 1 slot, $20/lot
-- **Breakout Scout v3** (config_id=12): range_breakout 1h, SL 3%, 1 slot, $20/lot
-- **Momentum Rider v4** (config_id=16): ema_crossover 4h, single slot, 8% trail, $20/lot
-- **SMA Pullback v1** (config_id=15): SMA100 pullback 4h, 15% trail, $20/lot
+### Model 2 Streams — Run 3 SELECTED (BACKTESTED, NOT LIVE)
+- **Dip Hunter v3** (config_id=11): rsi_recovery 1h, SL 6%, 1 slot, $25/lot
+- **Volume Raider v1** (config_id=10): volume_surge 4h, 1 slot single, $25/lot
+- **Breakout Scout v3** (config_id=12): range_breakout 1h, SL 3%, 1 slot, $25/lot
+- **Momentum Rider v4** (config_id=16): ema_crossover 4h, single slot, 8% trail, $25/lot
+
+Note: SMA Pullback v1 (config_id=15) exists in DB but excluded from Run 3 — showed 2026 YTD drag.
 
 ### App Architecture
 - Multipage app: `src/app/app.py` — port 8504 in dev
