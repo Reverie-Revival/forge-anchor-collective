@@ -27,6 +27,10 @@ jobs:
           KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
           KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
           DRY_RUN: ${{ secrets.DRY_RUN }}
+          ALERT_FROM_EMAIL: ${{ secrets.ALERT_FROM_EMAIL }}
+          ALERT_APP_PASSWORD: ${{ secrets.ALERT_APP_PASSWORD }}
+          ALERT_TO_EMAIL: ${{ secrets.ALERT_TO_EMAIL }}
+          ALERT_TO_SMS: ${{ secrets.ALERT_TO_SMS }}
         run: |
           if [ "$DRY_RUN" = "true" ]; then
             python -m src.live.executor --dry-run
