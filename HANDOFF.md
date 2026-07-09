@@ -1,4 +1,4 @@
-# Handoff — 2026-07-08
+# Handoff — 2026-07-09
 
 ---
 ## ⚠️ ACTION REQUIRED BY AUG 1, 2026 — ORACLE ACCOUNT
@@ -9,82 +9,51 @@ This reminder must stay at the top of every handoff until confirmed complete.
 
 ## Current State
 
-**Model 1 is LIVE** — executor running, cron on schedule. Trade alerting active (email + SMS on fill and close).
+**Model 1 is LIVE** — executor running, cron on schedule. Full alert coverage active (order placed, filled, closed, expired, system down).
 
 **Model 2 is assembled and backtested.** Run 3 selected as deployment config. Not yet deployed — at least a month away from going live.
 
-**Model Dashboard is BUILT** — `3_model_dashboard.py` live in the multipage app (port 8504). backtest.lots seeded for Model 1 and Model 2 (multiple configs + timeframes). Feature branch merged to main.
+**Model Dashboard is BUILT** — `3_model_dashboard.py` live in the multipage app (port 8504).
 
 ---
 
-## Done This Session (2026-07-08)
+## Done This Session (2026-07-09)
 
-### Model Dashboard — built and shipped
+### Alert Coverage — expanded and hardened
 
-New Streamlit page `src/app/pages/3_model_dashboard.py`. Added to `src/app/app.py` navigation.
+**New alert types in `src/live/notifier.py`:**
+- `alert_order_placed()` — fires when limit buy hits Kraken, before fill. Includes expiry time so you know the window.
+- `alert_order_expired()` — fires when an order times out unfilled or Kraken cancels it. Slot freed automatically.
+- `alert_system_down(hours)` — fires when executor has been silent > 2h.
 
-**What it shows:**
-- Portfolio snapshot: starting capital, current value, total return, annualized return (compound), YTD P&L, win rate
-- Stream status cards: open positions per stream with unrealized P&L + trail stop; last closed trade summary; YTD P&L
-- Equity curve: per-stream cumulative P&L lines + dotted "Avg Stream" baseline (not a sum — lets you see which streams are above/below average)
-- Period tabs: All Time / YTD / 90 Days / 30 Days
-- Monthly P&L breakdown table
-- Open Positions: entry price, current BTC value, unrealized P&L, trail stop price, days open
-- Trade Log: formatted table, sorted by close date, stream filter multiselect
+**Full alert sequence:**
+1. Order Placed — limit buy submitted to Kraken
+2. Opened — limit buy filled
+3. Closed — trailing stop triggered
+4. Order Expired — order never filled, slot freed
 
-**Key design points:**
-- `end_of_data` exit reason = still-open simulated positions → shown in Open Positions with live BTC price
-- Backtest mode uses local postgres; Live mode will use Supabase
-- Annualized return uses compound formula matching `compute_metrics()` — matches the dropdown label
-- Equity chart "Avg Stream" line = average of per-stream cumulative P&L at each timestamp (not sum)
-- `src/app/db.py`: `get_local_engine()` always uses `DB_*` env vars for backtest schema; `get_engine()` uses `DATABASE_URL` (Supabase) for live schema. All backtest functions now call `get_local_engine()`.
+**Test command:** `python -m src.live.notifier` — sends all 4 trade alert types.
+**SMS note:** T-Mobile rate-limits burst sends. Wait ~1h between test runs.
 
-### backtest.lots — seeded for all model comparisons
+### Dead Man's Switch — two layers
 
-Seeded via Python (not the UI) using `run_model_backtest()` + `save_model_test()`:
+**Layer 1 (self-check in executor.py):** When executor runs, if gap from `last_run_at` > 2h, fires `alert_system_down`. Catches "system recovered after outage."
 
-| model_test_id | Model | Run | Window | Trades | Ann% |
-|---|---|---|---|---|---|
-| 97 | Model 1 | 1 | Full History | 225 | +19.4% |
-| 99 | Model 2 | 3 | Full History | 218 | +21.7% |
-| 100 | Model 2 | 4 | Full History | 268 | +21.4% |
-| 101 | Model 1 | 4 | Full History | 142 | +22.4% |
-| 102 | Model 1 | 4 | Primary v2 | 66 | +15.6% |
-| 103 | Model 2 | 3 | Primary v2 | 107 | +19.4% |
-| 104 | Model 2 | 4 | Primary v2 | 126 | +20.1% |
+**Layer 2 (independent healthcheck):** `src/live/healthcheck.py` + `.github/workflows/healthcheck.yml`. Separate cron-job.org schedule (every 2h) triggers this independently of the executor. Queries `live.executor_state` and alerts if stale. Catches ongoing outages the executor itself can't detect.
 
-**Key insight from Primary v2 comparison (the right window):**
-- Model 1: 15.6% — underperforms S&P on this window (designed pre-2022)
-- Model 2 Run 3: 19.4%
-- Model 2 Run 4: 20.1% — clearly the better model on the period it was designed for
+**cron-job.org setup:** A second job was added pointing at the `healthcheck` workflow. Same PAT, same pattern as executor/market_data jobs.
 
-**VR v1 note:** Only 6.4% annualized on Full History. Looks good on Primary v2 (26.2%) because it was designed/tuned on 2022+ data. 2018–2021 was drag. This is expected and correct.
+### Order Expiry Fix — `order_manager.check_pending()`
 
-### engine.py — highest_close added to trade records
+**Before:** Expiry check ran AFTER Kraken API call. If Kraken was unreachable, `continue` skipped the expiry check — expired lots could pile up indefinitely, blocking slots.
 
-All 6 trade close points (single/staggered/cascade × main exit + end_of_data) now include `"highest_close"` in the trade dict, enabling `high_water_mark` to be populated in `backtest.lots`.
+**After:** Expiry check runs FIRST based on our own `entry_expiry_at` timestamp. Expired lots are always cancelled and deleted regardless of Kraken API health. Kraken query only runs for non-expired lots.
 
-### DB engine split — critical bug fix
+Also added `entry_price` to the `check_pending` SELECT (was missing, needed for expiry alert).
 
-`DATABASE_URL` in `.env` is the Supabase URL. Before this fix, every backtest query (`backtest.*`) was silently failing and returning empty results because `get_engine()` always used `DATABASE_URL`.
+### Cherry-pick to live-model-1
 
-Fix: `get_local_engine()` builds connection from `DB_HOST/PORT/NAME/USER/PASSWORD` env vars (always local postgres). All backtest functions use it. `get_engine()` (Supabase) reserved for live schema only.
-
-### Trade Alerting — built and shipped
-
-`src/live/notifier.py` — new module. Gmail SMTP, separate sends to email and SMS so T-Mobile gateway works.
-
-**Events:**
-- **Opened** — fires when limit buy order fills (not when placed). Includes model, stream, fill price, BTC qty, capital in.
-- **Closed** — fires when trailing stop triggers. Includes model, stream, entry→exit price, cash in→out, P&L.
-
-**Setup:** 4 env vars in `.env` + 4 GitHub Actions secrets (ALERT_FROM_EMAIL, ALERT_APP_PASSWORD, ALERT_TO_EMAIL, ALERT_TO_SMS). See `.env.example`.
-
-**Test:** `python -m src.live.notifier` — sends sample opened + closed alerts.
-
-**SMS note:** T-Mobile rate-limits if you send many test messages in a short window. Wait ~1 hour between test bursts.
-
-Cherry-picked to `live-model-1` — active on next real trade.
+All changes cherry-picked. Conflict resolved: `live-model-1` had a `_preflight_check()` (data freshness gate) not in `main` — preserved it and slotted the gap check before it. Both layers now on both branches.
 
 ---
 
@@ -103,7 +72,6 @@ python -m src.data.sentiment    # sentiment_data (F&G index)
 **Selected config (as of 2026-07-08): Run 3** — Config A, 4-stream, $25/lot each.
 Rationale: strongest YTD (+17.8% vs +11.9%), best Full History result, and cleaner than Run 4.
 SMA Pullback v1 (the 5th stream in Run 4) showed meaningful 2026 drag — excluded for now.
-This can be revisited before deployment; if no changes, Run 3 is what goes live.
 
 Before going live:
 1. ✅ All streams locked with backtest results
@@ -123,19 +91,20 @@ Before going live:
 | Run 4 | Config B — 5-stream $20 each | v4 single 8% | +20.0% | +21.4% | +21.9% | +11.9% |
 
 Run 3 = DH v3 + VR v1 + BS v3 + MR v4, all $25/lot.
-Run 4 = DH v3 + VR v1 + BS v3 + MR v4 + SMA Pullback v1, all $20/lot.
 
-### Possible future explorations
-- **Cascade DCA v2** — wider cascade gaps (7%), fewer adds but fires on bigger dips
-- **Sentiment Momentum** — enter when F&G crosses above 50 (neutral → greed transition)
-- **Multi-timeframe confirmation** — 4h trend + 1h entry signal
+### Future Explorations (spitballed this session, nothing to build yet)
+
+- **ETH as next asset (Model 3):** ETH/USD on Kraken, same fee structure, same strategy types. Main lift: make `pair` first-class in executor + backtester. Recommended: pure ETH-only $100 model first before mixing assets.
+- **SOL:** Higher beta, thinner liquidity. Valid but wait until ETH has real data.
+- **Mixed-asset models:** BTC + ETH + SOL streams in one model. Interesting long-term.
+- **Multi-account support:** Let a family member run the same model on their own Kraken account. ~1 day of work. Gate: Model 1 needs 3-6 months live track record first. Requires balance check + low-balance alert alongside it.
 
 ---
 
 ## Branch State
 
 - `main` — current, all development
-- `live-model-1` — production, GitHub Actions executor — DO NOT TOUCH (alerting cherry-picked here 2026-07-08)
+- `live-model-1` — production, GitHub Actions executor — cherry-pick critical fixes only
 
 ## Pending: Supabase Migration
 
@@ -147,15 +116,26 @@ Live executor uses `live.*` schema only — not affected.
 ## Reference: Architecture
 
 ### Branch Strategy
-- `main` — all development
+- `main` — all development. Dashboard, backtester, all 4 Streamlit pages.
 - `live-model-1` — production only. Critical fixes only. No feature work.
 - Bug fixes to live: commit to `live-model-1` directly, cherry-pick to `main`
+- **Important:** `live-model-1` has `_preflight_check()` in executor.py (data freshness gate) that main does not. Don't lose it on future cherry-picks.
 
 ### GitHub Actions Workflows
 | Workflow | Trigger | What It Does |
 |---|---|---|
-| `executor.yml` | Every 30 min | Runs `src.live.executor` tick |
-| `market_data.yml` | Every 15 min | Fetches candles + updates sentiment |
+| `executor.yml` | Every 30 min (cron-job.org) | Runs `src.live.executor` tick |
+| `market_data.yml` | Every 15 min (cron-job.org) | Fetches candles + updates sentiment |
+| `healthcheck.yml` | Every 2h (cron-job.org) | Dead man's switch — alerts if executor silent > 2h |
+
+### Alert System (`src/live/notifier.py`)
+| Function | When It Fires |
+|---|---|
+| `alert_order_placed()` | Limit buy submitted to Kraken |
+| `alert_opened()` | Limit buy filled |
+| `alert_closed()` | Trailing stop triggered, position closed |
+| `alert_order_expired()` | Order timed out unfilled, slot freed |
+| `alert_system_down(hours)` | Executor silent > 2h (executor self-check or healthcheck) |
 
 ### Model 1 Streams (LIVE)
 - **Momentum Rider v2** (stream_id=1) — 4h | EMA 30/120 | 7% trail | $33.33
@@ -168,10 +148,8 @@ Live executor uses `live.*` schema only — not affected.
 - **Breakout Scout v3** (config_id=12): range_breakout 1h, SL 3%, 1 slot, $25/lot
 - **Momentum Rider v4** (config_id=16): ema_crossover 4h, single slot, 8% trail, $25/lot
 
-Note: SMA Pullback v1 (config_id=15) exists in DB but excluded from Run 3 — showed 2026 YTD drag.
-
 ### App Architecture
-- Multipage app: `src/app/app.py` — port 8504 in dev
+- Multipage app: `src/app/app.py` — port 8504 in dev (`streamlit run src/app/app.py --server.port 8504`)
 - Pages: Stream Tester, Model Tester, Live Monitor, Model Dashboard
 - `src/app/db.py` DB pattern:
   - `get_local_engine()` — always local postgres via `DB_*` env vars — use for all `backtest.*` queries
@@ -200,3 +178,4 @@ Note: SMA Pullback v1 (config_id=15) exists in DB but excluded from Run 3 — sh
 | `executor.py` | tz-naive/aware in `_latest_candle_for_stream` | `.replace(tzinfo=None)` |
 | `kraken_client.py` | `QueryOrders` returns `{}` for taker fills | Fall back to `TradesHistory` |
 | `db.py` | `get_engine()` routed backtest queries to Supabase silently | Split into `get_local_engine()` + `get_engine()` |
+| `order_manager.py` | Expiry check ran after Kraken API call — expired lots stuck if Kraken unreachable | Check our own expiry timestamp first |

@@ -119,6 +119,8 @@ if __name__ == "__main__":
     from dotenv import load_dotenv
     load_dotenv()
     print("Sending test alerts...")
+    alert_order_placed("Momentum Rider v2", 1, 33.33, 105420.00, 0.000316, "2026-07-08 18:00 UTC")
     alert_opened("Momentum Rider v2", 1, 33.33, 105420.00, 0.000316)
     alert_closed("Momentum Rider v2", 1, 105420.00, 108650.00, 33.33, 37.54, 4.21)
+    alert_order_expired("Breakout Scout v2", 1, 105420.00)
     print("Done -- check your email and texts.")
