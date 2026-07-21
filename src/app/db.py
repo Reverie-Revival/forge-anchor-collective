@@ -37,10 +37,13 @@ def get_local_engine():
 
 
 def get_engine():
-    """Connect to the configured database (Supabase when DATABASE_URL is set). Used for live schema."""
-    db_url = os.getenv("DATABASE_URL")
+    """Connect to Supabase (live schema). Always uses SUPABASE_DATABASE_URL — never local postgres."""
+    db_url = os.getenv("SUPABASE_DATABASE_URL")
     if not db_url:
-        return get_local_engine()
+        raise RuntimeError(
+            "SUPABASE_DATABASE_URL is not set. "
+            "This variable must point to Supabase. Do not use DATABASE_URL for live queries."
+        )
     if db_url.startswith("postgresql://") and "+psycopg2" not in db_url:
         db_url = db_url.replace("postgresql://", "postgresql+psycopg2://", 1)
     return create_engine(db_url)

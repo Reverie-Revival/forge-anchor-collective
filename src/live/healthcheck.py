@@ -24,9 +24,9 @@ ALERT_THRESHOLD_HOURS = 2
 
 
 def run() -> None:
-    url = os.getenv("DATABASE_URL", "")
+    url = os.getenv("SUPABASE_DATABASE_URL", "")
     if not url:
-        log.error("DATABASE_URL not set")
+        log.error("SUPABASE_DATABASE_URL not set — must point to Supabase, not local postgres")
         sys.exit(1)
     if url.startswith("postgresql://") and "+psycopg2" not in url:
         url = url.replace("postgresql://", "postgresql+psycopg2://", 1)

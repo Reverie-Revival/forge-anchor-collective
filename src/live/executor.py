@@ -40,7 +40,12 @@ LIVE_MODEL_VERSION = 1
 
 
 def _get_engine():
-    url = os.getenv("DATABASE_URL", "postgresql://localhost/forge_anchor")
+    url = os.getenv("SUPABASE_DATABASE_URL", "")
+    if not url:
+        raise RuntimeError(
+            "SUPABASE_DATABASE_URL is not set. "
+            "This must point to Supabase. Do not use DATABASE_URL for the executor."
+        )
     if url.startswith("postgresql://") and "+psycopg2" not in url:
         url = url.replace("postgresql://", "postgresql+psycopg2://", 1)
     return create_engine(url)
