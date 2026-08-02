@@ -417,9 +417,16 @@ def _render_blended_trade_log(closed: pd.DataFrame, c_hrs: float, key_prefix: st
         else:
             result_word = "WIN" if row["pnl"] > 0.001 else ("FLAT" if abs(row["pnl"]) <= 0.001 else "LOSS")
 
-        # 0.25% maker fee per side (0.5% round trip). The buy-side fee is already
-        # baked into smaller BTC quantities (qty = capital*(1-fee)/price), so it's
-        # NOT a separate subtraction anywhere below -- only the sell-side fee is.
+        # BACKTEST DISPLAY ONLY -- mirrors _run_blended_slots' own convention of a
+        # single 0.25% maker fee on both sides (0.5% round trip), because the
+        # backtester simulates every exit as a limit-touch, not a real market
+        # order. Live Model 3 exits are real market sells at TAKER_FEE (0.40%) --
+        # do NOT reuse this MAKER_FEE-both-sides math for a future live blended
+        # trade log; see src/live/blended_order_manager.py's fee model docstring
+        # and src/live/blended_position_monitor.py for the correct live version.
+        # The buy-side fee here is already baked into smaller BTC quantities
+        # (qty = capital*(1-fee)/price), so it's NOT a separate subtraction
+        # anywhere below -- only the sell-side fee is.
         MAKER_FEE  = 0.0025
         gross_sale = total_qty * row["exit_price"]
         buy_fee    = capital_in * MAKER_FEE

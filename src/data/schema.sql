@@ -308,11 +308,16 @@ CREATE INDEX IF NOT EXISTS idx_live_lots_status ON live.lots (status);
 
 CREATE TABLE IF NOT EXISTS live.executor_state (
     id          INTEGER      PRIMARY KEY DEFAULT 1,
-    last_run_at TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+    last_run_at TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    model_id    INTEGER      -- tags which live.models row this heartbeat belongs to;
+                              -- lets multiple independent executors (Model 1, Model 3, ...)
+                              -- each own a row instead of fighting over id=1
 );
-INSERT INTO live.executor_state (id, last_run_at)
-VALUES (1, NOW())
+INSERT INTO live.executor_state (id, last_run_at, model_id)
+VALUES (1, NOW(), 1)
 ON CONFLICT (id) DO NOTHING;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_executor_state_model ON live.executor_state (model_id);
 
 CREATE TABLE IF NOT EXISTS live.executor_runs (
     run_id          SERIAL       PRIMARY KEY,
@@ -326,10 +331,76 @@ CREATE TABLE IF NOT EXISTS live.executor_runs (
     fills           INT,
     expirations     INT,
     stops_triggered INT,
-    error           TEXT
+    error           TEXT,
+    model_id        INTEGER   -- nullable; tags which live.models row this run belongs to
 );
 
 CREATE INDEX IF NOT EXISTS idx_executor_runs_ran_at ON live.executor_runs (ran_at);
+
+-- ============================================================
+-- Model 3 (Grid Stacker Blended) — blended-average DCA position tracking.
+-- Distinct from live.lots: one row here IS a whole multi-fill stack, not
+-- a single entry-to-exit trade. Kept as separate tables rather than
+-- retrofitting live.lots because too much existing code (position_monitor,
+-- order_manager, reporting.all_lots) assumes one row = one full trade.
+-- ============================================================
+
+CREATE TABLE IF NOT EXISTS live.blended_positions (
+    position_id             BIGSERIAL PRIMARY KEY,
+    model_id                INTEGER      NOT NULL REFERENCES live.models(model_id),
+    stream_id               INTEGER      NOT NULL REFERENCES live.streams(stream_id),
+    -- PENDING_ENTRY: slot-1 limit order out, no fill yet
+    -- OPEN: at least one fill; may also have a pending cascade add in flight
+    -- CLOSED: fully exited, P&L realized
+    status                   VARCHAR(20)  NOT NULL DEFAULT 'PENDING_ENTRY'
+                                 CHECK (status IN ('PENDING_ENTRY', 'OPEN', 'CLOSED')),
+    original_entry_price    NUMERIC(12,2),          -- slot 1's fill price; cascade triggers measure off this
+    avg_cost_basis           NUMERIC(20,8),          -- total_deployed / total_qty, recomputed on every fill
+    total_qty                NUMERIC(20,8) NOT NULL DEFAULT 0,
+    total_deployed            NUMERIC(12,2) NOT NULL DEFAULT 0,
+    highest_close             NUMERIC(12,2),          -- for the trailing stop, tracked off candle closes
+    capitulation_armed        BOOLEAN      NOT NULL DEFAULT FALSE,  -- true once all slots are filled (out of ammo)
+    pending_entry_order_id    VARCHAR(50),
+    pending_entry_expiry_at   TIMESTAMPTZ,
+    pending_add_order_id      VARCHAR(50),
+    pending_add_index          SMALLINT,              -- fill_number this pending add would become if filled
+    pending_add_expiry_at      TIMESTAMPTZ,
+    exit_price                  NUMERIC(12,2),
+    exit_order_id                VARCHAR(50),
+    closing_capital               NUMERIC(12,2),
+    realized_pnl                   NUMERIC(12,2),
+    exit_reason                     VARCHAR(30),        -- 'trailing_stop' | 'capitulation_stop'
+    opened_at                        TIMESTAMPTZ,
+    closed_at                         TIMESTAMPTZ,
+    created_at                         TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    position_capital_base             NUMERIC(12,2)  -- available_capital snapshotted at position-open time;
+                                                       -- slot_capitals = position_capital_base * weight/total_weight
+);
+
+CREATE INDEX IF NOT EXISTS idx_blended_positions_model  ON live.blended_positions (model_id);
+CREATE INDEX IF NOT EXISTS idx_blended_positions_status ON live.blended_positions (status);
+
+CREATE TABLE IF NOT EXISTS live.blended_fills (
+    fill_id      BIGSERIAL PRIMARY KEY,
+    position_id  BIGINT       NOT NULL REFERENCES live.blended_positions(position_id),
+    fill_number  SMALLINT     NOT NULL,   -- 0 = slot 1, 1..N = cascade adds
+    price        NUMERIC(12,2) NOT NULL,
+    capital      NUMERIC(12,2) NOT NULL,
+    qty          NUMERIC(20,8) NOT NULL,
+    order_id     VARCHAR(50),
+    filled_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_blended_fills_position ON live.blended_fills (position_id);
+
+-- Model 3's OWN tracked capital (compounds with realized P&L). Position
+-- sizing reads this, never Kraken's actual account balance, so Model 3
+-- can never size a trade off money that belongs to Model 1.
+CREATE TABLE IF NOT EXISTS live.blended_capital (
+    model_id           INTEGER PRIMARY KEY REFERENCES live.models(model_id),
+    available_capital  NUMERIC(12,2) NOT NULL,
+    updated_at         TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
 
 CREATE TABLE IF NOT EXISTS live.market_data_runs (
     run_id          SERIAL       PRIMARY KEY,

@@ -7,6 +7,7 @@ from sqlalchemy import create_engine, text
 
 from .indicators import add_indicators, resample_ohlcv, _CANDLES_PER_DAY
 from .signals import generate_signals
+from .slot_math import slot_capitals_for
 from src.data.sentiment import load_sentiment
 
 load_dotenv()
@@ -739,14 +740,8 @@ def _run_blended_slots(
     weights = (params.get("slots") or {}).get("slot_capital_weight")
     compound = position.get("compound", False)
 
-    def _slot_capitals_for(capital_base: float) -> list[float]:
-        if weights and len(weights) >= slot_count:
-            total_w = sum(weights[:slot_count])
-            return [capital_base * w / total_w for w in weights[:slot_count]]
-        return [capital_base / slot_count] * slot_count
-
     available_capital = total_capital  # grows/shrinks as positions close, if compound=True
-    slot_capitals = _slot_capitals_for(available_capital)  # this position's frozen split
+    slot_capitals = slot_capitals_for(available_capital, weights, slot_count)  # this position's frozen split
 
     all_trades = []
 
@@ -872,7 +867,7 @@ def _run_blended_slots(
         # --- slot 1: base signal entry ---
         if not position_open and pending_entry is None and signals.iloc[i]:
             if compound:
-                slot_capitals = _slot_capitals_for(available_capital)  # re-split using latest capital
+                slot_capitals = slot_capitals_for(available_capital, weights, slot_count)  # re-split using latest capital
             if slot_capitals[0] > 0.01:
                 pending_entry = (row["close"], expiry)
 
