@@ -13,7 +13,7 @@ This reminder must stay at the top of every handoff until confirmed complete.
 
 **Model 2 is assembled and backtested.** Run 3 selected as deployment config. Not yet deployed — deprioritized behind Model 3.
 
-**Model 3 live execution code is BUILT and heavily tested locally — NOT yet deployed to Supabase.** "Grid Stacker Blended" now has a full live state machine (entry → cascade adds → trailing/capitulation stop exit), isolated from Model 1 at every layer (separate DB tables, separate executor process, separate GitHub Actions workflow, separate capital ledger — never reads Kraken's actual account balance). 16/16 tests passing (pure math + full state-machine integration + an explicit isolation test proving Model 1's data is untouched). **Deliberately paused before touching Supabase** — no new $100 in Kraken yet for Model 3. See "What's Next" for the concrete remaining steps once funded.
+**Model 3 live execution code is BUILT, tested (22/22), cleaned up, and DEPLOYED to Supabase (DB rows only — no Kraken orders yet).** "Grid Stacker Blended" has a full live state machine (entry → cascade adds → trailing/capitulation stop exit), isolated from Model 1 at every layer (separate DB tables, separate executor process, separate GitHub Actions workflow, separate capital ledger — never reads Kraken's actual account balance). `live.models.model_id=3`, `live.streams.stream_id=4`, `live.blended_capital` seeded at $100.00 — confirmed via direct Supabase query, Model 1's `live.lots` unchanged (still 1 row). **Not yet live-trading** — still needs: `live-model-3` branch cut, `DRY_RUN_M3` GitHub secret, cron-job.org registration, and a dry-run logging trial before any real Kraken order is placed. See "What's Next" for the exact remaining steps.
 
 **Model Dashboard is BUILT** — `3_model_dashboard.py` live in the multipage app (port 8504).
 
@@ -71,6 +71,12 @@ Fair challenge — the first pass tested individual functions well but never exe
 **Test suite now 22/22** (`pytest tests/live/ --ignore=tests/live/test_signal_parity.py`): 8 pure math, 13 state-machine integration (9 original + 3 new partial-fill scenarios — at-expiry for both entry and add, plus still-resting-not-yet-finalized), 1 isolation, 3 tick-orchestration.
 
 **Still not covered, worth knowing about before flipping to real orders:** signal-detection parity for Model 3's exact param set against real historical dip events (the shared `signal_engine.check()` function is untouched and already relied on by live Model 1, but no test explicitly re-validates it for Model 3's `fear_dip`/4h/dip_pct=1.0 config); concurrent-tick / race-condition behavior if Model 1 and Model 3's workflows ever overlap in execution (each only touches its own model_id-scoped rows, so should be safe by construction, but untested under real concurrency).
+
+### Cleanup pass + real Supabase deploy (same session)
+
+Ran a 4-parallel-agent `/simplify` review (reuse, simplification, efficiency, altitude) over the full day's diff. Applied: extracted `slot_capitals_for()` into a new shared `src/backtester/slot_math.py` so live and backtest math can no longer silently drift (verified behavior-identical — re-ran the Grid Stacker backtest post-refactor, got the exact same 482 trades / 84.71% ann / $19,275.25 pnl); extracted a shared `_resolve_order()` helper for the cancel/requery/classify polling logic that's already had two real bugs fixed in it today; removed a redundant `live.streams` query on every fill by threading the already-loaded `streams` dict through; a few smaller dedups (`_tf_minutes`, a notifier label helper, three test files' identical `_get_engine()`). Skipped anything requiring changes to already-live `executor.py` or files outside today's diff. 22/22 tests still passing after.
+
+**Then deployed Model 3's DB rows to Supabase for real** (`python -m src.live.deploy_model3`) — `live.models.model_id=3`, `live.streams.stream_id=4`, `live.blended_capital` seeded at $100.00, all confirmed via direct query. Model 1's `live.lots` confirmed unchanged (still 1 row) immediately after. **This is DB bookkeeping only — no Kraken order has been placed, no branch has been cut, and DRY_RUN_M3 doesn't exist as a secret yet.** See "What's Next" above for the remaining steps before any real trading starts.
 
 ---
 
@@ -167,17 +173,17 @@ All changes cherry-picked. Conflict resolved: `live-model-1` had a `_preflight_c
 
 ## What's Next
 
-### 🎯 NEXT SESSION — Fund, deploy, and start Model 3's logging trial
+### 🎯 NEXT SESSION — Cut the branch and start Model 3's logging trial
 
-The live code is built and heavily tested (see "Done This Session" above). Remaining steps, in order:
+The live code is built, tested (22/22), cleaned up, and the DB rows are deployed for real (see "Done This Session" above). Remaining steps, in order:
 
-1. **Fund Kraken with Model 3's $100.** This session deliberately stopped here — user hasn't put new capital in yet. Nothing below can start for real until this happens (though DB deployment itself is capital-independent and could go first if desired).
-2. **Deploy the DB rows for real** — `python -m src.live.deploy_model3` against Supabase (`SUPABASE_DATABASE_URL` already points there by default). Creates `live.models` (model_version=3), `live.streams`, and seeds `live.blended_capital` at $100. Zero Kraken interaction, fully reversible (just `DELETE` the rows).
-3. **Cut the `live-model-3` branch** from `main` (merge `feature/model3-live-build` into `main` first), same pattern as `live-model-1`. `.github/workflows/executor_m3.yml` and `healthcheck_m3.yml` already check out `ref: live-model-3` — they'll 404 until the branch exists.
-4. **GitHub secrets** — add `DRY_RUN_M3` (separate from Model 1's `DRY_RUN`, so each model's live/dry-run state toggles independently). `KRAKEN_API_KEY`/`KRAKEN_API_SECRET`/`ALERT_*` are already shared secrets Model 1 uses — same Kraken account, no reason for a second API key.
-5. **cron-job.org** — register a new job POSTing to `executor_m3.yml`'s workflow-dispatch endpoint (same pattern as Model 1's two existing jobs — free, no meaningful limit for this usage). Suggest every 30 min, matching Model 1's cadence (Model 3's primary timeframe is 4h, so this is plenty frequent).
-6. **Start in `--dry-run` / `DRY_RUN_M3=true`** and log for at least a few days against live prices before flipping to real orders — catches "forgot to handle X" bugs on brand-new order-placement code without risking money. Short trial, not a formal paper-trading program (matches the project's stated philosophy — see CLAUDE.md "no mandatory paper trading phase").
-7. **Flip `DRY_RUN_M3=false`** only after the logging trial looks clean and after explicit go-ahead — this is the one step that should never happen without a direct decision to do so.
+1. ✅ **Deploy the DB rows** — done 2026-08-02. `live.models.model_id=3`, `live.streams.stream_id=4`, `live.blended_capital` seeded at $100.00. Zero Kraken interaction so far, still fully reversible.
+2. ⬜ **Fund Kraken with Model 3's $100.** Not done yet — needed before the dry-run trial can meaningfully validate real order placement (dry-run doesn't call Kraken at all, but the trial after it, and going fully live, both need the capital actually sitting there).
+3. ⬜ **Cut the `live-model-3` branch** from `main` (merge `feature/model3-live-build` into `main` first), same pattern as `live-model-1`. `.github/workflows/executor_m3.yml` and `healthcheck_m3.yml` already check out `ref: live-model-3` — they'll 404 until the branch exists.
+4. ⬜ **GitHub secrets** — add `DRY_RUN_M3` (separate from Model 1's `DRY_RUN`, so each model's live/dry-run state toggles independently). `KRAKEN_API_KEY`/`KRAKEN_API_SECRET`/`ALERT_*` are already shared secrets Model 1 uses — same Kraken account, no reason for a second API key.
+5. ⬜ **cron-job.org** — register a new job POSTing to `executor_m3.yml`'s workflow-dispatch endpoint (same pattern as Model 1's two existing jobs — free, no meaningful limit for this usage). Suggest every 30 min, matching Model 1's cadence (Model 3's primary timeframe is 4h, so this is plenty frequent).
+6. ⬜ **Start in `--dry-run` / `DRY_RUN_M3=true`** and log for at least a few days against live prices before flipping to real orders — catches "forgot to handle X" bugs on brand-new order-placement code without risking money. Short trial, not a formal paper-trading program (matches the project's stated philosophy — see CLAUDE.md "no mandatory paper trading phase").
+7. ⬜ **Flip `DRY_RUN_M3=false`** only after the logging trial looks clean and after explicit go-ahead — this is the one step that should never happen without a direct decision to do so.
 
 **Final validated params** (unchanged, already built against — see `backtest.stream_configs.stream_config_id=36` v8 for full notes):
 ```
