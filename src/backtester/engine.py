@@ -19,7 +19,10 @@ MAKER_FEE = 0.0025  # 0.25% per side
 # 'scale_up'   = slot 2 adds when price rises above slot 1's entry + signal fires (2-slot only).
 # 'cascade'    = N slots; slot 1 fires on signal, each subsequent slot auto-fires when price
 #                drops cascade_drop_pct below the previous slot's entry (params.position).
-SLOT_MODES = ('single', 'staggered', 'scale_down', 'scale_up', 'cascade')
+# 'blended'    = N slots, ONE position with a single weighted-average cost basis. Adds fire
+#                at cumulative_drop_pcts (from the original entry, not the prior add) in
+#                params.position. One shared exit off the blended average -- no per-slot stops.
+SLOT_MODES = ('single', 'staggered', 'scale_down', 'scale_up', 'cascade', 'blended')
 
 
 def _warmup_days(params: dict) -> int:
@@ -492,16 +495,36 @@ def _run_cascade_slots(
     drops cascade_drop_pct below that slot's entry price.
     Each slot has its own trailing stop and hard stop — exits are independent.
     When a slot exits its position, the cascade trigger for the next slot is cleared.
+
+    Slot capital defaults to an equal split, but can be front-loaded via
+    params["slots"]["slot_capital_weight"] (e.g. [33, 25, 20, 12, 10]) — same
+    convention as staggered mode. Weights are normalized to total_capital.
+
+    Ladder stop (downside, optional via position.ladder_stop_buffer_pct): the
+    moment the NEXT deeper slot fires, a shallower slot's trailing stop arms
+    at (deeper slot's entry price) * (1 - buffer_pct) and ratchets up with the
+    high-water mark from that point forward — bounding a shallow slot's max
+    loss to roughly one cascade step instead of leaving it frozen forever or
+    exposed to the full ladder depth. The deepest slot never gets one (no
+    slot below it to arm off of).
     """
     position        = params.get("position", {})
     trail_pct       = position.get("trailing_stop_pct")
     trail_steps     = position.get("trailing_stop_steps")  # [[gain_pct, trail_pct], ...] ascending
+    trail_arm_gain_pct = position.get("trail_arm_gain_pct")  # trail stays off until this much gain from entry
     stop_loss_pct   = position.get("stop_loss_pct")
+    ladder_buffer_pct = position.get("ladder_stop_buffer_pct")
     cascade_drop    = position.get("cascade_drop_pct", 5.0) / 100.0
     expiry          = position.get("entry_expiry_candles", 2)
     min_hold        = position.get("min_hold_candles") or 0
     max_hold        = position.get("max_hold_candles")
-    slot_capital    = total_capital / slot_count
+
+    weights = (params.get("slots") or {}).get("slot_capital_weight")
+    if weights and len(weights) >= slot_count:
+        total_w = sum(weights[:slot_count])
+        slot_capitals = [total_capital * w / total_w for w in weights[:slot_count]]
+    else:
+        slot_capitals = [total_capital / slot_count] * slot_count
 
     slots = [
         {
@@ -509,7 +532,7 @@ def _run_cascade_slots(
             "slot_number":      i + 1,
             "open_trade":       None,
             "pending_entry":    None,
-            "capital":          slot_capital,
+            "capital":          slot_capitals[i],
             "cascade_trigger":  None,   # price level that auto-fires this slot
         }
         for i in range(slot_count)
@@ -539,6 +562,14 @@ def _run_cascade_slots(
                     nxt = slot["idx"] + 1
                     if nxt < slot_count:
                         slots[nxt]["cascade_trigger"] = lp * (1 - cascade_drop)
+                    # arm the ladder stop on the previous (shallower) slot, if still open
+                    if ladder_buffer_pct:
+                        prev_idx = slot["idx"] - 1
+                        if prev_idx >= 0 and slots[prev_idx]["open_trade"] is not None:
+                            pt = slots[prev_idx]["open_trade"]
+                            if not pt.get("ladder_armed"):
+                                pt["ladder_armed"] = True
+                                pt["ladder_peak"]  = lp
                 else:
                     ttl -= 1
                     slot["pending_entry"] = (lp, ttl, cap) if ttl > 0 else None
@@ -551,27 +582,51 @@ def _run_cascade_slots(
                 t["highest_high"]  = max(t["highest_high"],  row["high"])
                 t["candles_held"] += 1
 
-                if trail_pct:
+                gain_pct = (t["highest_close"] - t["entry_price"]) / t["entry_price"] * 100
+                armed = (not trail_arm_gain_pct) or gain_pct >= trail_arm_gain_pct
+
+                if trail_pct and armed:
                     eff_trail = trail_pct
                     if trail_steps:
-                        gain_pct = (t["highest_close"] - t["entry_price"]) / t["entry_price"] * 100
                         for threshold, tighter in sorted(trail_steps, key=lambda x: x[0]):
                             if gain_pct >= threshold:
                                 eff_trail = tighter
                     trail_stop = t["highest_close"] * (1 - eff_trail / 100.0)
+                    if trail_arm_gain_pct:
+                        # Once armed, never trail back below breakeven (entry + round-trip fee) —
+                        # the arm threshold alone doesn't guarantee that if trail_pct is wide.
+                        breakeven = t["entry_price"] * (1 + fee * 2)
+                        trail_stop = max(trail_stop, breakeven)
                 else:
                     trail_stop = None
+
+                if t.get("ladder_armed"):
+                    t["ladder_peak"] = max(t["ladder_peak"], row["close"])
+                    ladder_stop = t["ladder_peak"] * (1 - ladder_buffer_pct / 100.0)
+                else:
+                    ladder_stop = None
+
                 hard_stop  = t["entry_price"]   * (1 - stop_loss_pct / 100.0) if stop_loss_pct else None
-                candidates = [s for s in [trail_stop, hard_stop] if s is not None]
-                stop_price = max(candidates) if candidates else t["highest_close"] * 0.97
+                candidates = [s for s in [trail_stop, hard_stop, ladder_stop] if s is not None]
+                if candidates:
+                    stop_price = max(candidates)
+                elif trail_arm_gain_pct:
+                    stop_price = None  # not armed yet, no hard stop configured — hold, cascade can still add
+                else:
+                    stop_price = t["highest_close"] * 0.97  # legacy safety net when no stop is configured at all
 
                 if t["candles_held"] >= min_hold:
                     exit_price = exit_reason = None
                     if max_hold and t["candles_held"] >= max_hold:
                         exit_price, exit_reason = row["close"], "max_hold"
-                    elif row["low"] <= stop_price:
+                    elif stop_price is not None and row["low"] <= stop_price:
                         exit_price = stop_price
-                        exit_reason = "stop_loss" if (hard_stop and stop_price <= hard_stop) else "trailing_stop"
+                        if hard_stop is not None and stop_price == hard_stop:
+                            exit_reason = "stop_loss"
+                        elif ladder_stop is not None and stop_price == ladder_stop:
+                            exit_reason = "ladder_stop"
+                        else:
+                            exit_reason = "trailing_stop"
 
                     if exit_price:
                         gain = (exit_price - t["entry_price"]) / t["entry_price"]
@@ -645,6 +700,208 @@ def _run_cascade_slots(
     return all_trades
 
 
+def _run_blended_slots(
+    df: pd.DataFrame,
+    signals: pd.Series,
+    params: dict,
+    slot_count: int,
+    total_capital: float,
+    fee: float = MAKER_FEE,
+) -> list[dict]:
+    """
+    Blended-average DCA: ONE position, not N independent trades.
+
+    Slot 1 fires on the base signal. Each subsequent add fires when price drops
+    cumulative_drop_pcts[k] percent below slot 1's ORIGINAL entry (not the prior
+    add) -- params.position["cumulative_drop_pcts"], e.g. [12, 25, 45, 70] for a
+    5-slot ladder. Every fill updates one weighted-average cost basis (tracked in
+    BTC-quantity terms so the average is a true dollar-cost-average, not a naive
+    price average).
+
+    There is no per-slot exit and no stop-loss: the whole stack exits together,
+    once, off a single trailing stop computed from the blended average. The trail
+    only arms once price is trail_arm_gain_pct above the average, and is floored
+    at breakeven once armed -- so the position never voluntarily realizes a loss.
+    The only way this shows a loss is a forced close at the end of the backtest
+    window while still underwater and out of slots (same caveat as the
+    independent no-stop cascade design).
+    """
+    position           = params.get("position", {})
+    cumulative_drops   = position.get("cumulative_drop_pcts", [])  # % below slot1 entry, per add
+    trail_pct          = position.get("trailing_stop_pct")
+    trail_arm_gain_pct = position.get("trail_arm_gain_pct")
+    expiry             = position.get("entry_expiry_candles", 2)
+    capitulation_stop_pct = position.get("capitulation_stop_pct")  # only armed once ALL slots are filled --
+                                                                     # the one backstop for a crash worse than
+                                                                     # anything seen historically (out of ammo,
+                                                                     # no more room to average down further)
+
+    weights = (params.get("slots") or {}).get("slot_capital_weight")
+    compound = position.get("compound", False)
+
+    def _slot_capitals_for(capital_base: float) -> list[float]:
+        if weights and len(weights) >= slot_count:
+            total_w = sum(weights[:slot_count])
+            return [capital_base * w / total_w for w in weights[:slot_count]]
+        return [capital_base / slot_count] * slot_count
+
+    available_capital = total_capital  # grows/shrinks as positions close, if compound=True
+    slot_capitals = _slot_capitals_for(available_capital)  # this position's frozen split
+
+    all_trades = []
+
+    pending_entry = None       # (limit_price, ttl) for slot 1 only
+    pending_add   = None       # (limit_price, ttl, next_idx) for a cascade add -- same
+                                # limit-order-with-expiry simulation as slot 1, not an instant fill
+    position_open = False
+    original_entry_price = None
+    fills = []                 # list of (price, capital, qty, ts) for the open position
+    highest_close = None
+    entry_ts = None
+    candles_held = 0
+
+    def total_qty():
+        return sum(q for _, _, q, _ in fills)
+
+    def total_deployed():
+        return sum(c for _, c, _, _ in fills)
+
+    def avg_entry_price():
+        q = total_qty()
+        return total_deployed() / q if q > 0 else None
+
+    for i, (ts, row) in enumerate(df.iterrows()):
+
+        # --- try to fill a pending slot-1 entry ---
+        if pending_entry and not position_open:
+            lp, ttl = pending_entry
+            if row["low"] <= lp <= row["high"]:
+                qty = (slot_capitals[0] * (1 - fee)) / lp
+                fills = [(lp, slot_capitals[0], qty, ts)]
+                position_open = True
+                original_entry_price = lp
+                highest_close = lp
+                entry_ts = ts
+                candles_held = 0
+                pending_entry = None
+            else:
+                ttl -= 1
+                pending_entry = (lp, ttl) if ttl > 0 else None
+
+        # --- try to fill a pending cascade add (same limit-order simulation as slot 1) ---
+        if pending_add and position_open:
+            lp, ttl, add_idx = pending_add
+            if row["low"] <= lp <= row["high"]:
+                qty = (slot_capitals[add_idx] * (1 - fee)) / lp
+                fills.append((lp, slot_capitals[add_idx], qty, ts))
+                pending_add = None
+            else:
+                ttl -= 1
+                pending_add = (lp, ttl, add_idx) if ttl > 0 else None
+
+        # --- manage the open position ---
+        if position_open:
+            highest_close = max(highest_close, row["close"])
+            candles_held += 1
+            avg_ep = avg_entry_price()
+
+            gain_pct = (highest_close - avg_ep) / avg_ep * 100
+            armed = (not trail_arm_gain_pct) or gain_pct >= trail_arm_gain_pct
+
+            stop_price = None
+            if trail_pct and armed:
+                stop_price = highest_close * (1 - trail_pct / 100.0)
+                if trail_arm_gain_pct:
+                    # avg_ep already has the buy-side fee baked in (qty was reduced by
+                    # (1-fee) at each fill), so only the sell-side fee needs pricing in here.
+                    breakeven = avg_ep / (1 - fee)
+                    stop_price = max(stop_price, breakeven)
+
+            # Capitulation backstop: only once every slot is filled (out of ammo -- no
+            # more room to average down), a further drop below the LAST fill's price
+            # forces a full exit instead of holding indefinitely into the unknown.
+            capitulation_price = None
+            if capitulation_stop_pct and len(fills) == slot_count:
+                last_fill_price = fills[-1][0]
+                capitulation_price = last_fill_price * (1 - capitulation_stop_pct / 100.0)
+
+            exit_reason_override = None
+            effective_stop = stop_price
+            if capitulation_price is not None and row["low"] <= capitulation_price:
+                if stop_price is None or capitulation_price < stop_price:
+                    # only the capitulation stop is active (still underwater), or it's
+                    # the more conservative of the two -- either way it's the one that fires
+                    effective_stop = capitulation_price
+                    exit_reason_override = "capitulation_stop"
+
+            if effective_stop is not None and row["low"] <= effective_stop:
+                exit_price = effective_stop
+                gross = total_qty() * exit_price
+                pnl   = gross * (1 - fee) - total_deployed()
+                all_trades.append({
+                    "slot":            len(fills),   # num fills THIS position used, not a persistent slot id
+                    "entry_ts":        entry_ts,
+                    "exit_ts":         ts,
+                    "entry_price":     avg_ep,        # blended, fee-adjusted average across all fills below
+                    "exit_price":      exit_price,
+                    "highest_close":   highest_close,
+                    "capital":         total_deployed(),
+                    "pnl":             pnl,
+                    "exit_reason":     exit_reason_override or "trailing_stop",
+                    "candles_held":    candles_held,
+                    "fill_prices":     [p for p, _, _, _ in fills],
+                    "fill_timestamps": [ft for _, _, _, ft in fills],
+                    "fill_capitals":   [c for _, c, _, _ in fills],
+                    "fill_qtys":       [q for _, _, q, _ in fills],
+                })
+                position_open = False
+                fills = []
+                original_entry_price = None
+                pending_add = None
+                if compound:
+                    available_capital += pnl
+            else:
+                # arm the next cascade add as a limit order (not an instant fill) --
+                # it still has to actually get touched within `expiry` candles, same as slot 1
+                next_idx = len(fills)  # number filled so far == index of the next add
+                if next_idx < slot_count and (next_idx - 1) < len(cumulative_drops) and pending_add is None:
+                    trigger_price = original_entry_price * (1 - cumulative_drops[next_idx - 1] / 100.0)
+                    if row["close"] <= trigger_price and slot_capitals[next_idx] > 0.01:
+                        pending_add = (row["close"], expiry, next_idx)
+
+        # --- slot 1: base signal entry ---
+        if not position_open and pending_entry is None and signals.iloc[i]:
+            if compound:
+                slot_capitals = _slot_capitals_for(available_capital)  # re-split using latest capital
+            if slot_capitals[0] > 0.01:
+                pending_entry = (row["close"], expiry)
+
+    # close an open position at end of data
+    if position_open:
+        last_row  = df.iloc[-1]
+        exit_price = last_row["close"]
+        gross = total_qty() * exit_price
+        pnl   = gross * (1 - fee) - total_deployed()
+        all_trades.append({
+            "slot":            len(fills),
+            "entry_ts":        entry_ts,
+            "exit_ts":         df.index[-1],
+            "entry_price":     avg_entry_price(),
+            "exit_price":      exit_price,
+            "highest_close":   highest_close,
+            "capital":         total_deployed(),
+            "pnl":             pnl,
+            "exit_reason":     "end_of_data",
+            "candles_held":    candles_held,
+            "fill_prices":     [p for p, _, _, _ in fills],
+            "fill_timestamps": [ft for _, _, _, ft in fills],
+            "fill_capitals":   [c for _, c, _, _ in fills],
+            "fill_qtys":       [q for _, _, q, _ in fills],
+        })
+
+    return all_trades
+
+
 def run_backtest(
     params: dict,
     start: str = None,
@@ -696,6 +953,8 @@ def run_backtest(
         all_trades = _run_staggered_slots(df, signals, params, slot_count, lot_size_usd)
     elif slot_mode == 'cascade' and slot_count >= 2:
         all_trades = _run_cascade_slots(df, signals, params, slot_count, lot_size_usd)
+    elif slot_mode == 'blended' and slot_count >= 2:
+        all_trades = _run_blended_slots(df, signals, params, slot_count, lot_size_usd)
     else:
         slot1_trades = _run_slot(df, signals, params, slot=1, initial_capital=lot_size_usd)
         all_trades = slot1_trades

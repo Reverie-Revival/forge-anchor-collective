@@ -17,6 +17,10 @@ def compute_metrics(trades: pd.DataFrame, initial_capital: float, start, end) ->
         return empty
 
     t = trades[trades["exit_reason"] != "partial"].copy()
+    # Round to the cent — chained float math on breakeven-floored exits can leave
+    # pnl at +/-1e-13 instead of exactly 0, which misclassifies wins/losses and
+    # blows up profit_factor toward a near-zero denominator.
+    t["pnl"] = t["pnl"].round(2)
     t["return_pct"] = (t["exit_price"] - t["entry_price"]) / t["entry_price"] * 100
 
     winners = t[t["pnl"] > 0]

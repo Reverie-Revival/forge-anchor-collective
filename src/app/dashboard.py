@@ -37,6 +37,12 @@ def render_dashboard(payload: dict, show_save: bool = False, key_prefix: str = "
         )
 
     # Header
+    if has_trades and slot_mode == "blended" and "fill_prices" in closed.columns:
+        total_fills = int(closed["fill_prices"].apply(len).sum())
+        trade_count_str = f"{metrics['total_trades']} blends ({total_fills} actual buy orders)"
+    else:
+        trade_count_str = f"{metrics['total_trades']} trades"
+
     col_title, col_grade = st.columns([3, 1])
     with col_title:
         st.subheader(display_name)
@@ -45,7 +51,7 @@ def render_dashboard(payload: dict, show_save: bool = False, key_prefix: str = "
         )
         st.caption(
             f"{period_str}  ·  {tf} candles  ·  {slot_desc}  ·  "
-            f"{result['signals'].sum()} signals  ·  {metrics['total_trades']} trades"
+            f"{result['signals'].sum()} signals  ·  {trade_count_str}"
         )
     with col_grade:
         st.markdown(
@@ -361,28 +367,117 @@ def render_dashboard(payload: dict, show_save: bool = False, key_prefix: str = "
         else:
             st.info("MAE/MFE data not available for this run — use ↺ Re-run All Presets to generate it.")
 
-    with st.expander(f"Trade Log ({len(closed)} trades)", expanded=False):
-        log = closed.copy()
-        log["btc_bought"]   = (log["capital"] / log["entry_price"]).round(6)
-        log["start_value"]  = log["capital"].round(2)
-        log["end_value"]    = (log["capital"] + log["pnl"]).round(2)
-        log["gain_loss"]    = log["pnl"].round(4)
-        log["return_pct"]   = log["return_pct"].round(2)
-        log["entry_price"]  = log["entry_price"].round(2)
-        log["exit_price"]   = log["exit_price"].round(2)
-        log["duration_hrs"] = (log["candles_held"] * c_hrs).round(1)
-        st.dataframe(
-            log[[
-                "slot", "entry_ts", "exit_ts", "entry_price", "exit_price",
-                "btc_bought", "start_value", "end_value", "gain_loss",
-                "return_pct", "duration_hrs", "exit_reason",
-            ]].rename(columns={
-                "slot": "Slot", "entry_ts": "Entered", "exit_ts": "Exited",
-                "entry_price": "BTC In", "exit_price": "BTC Out",
-                "btc_bought": "BTC Bought", "start_value": "$ In", "end_value": "$ Out",
-                "gain_loss": "P&L ($)", "return_pct": "Return %",
-                "duration_hrs": "Hours Held", "exit_reason": "Exit Reason",
-            }),
-            use_container_width=True,
+    trade_log_title = f"Trade Log ({trade_count_str})" if has_trades else "Trade Log"
+    with st.expander(trade_log_title, expanded=False):
+        if slot_mode == "blended" and "fill_prices" in closed.columns:
+            _render_blended_trade_log(closed, c_hrs, key_prefix)
+        else:
+            log = closed.copy()
+            log["btc_bought"]   = (log["capital"] / log["entry_price"]).round(6)
+            log["start_value"]  = log["capital"].round(2)
+            log["end_value"]    = (log["capital"] + log["pnl"]).round(2)
+            log["gain_loss"]    = log["pnl"].round(4)
+            log["return_pct"]   = log["return_pct"].round(2)
+            log["entry_price"]  = log["entry_price"].round(2)
+            log["exit_price"]   = log["exit_price"].round(2)
+            log["duration_hrs"] = (log["candles_held"] * c_hrs).round(1)
+            st.dataframe(
+                log[[
+                    "slot", "entry_ts", "exit_ts", "entry_price", "exit_price",
+                    "btc_bought", "start_value", "end_value", "gain_loss",
+                    "return_pct", "duration_hrs", "exit_reason",
+                ]].rename(columns={
+                    "slot": "Slot", "entry_ts": "Entered", "exit_ts": "Exited",
+                    "entry_price": "BTC In", "exit_price": "BTC Out",
+                    "btc_bought": "BTC Bought", "start_value": "$ In", "end_value": "$ Out",
+                    "gain_loss": "P&L ($)", "return_pct": "Return %",
+                    "duration_hrs": "Hours Held", "exit_reason": "Exit Reason",
+                }),
+                use_container_width=True,
+            )
+
+
+def _render_blended_trade_log(closed: pd.DataFrame, c_hrs: float, key_prefix: str):
+    """
+    Hierarchical view for blended-average positions: one expander per closed
+    position ("Blend N") showing the rolled-up cost basis, total BTC, and P&L,
+    with the individual fills that built it (Slot 1, Slot 2, ...) nested inside.
+    """
+    ordered = closed.sort_values("entry_ts").reset_index(drop=True)
+    for i, row in ordered.iterrows():
+        blend_num    = i + 1
+        total_qty    = sum(row["fill_qtys"])
+        capital_in   = row["capital"]
+        capital_out  = row["capital"] + row["pnl"]
+        return_pct   = (row["exit_price"] - row["entry_price"]) / row["entry_price"] * 100
+        duration_hrs = row["candles_held"] * c_hrs
+        is_still_open = row["exit_reason"] == "end_of_data"
+        if is_still_open:
+            result_word = "STILL OPEN"
+        else:
+            result_word = "WIN" if row["pnl"] > 0.001 else ("FLAT" if abs(row["pnl"]) <= 0.001 else "LOSS")
+
+        # 0.25% maker fee per side (0.5% round trip). The buy-side fee is already
+        # baked into smaller BTC quantities (qty = capital*(1-fee)/price), so it's
+        # NOT a separate subtraction anywhere below -- only the sell-side fee is.
+        MAKER_FEE  = 0.0025
+        gross_sale = total_qty * row["exit_price"]
+        buy_fee    = capital_in * MAKER_FEE
+        sell_fee   = gross_sale * MAKER_FEE
+        fees_paid  = buy_fee + sell_fee
+
+        # Collapsed summary: the win/loss story at a glance, no expanding needed.
+        num_fills     = len(row["fill_prices"])
+        slot1_capital = row["fill_capitals"][0]  # the base unit -- this is what grows if compounding is on
+        arrow_note    = " (as of latest data -- still open, not sold)" if is_still_open else ""
+        header = (
+            f"Blend {blend_num}  —  {result_word}  ·  "
+            f"{num_fills} slot{'s' if num_fills > 1 else ''} @ ${slot1_capital:,.2f}/slot  ·  "
+            f"${capital_in:,.2f} → ${capital_out:,.2f}  ({return_pct:+.2f}%)  ·  "
+            f"{row['entry_ts']:%b %d, %Y} → {row['exit_ts']:%b %d, %Y}{arrow_note}"
         )
+        with st.expander(header, expanded=False):
+            if is_still_open:
+                st.info("This position is still open as of the latest data -- nothing has actually sold. The numbers below show its current unrealized value, not a completed trade.", icon="⏳")
+
+            r1c1, r1c2, r1c3, r1c4 = st.columns(4)
+            r1c1.metric("Starting Capital", f"${capital_in:,.2f}")
+            r1c2.metric("Current Value" if is_still_open else "Ending Capital", f"${capital_out:,.2f}", delta=f"${row['pnl']:,.2f}")
+            r1c3.metric("Buy Date", f"{row['entry_ts']:%b %d, %Y}", help=str(row["entry_ts"]))
+            r1c4.metric("As Of" if is_still_open else "Sale Date", f"{row['exit_ts']:%b %d, %Y}", help=str(row["exit_ts"]))
+
+            r2c1, r2c2, r2c3 = st.columns(3)
+            r2c1.metric("Total BTC Bought", f"{total_qty:.6f}")
+            r2c2.metric("Blended Avg Cost", f"${row['entry_price']:,.2f}", help="Raw buy price grossed up by the 0.25% buy fee -- the true cost per BTC after paying to buy it.")
+            r2c3.metric("Current Price" if is_still_open else "Sale Price", f"${row['exit_price']:,.2f}")
+
+            r3c1, r3c2, r3c3 = st.columns(3)
+            r3c1.metric("Buy Fee", f"${buy_fee:,.2f}", help="Already reflected in the smaller 'BTC Bought' amounts below -- not a separate subtraction from Gain/Loss.")
+            r3c2.metric("Sell Fee", f"${sell_fee:,.2f}", help="This is the number to subtract from the Gain/Loss column sum below to get net P&L.")
+            r3c3.metric("Total Fees (both sides)", f"${fees_paid:,.2f}")
+
+            sold_phrase = f"would sell together at ${row['exit_price']:,.2f} (current price) if closed now" if is_still_open else f"all sold together at ${row['exit_price']:,.2f}"
+            st.caption(f"{len(row['fill_prices'])} purchase{'s' if len(row['fill_prices']) > 1 else ''} made up this blend  ·  {duration_hrs:,.1f} hours held so far  ·  {sold_phrase}:")
+            ending_values = [q * row["exit_price"] for q in row["fill_qtys"]]
+            gains         = [ev - c for ev, c in zip(ending_values, row["fill_capitals"])]
+            fills_df = pd.DataFrame({
+                "Slot":          [f"Slot {j+1}" for j in range(len(row["fill_prices"]))] + ["Total"],
+                "Buy Date":      [f"{ts:%b %d, %Y %H:%M}" for ts in row["fill_timestamps"]] + [""],
+                "Price":         [f"${p:,.2f}" for p in row["fill_prices"]] + [""],
+                "Capital":       [f"${c:,.2f}" for c in row["fill_capitals"]] + [f"${sum(row['fill_capitals']):,.2f}"],
+                "BTC Bought":    [f"{q:.6f}" for q in row["fill_qtys"]] + [f"{total_qty:.6f}"],
+                "Ending Value":  [f"${ev:,.2f}" for ev in ending_values] + [f"${sum(ending_values):,.2f}"],
+                "Gain/Loss":     [f"{'+' if g >= 0 else ''}${g:,.2f}" for g in gains] + [f"{'+' if sum(gains) >= 0 else ''}${sum(gains):,.2f}"],
+            })
+            st.dataframe(fills_df, use_container_width=True, hide_index=True, key=f"{key_prefix}_blend_{blend_num}_fills")
+            # Only the sell-side fee subtracts from the Gain/Loss sum -- the buy-side fee
+            # already reduced "BTC Bought" above (qty was computed net of it), so it's
+            # already inside every Gain/Loss number and would double-count if subtracted again.
+            pnl_label = "unrealized net P&L if closed now" if is_still_open else "net P&L"
+            ending_label = "Current Value" if is_still_open else "Ending Capital"
+            st.caption(
+                f"Gain/Loss sum: {'+' if sum(gains) >= 0 else ''}${sum(gains):,.2f}  −  ${sell_fee:,.2f} sell fee  "
+                f"=  {'+' if row['pnl'] >= 0 else ''}${row['pnl']:,.2f} {pnl_label} (matches the delta on {ending_label} above). "
+                f"The ${buy_fee:,.2f} buy fee is already inside the Gain/Loss numbers, not a second subtraction."
+            )
 
