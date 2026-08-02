@@ -25,11 +25,12 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from dotenv import load_dotenv
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 
 from src.live import blended_order_manager as order_manager
 from src.live import blended_position_monitor as position_monitor
 from tests.live._fake_kraken import FakeKraken
+from tests.live.conftest import get_local_engine as _get_engine
 
 load_dotenv()
 
@@ -52,13 +53,6 @@ PARAMS = {
     "core_signal": "fear_dip",
     "primary_timeframe": "4h",
 }
-
-
-def _get_engine():
-    url = os.getenv("DATABASE_URL", "postgresql://localhost/forge_anchor")
-    if url.startswith("postgresql://") and "+psycopg2" not in url:
-        url = url.replace("postgresql://", "postgresql+psycopg2://", 1)
-    return create_engine(url)
 
 
 @pytest.fixture
@@ -119,7 +113,7 @@ def test_full_cycle_entry_add_trailing_stop_exit(sandbox):
         assert order_manager.has_active_position(conn, stream["stream_id"])
 
     with engine.begin() as conn:
-        fills, expirations = order_manager.check_pending_entry(conn, kraken, dry_run=False)
+        fills, expirations = order_manager.check_pending_entry(conn, kraken, {stream["stream_id"]: stream}, dry_run=False)
         assert fills == 1 and expirations == 0
         pos = conn.execute(text("""
             SELECT status, avg_cost_basis, total_qty, total_deployed, original_entry_price
@@ -140,7 +134,7 @@ def test_full_cycle_entry_add_trailing_stop_exit(sandbox):
         assert pos.pending_add_index == 1
 
     with engine.begin() as conn:
-        fills, expirations = order_manager.check_pending_add(conn, kraken, dry_run=False)
+        fills, expirations = order_manager.check_pending_add(conn, kraken, {stream["stream_id"]: stream}, dry_run=False)
         assert fills == 1
         pos = conn.execute(text("""
             SELECT avg_cost_basis, total_qty, total_deployed, capitulation_armed
@@ -205,7 +199,7 @@ def test_entry_order_expiry_frees_the_slot(sandbox):
         """), {"sid": stream["stream_id"]})
 
     with engine.begin() as conn:
-        fills, expirations = order_manager.check_pending_entry(conn, kraken, dry_run=False)
+        fills, expirations = order_manager.check_pending_entry(conn, kraken, {stream["stream_id"]: stream}, dry_run=False)
         assert fills == 0 and expirations == 1
         assert not order_manager.has_active_position(conn, stream["stream_id"])
 
@@ -229,7 +223,7 @@ def test_partial_fill_right_before_entry_expiry_is_preserved(sandbox):
         """), {"sid": stream["stream_id"]})
 
     with engine.begin() as conn:
-        fills, expirations = order_manager.check_pending_entry(conn, kraken, dry_run=False)
+        fills, expirations = order_manager.check_pending_entry(conn, kraken, {stream["stream_id"]: stream}, dry_run=False)
         assert fills == 1 and expirations == 0   # treated as a real fill, NOT an expiration
         pos = conn.execute(text("""
             SELECT status, total_qty, total_deployed FROM live.blended_positions WHERE stream_id = :sid
@@ -252,7 +246,7 @@ def test_cascade_add_expiry_keeps_position_open_for_retry(sandbox):
     with engine.begin() as conn:
         order_manager.place_entry(conn, stream, kraken, dry_run=False)
     with engine.begin() as conn:
-        order_manager.check_pending_entry(conn, kraken, dry_run=False)
+        order_manager.check_pending_entry(conn, kraken, {stream["stream_id"]: stream}, dry_run=False)
 
     kraken._next_price = 49000.0
     kraken.next_fill_mode = "none"   # genuinely never fills
@@ -264,7 +258,7 @@ def test_cascade_add_expiry_keeps_position_open_for_retry(sandbox):
         """), {"sid": stream["stream_id"]})
 
     with engine.begin() as conn:
-        fills, expirations = order_manager.check_pending_add(conn, kraken, dry_run=False)
+        fills, expirations = order_manager.check_pending_add(conn, kraken, {stream["stream_id"]: stream}, dry_run=False)
         assert fills == 0 and expirations == 1
         pos = conn.execute(text("""
             SELECT status, pending_add_order_id FROM live.blended_positions WHERE stream_id = :sid
@@ -283,7 +277,7 @@ def test_partial_fill_right_before_add_expiry_is_preserved(sandbox):
     with engine.begin() as conn:
         order_manager.place_entry(conn, stream, kraken, dry_run=False)
     with engine.begin() as conn:
-        order_manager.check_pending_entry(conn, kraken, dry_run=False)
+        order_manager.check_pending_entry(conn, kraken, {stream["stream_id"]: stream}, dry_run=False)
 
     kraken._next_price = 49000.0
     kraken.next_fill_mode = "partial"
@@ -300,7 +294,7 @@ def test_partial_fill_right_before_add_expiry_is_preserved(sandbox):
             "SELECT total_qty FROM live.blended_positions WHERE stream_id = :sid"
         ), {"sid": stream["stream_id"]}).scalar()
 
-        fills, expirations = order_manager.check_pending_add(conn, kraken, dry_run=False)
+        fills, expirations = order_manager.check_pending_add(conn, kraken, {stream["stream_id"]: stream}, dry_run=False)
         assert fills == 1 and expirations == 0
         pos = conn.execute(text("""
             SELECT status, total_qty, pending_add_order_id FROM live.blended_positions WHERE stream_id = :sid
@@ -326,7 +320,7 @@ def test_partial_fill_still_resting_before_expiry_is_not_finalized_early(sandbox
     with engine.begin() as conn:
         order_manager.place_entry(conn, stream, kraken, dry_run=False)
     with engine.begin() as conn:
-        order_manager.check_pending_entry(conn, kraken, dry_run=False)
+        order_manager.check_pending_entry(conn, kraken, {stream["stream_id"]: stream}, dry_run=False)
 
     kraken._next_price = 49000.0
     kraken.next_fill_mode = "partial"
@@ -340,7 +334,7 @@ def test_partial_fill_still_resting_before_expiry_is_not_finalized_early(sandbox
             "SELECT total_qty FROM live.blended_positions WHERE stream_id = :sid"
         ), {"sid": stream["stream_id"]}).scalar()
 
-        fills, expirations = order_manager.check_pending_add(conn, kraken, dry_run=False)
+        fills, expirations = order_manager.check_pending_add(conn, kraken, {stream["stream_id"]: stream}, dry_run=False)
         assert fills == 0 and expirations == 0   # neither -- must be left alone
 
         pos = conn.execute(text("""
@@ -368,7 +362,7 @@ def test_capitulation_stop_can_realize_a_loss_once_out_of_slots(sandbox):
     with engine.begin() as conn:
         order_manager.place_entry(conn, stream, kraken, dry_run=False)
     with engine.begin() as conn:
-        order_manager.check_pending_entry(conn, kraken, dry_run=False)
+        order_manager.check_pending_entry(conn, kraken, {stream["stream_id"]: stream}, dry_run=False)
 
     # walk price down through all 4 remaining cascade triggers so every slot fills
     drop_prices = [49000.0, 48000.0, 47000.0, 44000.0]  # past 1%, 2%, 5%, 10% cumulative drops
@@ -377,7 +371,7 @@ def test_capitulation_stop_can_realize_a_loss_once_out_of_slots(sandbox):
         with engine.begin() as conn:
             order_manager.check_cascade_add_trigger(conn, stream, latest_close=price, kraken=kraken, dry_run=False)
         with engine.begin() as conn:
-            fills, _ = order_manager.check_pending_add(conn, kraken, dry_run=False)
+            fills, _ = order_manager.check_pending_add(conn, kraken, {stream["stream_id"]: stream}, dry_run=False)
             assert fills == 1
 
     with engine.begin() as conn:
@@ -420,7 +414,7 @@ def test_compounding_grows_next_position_capital_base(sandbox):
     with engine.begin() as conn:
         order_manager.place_entry(conn, stream, kraken, dry_run=False)
     with engine.begin() as conn:
-        order_manager.check_pending_entry(conn, kraken, dry_run=False)
+        order_manager.check_pending_entry(conn, kraken, {stream["stream_id"]: stream}, dry_run=False)
     with engine.begin() as conn:
         # rally well past breakeven+trail so this closes as a clean winner
         candle_row = {stream["stream_id"]: {"close": 60000.0, "low": 57000.0}}

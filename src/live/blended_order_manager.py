@@ -34,22 +34,11 @@ from datetime import datetime, timezone, timedelta
 from sqlalchemy import text
 
 from src.live.kraken_client import KrakenClient
-from src.live.order_manager import TAKER_FEE
+from src.live.order_manager import TAKER_FEE, _tf_minutes
+from src.backtester.slot_math import slot_capitals_for as _slot_capitals_for
 from src.live import blended_notifier as notifier
 
 log = logging.getLogger(__name__)
-
-
-def _tf_minutes(tf: str) -> int:
-    return {"15m": 15, "1h": 60, "4h": 240}.get(tf, 60)
-
-
-def _slot_capitals_for(capital_base: float, weights: list, slot_count: int) -> list:
-    """Mirrors backtester._run_blended_slots._slot_capitals_for exactly."""
-    if weights and len(weights) >= slot_count:
-        total_w = sum(weights[:slot_count])
-        return [capital_base * w / total_w for w in weights[:slot_count]]
-    return [capital_base / slot_count] * slot_count
 
 
 def get_available_capital(conn, model_id: int) -> float:
@@ -151,13 +140,50 @@ def place_entry(conn, stream: dict, kraken: KrakenClient, dry_run: bool = False)
     )
 
 
-def check_pending_entry(conn, kraken: KrakenClient, dry_run: bool = False) -> tuple[int, int]:
-    """Poll Kraken for PENDING_ENTRY positions. Flip to OPEN on fill, or delete on expiry."""
+def _resolve_order(kraken: KrakenClient, order_id: str, expiry_ts, now, log_label: str):
+    """
+    Poll an order's status, cancelling it first if our own expiry has passed.
+
+    Cancelling doesn't undo a fill that landed right before it took effect
+    (including a partial fill) -- so this always requeries AFTER cancelling
+    rather than trusting the cancel call alone, and callers must never
+    discard a position based on vol_exec without looking at this result.
+
+    Returns (order_dict, our_expiry_passed). order_dict is None if the status
+    query itself failed -- callers should skip this position for this tick.
+    """
+    our_expiry_passed = bool(expiry_ts and now > expiry_ts)
+
+    if our_expiry_passed:
+        log.info(f"{log_label} past expiry -- cancelling {order_id}")
+        try:
+            kraken.cancel_order(order_id)
+        except Exception as e:
+            log.warning(f"Cancel attempt for {order_id} raised: {e}")
+
+    try:
+        order = kraken.get_order_status(order_id)
+    except Exception as e:
+        verb = "confirm final status of" if our_expiry_passed else "query"
+        log.error(f"Could not {verb} {order_id} for {log_label}: {e}")
+        return None, our_expiry_passed
+
+    return order, our_expiry_passed
+
+
+def check_pending_entry(conn, kraken: KrakenClient, streams: dict, dry_run: bool = False) -> tuple[int, int]:
+    """
+    Poll Kraken for PENDING_ENTRY positions. Flip to OPEN on fill, or delete on expiry.
+
+    streams: {stream_id: stream_dict} -- the same dict the caller's tick()
+    already loaded once this tick, reused here instead of re-querying
+    live.streams for every fill.
+    """
     now = datetime.now(timezone.utc)
     pending = conn.execute(
         text("""
             SELECT bp.position_id, bp.stream_id, bp.model_id, ls.stream_name,
-                   bp.pending_entry_order_id, bp.pending_entry_expiry_at
+                   bp.pending_entry_order_id, bp.pending_entry_expiry_at, bp.position_capital_base
             FROM live.blended_positions bp
             JOIN live.streams ls ON ls.stream_id = bp.stream_id
             WHERE bp.status = 'PENDING_ENTRY'
@@ -173,31 +199,11 @@ def check_pending_entry(conn, kraken: KrakenClient, dry_run: bool = False) -> tu
             continue
 
         expiry_ts = pos.pending_entry_expiry_at.replace(tzinfo=timezone.utc) if pos.pending_entry_expiry_at else None
-        our_expiry_passed = expiry_ts and now > expiry_ts
-
-        if our_expiry_passed:
-            # Cancel first -- but a fill can land on Kraken's side in the gap
-            # between our last check and this one, including a PARTIAL fill
-            # right before cancellation takes effect. Cancelling only stops
-            # further fills; it does not undo BTC already bought. Always
-            # requery status after cancelling and never discard a position
-            # that shows any vol_exec > 0.
-            log.info(f"Position {pos.position_id} slot-1 past expiry -- cancelling {pos.pending_entry_order_id}")
-            try:
-                kraken.cancel_order(pos.pending_entry_order_id)
-            except Exception as e:
-                log.warning(f"Cancel attempt for {pos.pending_entry_order_id} raised: {e}")
-            try:
-                order = kraken.get_order_status(pos.pending_entry_order_id)
-            except Exception as e:
-                log.error(f"Could not confirm final status of {pos.pending_entry_order_id} after cancel: {e}")
-                continue
-        else:
-            try:
-                order = kraken.get_order_status(pos.pending_entry_order_id)
-            except Exception as e:
-                log.error(f"Could not query order {pos.pending_entry_order_id} for position {pos.position_id}: {e}")
-                continue
+        order, our_expiry_passed = _resolve_order(
+            kraken, pos.pending_entry_order_id, expiry_ts, now, f"position {pos.position_id} slot-1"
+        )
+        if order is None:
+            continue
 
         status = order.get("status", "")
         vol_exec = float(order.get("vol_exec", 0) or 0)
@@ -219,7 +225,12 @@ def check_pending_entry(conn, kraken: KrakenClient, dry_run: bool = False) -> tu
             # Terminal state (closed = fully filled, or canceled/expired
             # with a partial fill locked in) -- safe to finalize now, this
             # volume will never change again.
-            _apply_entry_fill(conn, pos, order, vol_exec, now)
+            stream = streams.get(pos.stream_id)
+            if stream is None:
+                log.error(f"Position {pos.position_id}: stream_id={pos.stream_id} not in loaded streams, "
+                          "cannot apply fill this tick")
+                continue
+            _apply_entry_fill(conn, pos, order, vol_exec, now, stream)
             fills += 1
         elif our_expiry_passed or status in ("canceled", "expired"):
             log.info(f"Position {pos.position_id} slot-1 order cancelled/expired on Kraken, zero fill -- freeing")
@@ -230,19 +241,11 @@ def check_pending_entry(conn, kraken: KrakenClient, dry_run: bool = False) -> tu
     return fills, expirations
 
 
-def _apply_entry_fill(conn, pos, order: dict, vol_exec: float, now) -> None:
+def _apply_entry_fill(conn, pos, order: dict, vol_exec: float, now, stream: dict) -> None:
     """Record slot 1's fill (full or partial -- either way it's real BTC bought) and open the position."""
     fill_price = float(order.get("price", 0) or 0)
-    capital = conn.execute(
-        text("SELECT position_capital_base FROM live.blended_positions WHERE position_id = :pid"),
-        {"pid": pos.position_id},
-    ).scalar()
-    weights_row = conn.execute(
-        text("SELECT parameters, slot_count FROM live.streams WHERE stream_id = :sid"),
-        {"sid": pos.stream_id},
-    ).fetchone()
-    weights = (weights_row.parameters.get("slots") or {}).get("slot_capital_weight")
-    slot_capitals = _slot_capitals_for(float(capital), weights, weights_row.slot_count)
+    weights = (stream["parameters"].get("slots") or {}).get("slot_capital_weight")
+    slot_capitals = _slot_capitals_for(float(pos.position_capital_base), weights, stream["slot_count"])
     slot1_capital = slot_capitals[0]
 
     log.info(f"Position {pos.position_id} slot 1 filled @ ${fill_price:.2f} (vol_exec={vol_exec:.8f})")
@@ -347,8 +350,13 @@ def check_cascade_add_trigger(conn, stream: dict, latest_close: float, kraken: K
     )
 
 
-def check_pending_add(conn, kraken: KrakenClient, dry_run: bool = False) -> tuple[int, int]:
-    """Poll Kraken for in-flight cascade adds. Fold into the position on fill, or clear on expiry."""
+def check_pending_add(conn, kraken: KrakenClient, streams: dict, dry_run: bool = False) -> tuple[int, int]:
+    """
+    Poll Kraken for in-flight cascade adds. Fold into the position on fill, or clear on expiry.
+
+    streams: {stream_id: stream_dict} -- reused from the caller's tick(),
+    same reasoning as check_pending_entry.
+    """
     now = datetime.now(timezone.utc)
     pending = conn.execute(
         text("""
@@ -370,28 +378,12 @@ def check_pending_add(conn, kraken: KrakenClient, dry_run: bool = False) -> tupl
             continue
 
         expiry_ts = pos.pending_add_expiry_at.replace(tzinfo=timezone.utc) if pos.pending_add_expiry_at else None
-        our_expiry_passed = expiry_ts and now > expiry_ts
-
-        if our_expiry_passed:
-            # Same reasoning as check_pending_entry: cancelling doesn't undo
-            # a fill that landed right before it took effect. Always requery
-            # and never discard a partial fill.
-            log.info(f"Position {pos.position_id} add #{pos.pending_add_index} past expiry -- cancelling")
-            try:
-                kraken.cancel_order(pos.pending_add_order_id)
-            except Exception as e:
-                log.warning(f"Cancel attempt for {pos.pending_add_order_id} raised: {e}")
-            try:
-                order = kraken.get_order_status(pos.pending_add_order_id)
-            except Exception as e:
-                log.error(f"Could not confirm final status of {pos.pending_add_order_id} after cancel: {e}")
-                continue
-        else:
-            try:
-                order = kraken.get_order_status(pos.pending_add_order_id)
-            except Exception as e:
-                log.error(f"Could not query order {pos.pending_add_order_id} for position {pos.position_id}: {e}")
-                continue
+        order, our_expiry_passed = _resolve_order(
+            kraken, pos.pending_add_order_id, expiry_ts, now,
+            f"position {pos.position_id} add #{pos.pending_add_index}"
+        )
+        if order is None:
+            continue
 
         status = order.get("status", "")
         vol_exec = float(order.get("vol_exec", 0) or 0)
@@ -407,7 +399,12 @@ def check_pending_add(conn, kraken: KrakenClient, dry_run: bool = False) -> tupl
             continue
 
         if vol_exec > 0:
-            _apply_add_fill(conn, pos, order, vol_exec, now)
+            stream = streams.get(pos.stream_id)
+            if stream is None:
+                log.error(f"Position {pos.position_id}: stream_id={pos.stream_id} not in loaded streams, "
+                          "cannot apply fill this tick")
+                continue
+            _apply_add_fill(conn, pos, order, vol_exec, now, stream)
             fills += 1
         elif our_expiry_passed or status in ("canceled", "expired"):
             log.info(f"Position {pos.position_id} add order cancelled/expired on Kraken, zero fill")
@@ -425,15 +422,12 @@ def check_pending_add(conn, kraken: KrakenClient, dry_run: bool = False) -> tupl
     return fills, expirations
 
 
-def _apply_add_fill(conn, pos, order: dict, vol_exec: float, now) -> None:
+def _apply_add_fill(conn, pos, order: dict, vol_exec: float, now, stream: dict) -> None:
     """Record a cascade add's fill (full or partial) and fold it into the blended average."""
     fill_price = float(order.get("price", 0) or 0)
-    weights_row = conn.execute(
-        text("SELECT parameters, slot_count FROM live.streams WHERE stream_id = :sid"),
-        {"sid": pos.stream_id},
-    ).fetchone()
-    weights = (weights_row.parameters.get("slots") or {}).get("slot_capital_weight")
-    slot_capitals = _slot_capitals_for(float(pos.position_capital_base), weights, weights_row.slot_count)
+    weights = (stream["parameters"].get("slots") or {}).get("slot_capital_weight")
+    slot_count = stream["slot_count"]
+    slot_capitals = _slot_capitals_for(float(pos.position_capital_base), weights, slot_count)
     add_capital = slot_capitals[pos.pending_add_index]
 
     new_qty = float(pos.total_qty) + vol_exec
@@ -451,7 +445,7 @@ def _apply_add_fill(conn, pos, order: dict, vol_exec: float, now) -> None:
         {"pid": pos.position_id, "fnum": pos.pending_add_index, "price": fill_price,
          "capital": add_capital, "qty": vol_exec, "oid": pos.pending_add_order_id, "now": now},
     )
-    capitulation_armed = (pos.pending_add_index + 1) == weights_row.slot_count
+    capitulation_armed = (pos.pending_add_index + 1) == slot_count
     conn.execute(
         text("""
             UPDATE live.blended_positions

@@ -19,12 +19,13 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from dotenv import load_dotenv
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 
 from src.live import blended_order_manager as order_manager
 from tests.live._fake_kraken import FakeKraken
 from src.live import blended_position_monitor as position_monitor
 from src.live.blended_executor import _write_last_run, _read_last_run
+from tests.live.conftest import get_local_engine as _get_engine
 
 load_dotenv()
 
@@ -39,13 +40,6 @@ PARAMS = {
                 "capitulation_stop_pct": 15},
     "core_params": {"dip_pct": 1.0}, "core_signal": "fear_dip", "primary_timeframe": "4h",
 }
-
-
-def _get_engine():
-    url = os.getenv("DATABASE_URL", "postgresql://localhost/forge_anchor")
-    if url.startswith("postgresql://") and "+psycopg2" not in url:
-        url = url.replace("postgresql://", "postgresql+psycopg2://", 1)
-    return create_engine(url)
 
 
 @pytest.fixture
@@ -126,13 +120,13 @@ def test_blended_flow_never_touches_model1_lots_or_heartbeat(dual_model_sandbox)
     with engine.begin() as conn:
         order_manager.place_entry(conn, m3_stream, kraken, dry_run=False)
     with engine.begin() as conn:
-        order_manager.check_pending_entry(conn, kraken, dry_run=False)
+        order_manager.check_pending_entry(conn, kraken, {m3_stream["stream_id"]: m3_stream}, dry_run=False)
 
     kraken._next_price = 49000.0
     with engine.begin() as conn:
         order_manager.check_cascade_add_trigger(conn, m3_stream, latest_close=49000.0, kraken=kraken, dry_run=False)
     with engine.begin() as conn:
-        order_manager.check_pending_add(conn, kraken, dry_run=False)
+        order_manager.check_pending_add(conn, kraken, {m3_stream["stream_id"]: m3_stream}, dry_run=False)
 
     with engine.begin() as conn:
         candle_row = {m3_stream["stream_id"]: {"close": 60000.0, "low": 57000.0}}

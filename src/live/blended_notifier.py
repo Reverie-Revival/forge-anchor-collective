@@ -8,9 +8,13 @@ mistaken for each other or for a Model 1 alert.
 from src.live.notifier import _dispatch
 
 
+def _slot_label(fill_number: int) -> str:
+    return "Slot 1 (base entry)" if fill_number == 0 else f"Cascade add #{fill_number}"
+
+
 def alert_blend_order_placed(stream_name: str, model_id: int, fill_number: int,
                              usd_in: float, limit_price: float, qty: float, expiry_at: str) -> None:
-    label = "Slot 1 (base entry)" if fill_number == 0 else f"Cascade add #{fill_number}"
+    label = _slot_label(fill_number)
     _dispatch(
         email_subject=f"Forge: Blend Order Placed - Model {model_id} | {stream_name}",
         email_body=(
@@ -28,7 +32,7 @@ def alert_blend_order_placed(stream_name: str, model_id: int, fill_number: int,
 
 
 def alert_blend_order_expired(stream_name: str, model_id: int, fill_number: int) -> None:
-    label = "Slot 1 (base entry)" if fill_number == 0 else f"Cascade add #{fill_number}"
+    label = _slot_label(fill_number)
     _dispatch(
         email_subject=f"Forge: Blend Order Expired - Model {model_id} | {stream_name}",
         email_body=(

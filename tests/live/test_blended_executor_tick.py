@@ -23,10 +23,11 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from dotenv import load_dotenv
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 
 from src.live import blended_executor
 from tests.live._fake_kraken import FakeKraken
+from tests.live.conftest import get_local_engine as _get_engine
 
 load_dotenv()
 
@@ -40,13 +41,6 @@ PARAMS = {
                 "capitulation_stop_pct": 15},
     "core_params": {"dip_pct": 1.0}, "core_signal": "fear_dip", "primary_timeframe": "4h",
 }
-
-
-def _get_engine():
-    url = os.getenv("DATABASE_URL", "postgresql://localhost/forge_anchor")
-    if url.startswith("postgresql://") and "+psycopg2" not in url:
-        url = url.replace("postgresql://", "postgresql+psycopg2://", 1)
-    return create_engine(url)
 
 
 @pytest.fixture

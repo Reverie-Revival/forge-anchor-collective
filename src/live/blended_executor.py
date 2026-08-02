@@ -148,47 +148,47 @@ def tick(conn, streams: dict, kraken: KrakenClient, last_tick: datetime,
     signals_fired = []
     entries_placed = 0
 
+    # One pass per stream whose timeframe closed this tick: fetch its candle,
+    # check for a cascade add, then check for a fresh entry signal. Each
+    # stream's decisions only depend on its own candle, so there's no
+    # ordering requirement forcing this into two separate passes -- candle_row
+    # just needs to be fully populated by the time position_monitor.check_all
+    # runs below, which it is either way.
     candle_row = {}
     for stream_id, stream in streams.items():
         tf = stream["parameters"].get("primary_timeframe", "4h")
-        if tf in closed_tfs:
-            candle = _latest_candle_for_stream(stream)
-            if candle:
-                candle_row[stream_id] = candle
+        if tf not in closed_tfs:
+            continue
 
-    if closed_tfs:
-        for stream_id, stream in streams.items():
-            tf = stream["parameters"].get("primary_timeframe", "4h")
-            if tf not in closed_tfs:
-                continue
+        candle = _latest_candle_for_stream(stream)
+        if candle:
+            candle_row[stream_id] = candle
 
-            candle = candle_row.get(stream_id)
+        # An OPEN position with room to add takes priority over trying to
+        # open a brand-new one (has_active_position blocks that anyway),
+        # but check it explicitly so the add uses this tick's fresh close.
+        if candle:
+            order_manager.check_cascade_add_trigger(conn, stream, candle["close"], kraken, dry_run)
 
-            # An OPEN position with room to add takes priority over trying to
-            # open a brand-new one (has_active_position blocks that anyway),
-            # but check it explicitly so the add uses this tick's fresh close.
-            if candle:
-                order_manager.check_cascade_add_trigger(conn, stream, candle["close"], kraken, dry_run)
+        if order_manager.has_active_position(conn, stream_id):
+            log.debug(f"{stream['stream_name']}: position already building/open, skipping signal check")
+            continue
 
-            if order_manager.has_active_position(conn, stream_id):
-                log.debug(f"{stream['stream_name']}: position already building/open, skipping signal check")
-                continue
+        try:
+            fired = signal_engine.check(stream)
+        except Exception as e:
+            log.error(f"Signal check failed for {stream['stream_name']}: {e}")
+            continue
+        if fired:
+            log.info(f"Signal fired: {stream['stream_name']} — placing slot-1 entry order")
+            signals_fired.append(stream["stream_name"])
+            order_manager.place_entry(conn, stream, kraken, dry_run)
+            entries_placed += 1
+        else:
+            log.debug(f"{stream['stream_name']}: no signal")
 
-            try:
-                fired = signal_engine.check(stream)
-            except Exception as e:
-                log.error(f"Signal check failed for {stream['stream_name']}: {e}")
-                continue
-            if fired:
-                log.info(f"Signal fired: {stream['stream_name']} — placing slot-1 entry order")
-                signals_fired.append(stream["stream_name"])
-                order_manager.place_entry(conn, stream, kraken, dry_run)
-                entries_placed += 1
-            else:
-                log.debug(f"{stream['stream_name']}: no signal")
-
-    entry_fills, entry_expirations = order_manager.check_pending_entry(conn, kraken, dry_run)
-    add_fills, add_expirations = order_manager.check_pending_add(conn, kraken, dry_run)
+    entry_fills, entry_expirations = order_manager.check_pending_entry(conn, kraken, streams, dry_run)
+    add_fills, add_expirations = order_manager.check_pending_add(conn, kraken, streams, dry_run)
     fills = entry_fills + add_fills
     expirations = entry_expirations + add_expirations
 
