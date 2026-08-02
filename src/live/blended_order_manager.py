@@ -173,72 +173,101 @@ def check_pending_entry(conn, kraken: KrakenClient, dry_run: bool = False) -> tu
             continue
 
         expiry_ts = pos.pending_entry_expiry_at.replace(tzinfo=timezone.utc) if pos.pending_entry_expiry_at else None
-        if expiry_ts and now > expiry_ts:
+        our_expiry_passed = expiry_ts and now > expiry_ts
+
+        if our_expiry_passed:
+            # Cancel first -- but a fill can land on Kraken's side in the gap
+            # between our last check and this one, including a PARTIAL fill
+            # right before cancellation takes effect. Cancelling only stops
+            # further fills; it does not undo BTC already bought. Always
+            # requery status after cancelling and never discard a position
+            # that shows any vol_exec > 0.
             log.info(f"Position {pos.position_id} slot-1 past expiry -- cancelling {pos.pending_entry_order_id}")
             try:
                 kraken.cancel_order(pos.pending_entry_order_id)
             except Exception as e:
                 log.warning(f"Cancel attempt for {pos.pending_entry_order_id} raised: {e}")
-            conn.execute(text("DELETE FROM live.blended_positions WHERE position_id = :pid"), {"pid": pos.position_id})
-            notifier.alert_blend_order_expired(pos.stream_name, pos.model_id, 0)
-            expirations += 1
-            continue
-
-        try:
-            order = kraken.get_order_status(pos.pending_entry_order_id)
-        except Exception as e:
-            log.error(f"Could not query order {pos.pending_entry_order_id} for position {pos.position_id}: {e}")
-            continue
+            try:
+                order = kraken.get_order_status(pos.pending_entry_order_id)
+            except Exception as e:
+                log.error(f"Could not confirm final status of {pos.pending_entry_order_id} after cancel: {e}")
+                continue
+        else:
+            try:
+                order = kraken.get_order_status(pos.pending_entry_order_id)
+            except Exception as e:
+                log.error(f"Could not query order {pos.pending_entry_order_id} for position {pos.position_id}: {e}")
+                continue
 
         status = order.get("status", "")
         vol_exec = float(order.get("vol_exec", 0) or 0)
 
-        if status == "closed" and vol_exec > 0:
-            fill_price = float(order.get("price", 0) or 0)
-            capital = conn.execute(
-                text("SELECT position_capital_base FROM live.blended_positions WHERE position_id = :pid"),
-                {"pid": pos.position_id},
-            ).scalar()
-            weights_row = conn.execute(
-                text("SELECT parameters, slot_count FROM live.streams WHERE stream_id = :sid"),
-                {"sid": pos.stream_id},
-            ).fetchone()
-            weights = (weights_row.parameters.get("slots") or {}).get("slot_capital_weight")
-            slot_capitals = _slot_capitals_for(float(capital), weights, weights_row.slot_count)
-            slot1_capital = slot_capitals[0]
+        if status == "open":
+            # Still resting on the book. A nonzero vol_exec here is a
+            # partial fill that could still grow with a LATER fill -- do
+            # NOT finalize it yet, that would silently orphan the rest of
+            # the order. If our expiry already passed, the cancel above
+            # should have moved it out of "open"; if it's still "open"
+            # anyway (cancel didn't take effect -- race/API hiccup), don't
+            # touch anything and let the next tick retry the cancel.
+            if our_expiry_passed:
+                log.warning(f"Position {pos.position_id} order still 'open' after a cancel attempt "
+                            f"(vol_exec={vol_exec:.8f}) -- will retry the cancel next tick")
+            continue
 
-            log.info(f"Position {pos.position_id} slot 1 filled @ ${fill_price:.2f}")
-            conn.execute(
-                text("""
-                    INSERT INTO live.blended_fills
-                        (position_id, fill_number, price, capital, qty, order_id, filled_at)
-                    VALUES (:pid, 0, :price, :capital, :qty, :oid, :now)
-                """),
-                {"pid": pos.position_id, "price": fill_price, "capital": slot1_capital,
-                 "qty": vol_exec, "oid": pos.pending_entry_order_id, "now": now},
-            )
-            conn.execute(
-                text("""
-                    UPDATE live.blended_positions
-                    SET status = 'OPEN', original_entry_price = :price,
-                        avg_cost_basis = :price, total_qty = :qty, total_deployed = :capital,
-                        highest_close = :price, pending_entry_order_id = NULL,
-                        pending_entry_expiry_at = NULL, opened_at = :now
-                    WHERE position_id = :pid
-                """),
-                {"price": fill_price, "qty": vol_exec, "capital": slot1_capital,
-                 "now": now, "pid": pos.position_id},
-            )
-            notifier.alert_blend_opened(pos.stream_name, pos.model_id, slot1_capital, fill_price, vol_exec)
+        if vol_exec > 0:
+            # Terminal state (closed = fully filled, or canceled/expired
+            # with a partial fill locked in) -- safe to finalize now, this
+            # volume will never change again.
+            _apply_entry_fill(conn, pos, order, vol_exec, now)
             fills += 1
-
-        elif status in ("canceled", "expired"):
-            log.info(f"Position {pos.position_id} slot-1 order cancelled/expired on Kraken -- freeing")
+        elif our_expiry_passed or status in ("canceled", "expired"):
+            log.info(f"Position {pos.position_id} slot-1 order cancelled/expired on Kraken, zero fill -- freeing")
             conn.execute(text("DELETE FROM live.blended_positions WHERE position_id = :pid"), {"pid": pos.position_id})
             notifier.alert_blend_order_expired(pos.stream_name, pos.model_id, 0)
             expirations += 1
 
     return fills, expirations
+
+
+def _apply_entry_fill(conn, pos, order: dict, vol_exec: float, now) -> None:
+    """Record slot 1's fill (full or partial -- either way it's real BTC bought) and open the position."""
+    fill_price = float(order.get("price", 0) or 0)
+    capital = conn.execute(
+        text("SELECT position_capital_base FROM live.blended_positions WHERE position_id = :pid"),
+        {"pid": pos.position_id},
+    ).scalar()
+    weights_row = conn.execute(
+        text("SELECT parameters, slot_count FROM live.streams WHERE stream_id = :sid"),
+        {"sid": pos.stream_id},
+    ).fetchone()
+    weights = (weights_row.parameters.get("slots") or {}).get("slot_capital_weight")
+    slot_capitals = _slot_capitals_for(float(capital), weights, weights_row.slot_count)
+    slot1_capital = slot_capitals[0]
+
+    log.info(f"Position {pos.position_id} slot 1 filled @ ${fill_price:.2f} (vol_exec={vol_exec:.8f})")
+    conn.execute(
+        text("""
+            INSERT INTO live.blended_fills
+                (position_id, fill_number, price, capital, qty, order_id, filled_at)
+            VALUES (:pid, 0, :price, :capital, :qty, :oid, :now)
+        """),
+        {"pid": pos.position_id, "price": fill_price, "capital": slot1_capital,
+         "qty": vol_exec, "oid": pos.pending_entry_order_id, "now": now},
+    )
+    conn.execute(
+        text("""
+            UPDATE live.blended_positions
+            SET status = 'OPEN', original_entry_price = :price,
+                avg_cost_basis = :price, total_qty = :qty, total_deployed = :capital,
+                highest_close = :price, pending_entry_order_id = NULL,
+                pending_entry_expiry_at = NULL, opened_at = :now
+            WHERE position_id = :pid
+        """),
+        {"price": fill_price, "qty": vol_exec, "capital": slot1_capital,
+         "now": now, "pid": pos.position_id},
+    )
+    notifier.alert_blend_opened(pos.stream_name, pos.model_id, slot1_capital, fill_price, vol_exec)
 
 
 def check_cascade_add_trigger(conn, stream: dict, latest_close: float, kraken: KrakenClient, dry_run: bool = False) -> None:
@@ -341,76 +370,47 @@ def check_pending_add(conn, kraken: KrakenClient, dry_run: bool = False) -> tupl
             continue
 
         expiry_ts = pos.pending_add_expiry_at.replace(tzinfo=timezone.utc) if pos.pending_add_expiry_at else None
-        if expiry_ts and now > expiry_ts:
+        our_expiry_passed = expiry_ts and now > expiry_ts
+
+        if our_expiry_passed:
+            # Same reasoning as check_pending_entry: cancelling doesn't undo
+            # a fill that landed right before it took effect. Always requery
+            # and never discard a partial fill.
             log.info(f"Position {pos.position_id} add #{pos.pending_add_index} past expiry -- cancelling")
             try:
                 kraken.cancel_order(pos.pending_add_order_id)
             except Exception as e:
                 log.warning(f"Cancel attempt for {pos.pending_add_order_id} raised: {e}")
-            conn.execute(
-                text("""
-                    UPDATE live.blended_positions
-                    SET pending_add_order_id = NULL, pending_add_index = NULL, pending_add_expiry_at = NULL
-                    WHERE position_id = :pid
-                """),
-                {"pid": pos.position_id},
-            )
-            notifier.alert_blend_order_expired(pos.stream_name, pos.model_id, pos.pending_add_index)
-            expirations += 1
-            continue
-
-        try:
-            order = kraken.get_order_status(pos.pending_add_order_id)
-        except Exception as e:
-            log.error(f"Could not query order {pos.pending_add_order_id} for position {pos.position_id}: {e}")
-            continue
+            try:
+                order = kraken.get_order_status(pos.pending_add_order_id)
+            except Exception as e:
+                log.error(f"Could not confirm final status of {pos.pending_add_order_id} after cancel: {e}")
+                continue
+        else:
+            try:
+                order = kraken.get_order_status(pos.pending_add_order_id)
+            except Exception as e:
+                log.error(f"Could not query order {pos.pending_add_order_id} for position {pos.position_id}: {e}")
+                continue
 
         status = order.get("status", "")
         vol_exec = float(order.get("vol_exec", 0) or 0)
 
-        if status == "closed" and vol_exec > 0:
-            fill_price = float(order.get("price", 0) or 0)
-            weights_row = conn.execute(
-                text("SELECT parameters, slot_count FROM live.streams WHERE stream_id = :sid"),
-                {"sid": pos.stream_id},
-            ).fetchone()
-            weights = (weights_row.parameters.get("slots") or {}).get("slot_capital_weight")
-            slot_capitals = _slot_capitals_for(float(pos.position_capital_base), weights, weights_row.slot_count)
-            add_capital = slot_capitals[pos.pending_add_index]
+        if status == "open":
+            # Still resting on the book -- see check_pending_entry's identical
+            # comment. A partial vol_exec here could still grow; don't
+            # finalize it, and don't touch anything if our own expiry timer
+            # already fired but the cancel hasn't taken effect yet.
+            if our_expiry_passed:
+                log.warning(f"Position {pos.position_id} add order still 'open' after a cancel attempt "
+                            f"(vol_exec={vol_exec:.8f}) -- will retry the cancel next tick")
+            continue
 
-            new_qty = float(pos.total_qty) + vol_exec
-            new_deployed = float(pos.total_deployed) + add_capital
-            new_avg = new_deployed / new_qty
-
-            log.info(f"Position {pos.position_id} add #{pos.pending_add_index} filled @ ${fill_price:.2f} "
-                     f"-- new avg cost ${new_avg:.2f}")
-            conn.execute(
-                text("""
-                    INSERT INTO live.blended_fills
-                        (position_id, fill_number, price, capital, qty, order_id, filled_at)
-                    VALUES (:pid, :fnum, :price, :capital, :qty, :oid, :now)
-                """),
-                {"pid": pos.position_id, "fnum": pos.pending_add_index, "price": fill_price,
-                 "capital": add_capital, "qty": vol_exec, "oid": pos.pending_add_order_id, "now": now},
-            )
-            capitulation_armed = (pos.pending_add_index + 1) == weights_row.slot_count
-            conn.execute(
-                text("""
-                    UPDATE live.blended_positions
-                    SET total_qty = :qty, total_deployed = :deployed, avg_cost_basis = :avg,
-                        pending_add_order_id = NULL, pending_add_index = NULL, pending_add_expiry_at = NULL,
-                        capitulation_armed = :armed
-                    WHERE position_id = :pid
-                """),
-                {"qty": new_qty, "deployed": new_deployed, "avg": new_avg,
-                 "armed": capitulation_armed, "pid": pos.position_id},
-            )
-            notifier.alert_blend_add_filled(pos.stream_name, pos.model_id, pos.pending_add_index + 1,
-                                            add_capital, fill_price, new_avg)
+        if vol_exec > 0:
+            _apply_add_fill(conn, pos, order, vol_exec, now)
             fills += 1
-
-        elif status in ("canceled", "expired"):
-            log.info(f"Position {pos.position_id} add order cancelled/expired on Kraken")
+        elif our_expiry_passed or status in ("canceled", "expired"):
+            log.info(f"Position {pos.position_id} add order cancelled/expired on Kraken, zero fill")
             conn.execute(
                 text("""
                     UPDATE live.blended_positions
@@ -423,6 +423,48 @@ def check_pending_add(conn, kraken: KrakenClient, dry_run: bool = False) -> tupl
             expirations += 1
 
     return fills, expirations
+
+
+def _apply_add_fill(conn, pos, order: dict, vol_exec: float, now) -> None:
+    """Record a cascade add's fill (full or partial) and fold it into the blended average."""
+    fill_price = float(order.get("price", 0) or 0)
+    weights_row = conn.execute(
+        text("SELECT parameters, slot_count FROM live.streams WHERE stream_id = :sid"),
+        {"sid": pos.stream_id},
+    ).fetchone()
+    weights = (weights_row.parameters.get("slots") or {}).get("slot_capital_weight")
+    slot_capitals = _slot_capitals_for(float(pos.position_capital_base), weights, weights_row.slot_count)
+    add_capital = slot_capitals[pos.pending_add_index]
+
+    new_qty = float(pos.total_qty) + vol_exec
+    new_deployed = float(pos.total_deployed) + add_capital
+    new_avg = new_deployed / new_qty
+
+    log.info(f"Position {pos.position_id} add #{pos.pending_add_index} filled @ ${fill_price:.2f} "
+             f"(vol_exec={vol_exec:.8f}) -- new avg cost ${new_avg:.2f}")
+    conn.execute(
+        text("""
+            INSERT INTO live.blended_fills
+                (position_id, fill_number, price, capital, qty, order_id, filled_at)
+            VALUES (:pid, :fnum, :price, :capital, :qty, :oid, :now)
+        """),
+        {"pid": pos.position_id, "fnum": pos.pending_add_index, "price": fill_price,
+         "capital": add_capital, "qty": vol_exec, "oid": pos.pending_add_order_id, "now": now},
+    )
+    capitulation_armed = (pos.pending_add_index + 1) == weights_row.slot_count
+    conn.execute(
+        text("""
+            UPDATE live.blended_positions
+            SET total_qty = :qty, total_deployed = :deployed, avg_cost_basis = :avg,
+                pending_add_order_id = NULL, pending_add_index = NULL, pending_add_expiry_at = NULL,
+                capitulation_armed = :armed
+            WHERE position_id = :pid
+        """),
+        {"qty": new_qty, "deployed": new_deployed, "avg": new_avg,
+         "armed": capitulation_armed, "pid": pos.position_id},
+    )
+    notifier.alert_blend_add_filled(pos.stream_name, pos.model_id, pos.pending_add_index + 1,
+                                    add_capital, fill_price, new_avg)
 
 
 def place_exit(conn, position, exit_price: float, exit_reason: str,

@@ -22,6 +22,7 @@ from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
 
 from src.live import blended_order_manager as order_manager
+from tests.live._fake_kraken import FakeKraken
 from src.live import blended_position_monitor as position_monitor
 from src.live.blended_executor import _write_last_run, _read_last_run
 
@@ -45,29 +46,6 @@ def _get_engine():
     if url.startswith("postgresql://") and "+psycopg2" not in url:
         url = url.replace("postgresql://", "postgresql+psycopg2://", 1)
     return create_engine(url)
-
-
-class FakeKraken:
-    def __init__(self):
-        self.orders = {}
-        self._next_id = 1
-        self._next_price = 50000.0
-
-    def get_ticker_price(self):
-        return self._next_price
-
-    def place_order(self, side, volume_btc, price_usd=None, order_type="limit"):
-        txid = f"FAKE-{self._next_id}"
-        self._next_id += 1
-        fill_price = price_usd if price_usd is not None else self._next_price
-        self.orders[txid] = {"status": "closed", "vol_exec": f"{volume_btc:.8f}", "price": f"{fill_price:.2f}"}
-        return txid
-
-    def get_order_status(self, txid):
-        return self.orders[txid]
-
-    def cancel_order(self, txid):
-        pass
 
 
 @pytest.fixture

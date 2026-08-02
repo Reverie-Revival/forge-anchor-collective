@@ -29,6 +29,7 @@ from sqlalchemy import create_engine, text
 
 from src.live import blended_order_manager as order_manager
 from src.live import blended_position_monitor as position_monitor
+from tests.live._fake_kraken import FakeKraken
 
 load_dotenv()
 
@@ -58,30 +59,6 @@ def _get_engine():
     if url.startswith("postgresql://") and "+psycopg2" not in url:
         url = url.replace("postgresql://", "postgresql+psycopg2://", 1)
     return create_engine(url)
-
-
-class FakeKraken:
-    """Stub KrakenClient — every order fills instantly at the submitted price."""
-
-    def __init__(self):
-        self.orders = {}
-        self._next_id = 1
-
-    def get_ticker_price(self):
-        return self._next_price
-
-    def place_order(self, side, volume_btc, price_usd=None, order_type="limit"):
-        txid = f"FAKE-{self._next_id}"
-        self._next_id += 1
-        fill_price = price_usd if price_usd is not None else self._next_price
-        self.orders[txid] = {"status": "closed", "vol_exec": f"{volume_btc:.8f}", "price": f"{fill_price:.2f}"}
-        return txid
-
-    def get_order_status(self, txid):
-        return self.orders[txid]
-
-    def cancel_order(self, txid):
-        pass
 
 
 @pytest.fixture
@@ -217,6 +194,7 @@ def test_entry_order_expiry_frees_the_slot(sandbox):
     engine, stream, model_id = sandbox
     kraken = FakeKraken()
     kraken._next_price = 50000.0
+    kraken.next_fill_mode = "none"   # genuinely never fills -- a real unfilled limit order
 
     with engine.begin() as conn:
         order_manager.place_entry(conn, stream, kraken, dry_run=False)
@@ -230,6 +208,37 @@ def test_entry_order_expiry_frees_the_slot(sandbox):
         fills, expirations = order_manager.check_pending_entry(conn, kraken, dry_run=False)
         assert fills == 0 and expirations == 1
         assert not order_manager.has_active_position(conn, stream["stream_id"])
+
+
+def test_partial_fill_right_before_entry_expiry_is_preserved(sandbox):
+    """The exact bug this test guards against: a limit order partially fills
+    right before its expiry, then gets cancelled. Cancelling does NOT undo
+    the BTC already bought -- the position must open with the partial fill,
+    never be silently deleted."""
+    engine, stream, model_id = sandbox
+    kraken = FakeKraken()
+    kraken._next_price = 50000.0
+    kraken.next_fill_mode = "partial"
+    kraken.next_partial_fraction = 0.4
+
+    with engine.begin() as conn:
+        order_manager.place_entry(conn, stream, kraken, dry_run=False)
+        conn.execute(text("""
+            UPDATE live.blended_positions SET pending_entry_expiry_at = now() - interval '1 hour'
+            WHERE stream_id = :sid
+        """), {"sid": stream["stream_id"]})
+
+    with engine.begin() as conn:
+        fills, expirations = order_manager.check_pending_entry(conn, kraken, dry_run=False)
+        assert fills == 1 and expirations == 0   # treated as a real fill, NOT an expiration
+        pos = conn.execute(text("""
+            SELECT status, total_qty, total_deployed FROM live.blended_positions WHERE stream_id = :sid
+        """), {"sid": stream["stream_id"]}).fetchone()
+        assert pos.status == "OPEN"
+        assert float(pos.total_qty) > 0   # the partial BTC is tracked, not lost
+        assert order_manager.has_active_position(conn, stream["stream_id"])
+
+    print("\nPartial-fill-at-expiry OK -- position opened with the partial fill, not deleted.")
 
 
 def test_cascade_add_expiry_keeps_position_open_for_retry(sandbox):
@@ -246,6 +255,7 @@ def test_cascade_add_expiry_keeps_position_open_for_retry(sandbox):
         order_manager.check_pending_entry(conn, kraken, dry_run=False)
 
     kraken._next_price = 49000.0
+    kraken.next_fill_mode = "none"   # genuinely never fills
     with engine.begin() as conn:
         order_manager.check_cascade_add_trigger(conn, stream, latest_close=49000.0, kraken=kraken, dry_run=False)
         conn.execute(text("""
@@ -261,6 +271,90 @@ def test_cascade_add_expiry_keeps_position_open_for_retry(sandbox):
         """), {"sid": stream["stream_id"]}).fetchone()
         assert pos.status == "OPEN"          # still open, NOT closed or deleted
         assert pos.pending_add_order_id is None  # cleared, free to retry next tick
+
+
+def test_partial_fill_right_before_add_expiry_is_preserved(sandbox):
+    """Same bug, cascade-add version: a partial add fill right before
+    expiry must be folded into the position, never discarded."""
+    engine, stream, model_id = sandbox
+    kraken = FakeKraken()
+    kraken._next_price = 50000.0
+
+    with engine.begin() as conn:
+        order_manager.place_entry(conn, stream, kraken, dry_run=False)
+    with engine.begin() as conn:
+        order_manager.check_pending_entry(conn, kraken, dry_run=False)
+
+    kraken._next_price = 49000.0
+    kraken.next_fill_mode = "partial"
+    kraken.next_partial_fraction = 0.5
+    with engine.begin() as conn:
+        order_manager.check_cascade_add_trigger(conn, stream, latest_close=49000.0, kraken=kraken, dry_run=False)
+        conn.execute(text("""
+            UPDATE live.blended_positions SET pending_add_expiry_at = now() - interval '1 hour'
+            WHERE stream_id = :sid
+        """), {"sid": stream["stream_id"]})
+
+    with engine.begin() as conn:
+        qty_before = conn.execute(text(
+            "SELECT total_qty FROM live.blended_positions WHERE stream_id = :sid"
+        ), {"sid": stream["stream_id"]}).scalar()
+
+        fills, expirations = order_manager.check_pending_add(conn, kraken, dry_run=False)
+        assert fills == 1 and expirations == 0
+        pos = conn.execute(text("""
+            SELECT status, total_qty, pending_add_order_id FROM live.blended_positions WHERE stream_id = :sid
+        """), {"sid": stream["stream_id"]}).fetchone()
+        assert pos.status == "OPEN"
+        assert float(pos.total_qty) > float(qty_before)   # the partial add BTC was folded in, not lost
+        assert pos.pending_add_order_id is None
+
+    print("\nPartial-add-fill-at-expiry OK -- fill folded into position, not discarded.")
+
+
+def test_partial_fill_still_resting_before_expiry_is_not_finalized_early(sandbox):
+    """The second, subtler bug this session caught: a partial fill on an
+    order that's still OPEN on Kraken's book (not cancelled, not expired
+    yet) must NOT be treated as final -- it could still fill more. Applying
+    it early would stop polling that order and silently orphan the rest of
+    the fill. The pending-add tracking must stay in place until the order
+    reaches a terminal state (closed/canceled/expired)."""
+    engine, stream, model_id = sandbox
+    kraken = FakeKraken()
+    kraken._next_price = 50000.0
+
+    with engine.begin() as conn:
+        order_manager.place_entry(conn, stream, kraken, dry_run=False)
+    with engine.begin() as conn:
+        order_manager.check_pending_entry(conn, kraken, dry_run=False)
+
+    kraken._next_price = 49000.0
+    kraken.next_fill_mode = "partial"
+    kraken.next_partial_fraction = 0.3
+    with engine.begin() as conn:
+        order_manager.check_cascade_add_trigger(conn, stream, latest_close=49000.0, kraken=kraken, dry_run=False)
+        # note: expiry is NOT forced into the past here -- still well within its window
+
+    with engine.begin() as conn:
+        qty_before = conn.execute(text(
+            "SELECT total_qty FROM live.blended_positions WHERE stream_id = :sid"
+        ), {"sid": stream["stream_id"]}).scalar()
+
+        fills, expirations = order_manager.check_pending_add(conn, kraken, dry_run=False)
+        assert fills == 0 and expirations == 0   # neither -- must be left alone
+
+        pos = conn.execute(text("""
+            SELECT status, total_qty, pending_add_order_id, pending_add_index
+            FROM live.blended_positions WHERE stream_id = :sid
+        """), {"sid": stream["stream_id"]}).fetchone()
+        assert pos.status == "OPEN"
+        assert float(pos.total_qty) == float(qty_before)   # NOT folded in yet -- still resting
+        assert pos.pending_add_order_id is not None         # still tracked, will poll again next tick
+        assert pos.pending_add_index == 1
+
+    print("\nStill-resting partial fill OK -- left untouched, still tracked for the next tick.")
+
+    print("\nPartial-add-fill-at-expiry OK -- fill folded into position, not discarded.")
 
 
 def test_capitulation_stop_can_realize_a_loss_once_out_of_slots(sandbox):
