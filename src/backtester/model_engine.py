@@ -27,7 +27,13 @@ def run_model_backtest(stream_configs: list, start: str = None, end: str = None)
     reference_df = None
 
     for sc in stream_configs:
-        initial_capital = sc["lot_size_usd"] * sc["slot_count"]
+        # Blended mode's lot_size_usd IS the stream's total capital pool (split
+        # across slots internally via slot_capital_weight) -- unlike every other
+        # slot_mode, where lot_size_usd is per-slot and gets multiplied up.
+        if sc.get("slot_mode") == "blended":
+            initial_capital = sc["lot_size_usd"]
+        else:
+            initial_capital = sc["lot_size_usd"] * sc["slot_count"]
         result = run_backtest(
             sc["params"],
             start=start,

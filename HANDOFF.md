@@ -1,9 +1,9 @@
-# Handoff — 2026-08-01
+# Handoff — 2026-08-02
 
 ---
-## ⚠️ ACTION REQUIRED — ORACLE ACCOUNT (deadline is TODAY, Aug 1)
+## ⚠️ ACTION REQUIRED — ORACLE ACCOUNT
 A tenancy deletion was submitted on an Oracle Cloud account (personal Gmail). Deletion takes 30 days.
-**Log into your credit card TODAY and confirm zero Oracle charges ever appeared.** The account should be fully deleted by now — verify it's gone and no recurring relationship exists. This has been reminded every session since the deletion was submitted — please confirm and this banner comes down.
+**Log into your credit card and confirm zero Oracle charges ever appeared.** The account should be fully deleted by now — verify it's gone and no recurring relationship exists. This has been reminded every session since the deletion was submitted — please confirm and this banner comes down.
 This reminder must stay at the top of every handoff until confirmed complete.
 ---
 
@@ -11,15 +11,54 @@ This reminder must stay at the top of every handoff until confirmed complete.
 
 **Model 1 is LIVE** — executor running, cron on schedule. Full alert coverage active (order placed, filled, closed, expired, system down).
 
-**Model 2 is assembled and backtested.** Run 3 selected as deployment config. Not yet deployed — deprioritized in favor of Model 3 (see below), which tested significantly stronger.
+**Model 2 is assembled and backtested.** Run 3 selected as deployment config. Not yet deployed — deprioritized behind Model 3.
 
-**Model 3 candidate is backtest-validated and ready for live-code build.** "Grid Stacker Blended" — a blended-average DCA stream — backtested at 24-38% annualized across every window tested, zero real losing trades in 8 years including both major historical crashes, passed rigorous walk-forward and bootstrap validation. **No live execution code exists for it yet — that's tomorrow's entire session.** Full detail below and in Reference section.
+**Model 3 live execution code is BUILT and heavily tested locally — NOT yet deployed to Supabase.** "Grid Stacker Blended" now has a full live state machine (entry → cascade adds → trailing/capitulation stop exit), isolated from Model 1 at every layer (separate DB tables, separate executor process, separate GitHub Actions workflow, separate capital ledger — never reads Kraken's actual account balance). 16/16 tests passing (pure math + full state-machine integration + an explicit isolation test proving Model 1's data is untouched). **Deliberately paused before touching Supabase** — no new $100 in Kraken yet for Model 3. See "What's Next" for the concrete remaining steps once funded.
 
 **Model Dashboard is BUILT** — `3_model_dashboard.py` live in the multipage app (port 8504).
 
 ---
 
-## Done This Session (2026-08-01) — Model 3 candidate discovered, tuned, and QA'd
+## Done This Session (2026-08-02) — Model 3 live execution built, isolated, and tested
+
+Branched `feature/model3-live-build` off `main` for the whole session. Committed last session's uncommitted Grid Stacker Blended backtester work first (it had never been committed — engine.py, dashboard.py, metrics.py changes from 2026-08-01).
+
+### Isolation design (the actual hard requirement this session)
+
+Same Kraken account as Model 1, same Supabase project (same `SUPABASE_DATABASE_URL` — no new Supabase project, stays $0). Model 1 must keep running unaffected; Model 3 must never be able to spend Model 1's money even though compounding means Model 3's own capital isn't a fixed $100.
+
+- **New tables, not a retrofit of `live.lots`**: `live.blended_positions` (one row per stack: status, avg_cost_basis, total_qty, capitulation_armed, pending-entry/pending-add tracking) + `live.blended_fills` (child rows per fill) + `live.blended_capital` (Model 3's own tracked capital ledger, seeded at $100, updated only on realized close).
+- **Capital ledger, never Kraken's account balance**: every position sizes off `live.blended_capital.available_capital`, frozen per-position as `position_capital_base` at open time (mirrors the backtester's frozen `slot_capitals` split). Model 3 can only ever spend money it has itself realized — it has no code path that reads or reasons about the shared account's actual USD/BTC balance.
+- **`live.executor_state` was a shared singleton (`id=1`)** — added a nullable `model_id` column, backfilled Model 1's row to `model_id=1`, unique-indexed on `model_id`. Model 3's executor reads/writes its own row keyed by `model_id`, never touches Model 1's.
+- **Separate process, separate everything**: `src/live/blended_executor.py` (own tick loop), `blended_order_manager.py`, `blended_position_monitor.py`, `blended_notifier.py`, `blended_healthcheck.py`, `.github/workflows/executor_m3.yml` + `healthcheck_m3.yml` (separate `DRY_RUN_M3` secret from Model 1's `DRY_RUN`). `executor.py` (Model 1, live, production) was never modified — only read from (two pure helper functions imported: `_detect_closed_timeframes`, `_latest_candle_for_stream`).
+
+### Model 3 formally finalized in the backtest schema (a gap this session found)
+
+CLAUDE.md's model lifecycle requires assembling into `backtest.model_streams` and running a model-level backtest before a model is "deployment-ready" — Model 3 had only ever been validated at the stream level (see prior session below). Found and fixed a real bug in `model_engine.py` along the way: it computed `initial_capital = lot_size_usd * slot_count` for every slot_mode, but blended mode's `lot_size_usd` already **is** the total capital pool (split internally via `slot_capital_weight`), not a per-slot amount — this would have 5x-inflated Model 3's capital if run through the model-level tooling before the fix. Fixed, then ran `src/backtester/finalize_model3.py` (new, one-time): created `backtest.models` + `backtest.model_streams` rows, ran the model-level backtest (Full History), got **+84.7% ann, 482 trades** — matches the stream-level number from 2026-08-01 almost exactly, confirming the finalization path is correct. Saved as `backtest.model_tests.model_test_id=106`.
+
+### Real bugs caught by testing (this is why the test suite matters)
+
+1. **`executor_state` id collision** — the fallback INSERT in `_write_last_run` didn't specify `id`, so it silently tried the column's `DEFAULT 1` and collided with Model 1's row. Fixed to key off `model_id`.
+2. **Breakeven floor used the wrong fee.** `blended_position_monitor.py`'s "never voluntarily realize a loss" floor divided by `(1 - MAKER_FEE)`, but the real exit (`place_exit`) is a market sell charged `TAKER_FEE` (0.40% vs 0.25%) — same known fee-type gap already documented for Model 1's live exits, just not yet accounted for here. The mismatch let a test position close at a small real loss (-$0.06 on a $40 position) instead of flat/positive. Fixed to `avg_ep / (1 - TAKER_FEE)`, exactly matching `place_exit`'s real pnl formula. Cleaned up the unused `MAKER_FEE` import and added a fee-model docstring to `blended_order_manager.py` so this can't silently drift back.
+3. **`deploy_model3.py` queried `backtest.stream_configs` over `SUPABASE_DATABASE_URL`** — Supabase has no `backtest` schema at all (confirmed: live schema + market_data + sentiment_data only). Split into two connections: local Postgres to read the locked stream config, Supabase to write `live.models`/`live.streams`/`live.blended_capital`.
+4. **SQLAlchemy `text()` doesn't safely parse `:name::type`** (a cast immediately after a bind param) — `deploy.py`'s original pattern silently fails a syntax check in the installed SQLAlchemy version. Used `CAST(:params AS jsonb)` instead in `deploy_model3.py`. Not fixed in `deploy.py` itself (already run once for Model 1, guarded against re-running, out of scope to touch production deploy code for a latent bug that can't fire again).
+5. **Tests were sending real email/SMS alerts.** Testing the real (non-dry-run) fill/exit code paths necessarily calls the real notifier. Added `tests/live/conftest.py` — an autouse fixture that blanks the `ALERT_*` env vars for every test in `tests/live/`, so `notifier._dispatch`'s own "not configured" guard skips silently. Also cut total test suite runtime from ~9 minutes to ~2 seconds (the real SMTP round-trips were the entire cost).
+
+### Test suite — 16/16 passing (`tests/live/`)
+
+- `test_blended_math.py` (8 tests, no DB) — slot-weight splitting (equal, uneven, compounding-scaled), cascade trigger price math, capitulation price math, minimum lot-size threshold, and an explicit regression guard pinning `TAKER_FEE > MAKER_FEE` in the breakeven formula.
+- `test_blended_state_machine.py` (8 tests, local Postgres sandbox, mocked Kraken) — full entry→add→trailing-stop-exit cycle, entry-order expiry frees the slot, cascade-add expiry keeps the position open for retry (doesn't close it), capitulation stop realizing an allowed loss once all 5 slots are filled, compounding correctly growing the next position's capital base, duplicate-entry blocking, minimum-lot-size skip placing zero orders.
+- `test_blended_isolation.py` (1 test) — seeds a fake Model 1 lot + heartbeat row, runs a full Model 3 cycle through the real (non-mocked-DB) code paths, asserts Model 1's lot row is byte-for-byte unchanged and its heartbeat timestamp untouched.
+- Dry-run mode was confirmed to skip all Kraken polling (same as Model 1's `order_manager`) — meaning dry-run alone would never have exercised the fill/add/exit logic. The state-machine and isolation tests deliberately use `dry_run=False` with a `FakeKraken` stub instead, which is what actually caught bugs #1 and #2 above.
+- **Pre-existing, unrelated**: `tests/live/test_signal_parity.py` (Model 1's regression test) is currently broken — it queries `backtest.streams.locked_test_id`/`.parameters`/`.model_id`, columns that don't exist in the current v3 schema (`backtest.streams` is identity-only now; config lives in `backtest.stream_configs`). Not touched or caused by this session — flagging for a future cleanup pass.
+
+### What did NOT change
+
+Model 1 (live) and Model 2 (backtested, not deployed) — completely untouched in behavior. `executor.py`, `order_manager.py`, `position_monitor.py`, `notifier.py`, `live.lots`, `live.models`, `live.streams` structure all unmodified. The only shared-table changes were additive/nullable (`executor_runs.model_id`, `executor_state.model_id`) and were applied to both local Postgres and Supabase, verified against Model 1's real row afterward.
+
+---
+
+## Done Prior Session (2026-08-01) — Model 3 candidate discovered, tuned, and QA'd
 
 Ran data sync. Picked up the low-volatility uptrend question from last session (closed out — see prior entry below), then built something that turned into the main event of this session: a new stream design that ended up being the best-performing thing in this project by a wide margin.
 
@@ -112,34 +151,27 @@ All changes cherry-picked. Conflict resolved: `live-model-1` had a `_preflight_c
 
 ## What's Next
 
-### 🎯 TOMORROW'S SESSION — Build live execution for Model 3 (Grid Stacker Blended)
+### 🎯 NEXT SESSION — Fund, deploy, and start Model 3's logging trial
 
-**Goal stated by user:** get this deployable to Kraken as a second working branch, live, with real $100 — "tomorrow or the next day." Explicitly **not** interested in a formal weeks-long paper-trading phase; wants the live code built with real care and at minimum a short live-logging trial before connecting real orders, given this is genuinely new code, not a config change.
+The live code is built and heavily tested (see "Done This Session" above). Remaining steps, in order:
 
-**The honest scope — this is a real build, not a config flip.** An investigation this session (read-only audit of `src/live/`) found:
+1. **Fund Kraken with Model 3's $100.** This session deliberately stopped here — user hasn't put new capital in yet. Nothing below can start for real until this happens (though DB deployment itself is capital-independent and could go first if desired).
+2. **Deploy the DB rows for real** — `python -m src.live.deploy_model3` against Supabase (`SUPABASE_DATABASE_URL` already points there by default). Creates `live.models` (model_version=3), `live.streams`, and seeds `live.blended_capital` at $100. Zero Kraken interaction, fully reversible (just `DELETE` the rows).
+3. **Cut the `live-model-3` branch** from `main` (merge `feature/model3-live-build` into `main` first), same pattern as `live-model-1`. `.github/workflows/executor_m3.yml` and `healthcheck_m3.yml` already check out `ref: live-model-3` — they'll 404 until the branch exists.
+4. **GitHub secrets** — add `DRY_RUN_M3` (separate from Model 1's `DRY_RUN`, so each model's live/dry-run state toggles independently). `KRAKEN_API_KEY`/`KRAKEN_API_SECRET`/`ALERT_*` are already shared secrets Model 1 uses — same Kraken account, no reason for a second API key.
+5. **cron-job.org** — register a new job POSTing to `executor_m3.yml`'s workflow-dispatch endpoint (same pattern as Model 1's two existing jobs — free, no meaningful limit for this usage). Suggest every 30 min, matching Model 1's cadence (Model 3's primary timeframe is 4h, so this is plenty frequent).
+6. **Start in `--dry-run` / `DRY_RUN_M3=true`** and log for at least a few days against live prices before flipping to real orders — catches "forgot to handle X" bugs on brand-new order-placement code without risking money. Short trial, not a formal paper-trading program (matches the project's stated philosophy — see CLAUDE.md "no mandatory paper trading phase").
+7. **Flip `DRY_RUN_M3=false`** only after the logging trial looks clean and after explicit go-ahead — this is the one step that should never happen without a direct decision to do so.
 
-- **`live.lots` today = one entry-to-exit trade, period.** No cost-basis-across-fills concept, no parent/child relationship between fills, no "fill" sub-entity. One row IS one fill.
-- **Model 1's live code has never actually exercised multi-slot logic at all**, despite `slot_count`/`slot_mode` columns existing on `live.streams`. `order_manager.place_entry()` hardcodes `slot_number=1`. `executor.py`'s `slot_is_available()` call is hardcoded to `slot_number=1`. All three live Model 1 streams were seeded with `slot_count: 1`. So "replicate Model 1's branch" does **not** hand you multi-slot handling — that part was never built there either.
-- **`signal_engine.py` is stateless w.r.t. open positions** — no access to an open position's cost basis, no way to compare current price to an existing entry. The blended design needs this for both cascade-add triggers and the exit logic.
-- **Estimated ~60-70% new code.** Reusable: Kraken order plumbing (`kraken_client.py`), `notifier.py`, the general PENDING→OPEN polling pattern in `executor.py`. Not reusable as-is: `live.lots`' one-row-one-trade schema, `order_manager.py`'s single-lot state machine, `position_monitor.py`'s per-lot-independent stop check, `signal_engine.py`'s lack of position-state awareness.
-
-**Concrete build checklist for tomorrow:**
-
-1. **New table(s)** — most likely `live.blended_positions` (one row per open/closed position: status, original_entry_price, avg_cost, total_qty, capitulation_armed, etc.) + `live.blended_fills` (child rows: fill_number, price, capital, qty, filled_at, order_id). Retrofitting `live.lots` was considered and rejected — too many existing queries (`position_monitor.check_all`, `order_manager.check_pending`, the `reporting.all_lots` view) assume one row = one full trade; a migration there is riskier than a clean new table.
-2. **Port `_run_blended_slots`' state machine from batch to incremental.** The backtester loops over all historical candles at once; live needs the equivalent logic rewritten to advance **one tick at a time**, with all state (fills so far, avg cost, whether capitulation is armed, current trailing stop level) persisted in the DB between executor runs (every 30 min via cron).
-3. **New order-placement logic** — place a real Kraken limit order for slot 1 on signal, for each cascade add when its threshold is crossed, and for the exit (selling the *combined* quantity across however many fills happened). Compounding needs the live position size computed from actual realized account balance, not a hardcoded number.
-4. **Capitulation stop as a real order type** — needs to be distinguished from the normal trailing-stop exit in whatever alerting/logging happens, same as the backtester's `exit_reason` field does.
-5. **Wire into `notifier.py`** — new alert copy for blended-specific events (an "add" firing is different from a fresh entry; a capitulation exit should probably get its own distinct, unambiguous alert given what it means).
-6. **Register a `live.models` entry** once the code is ready — this part is trivial (a few minutes of bookkeeping), explicitly NOT the hard part, don't let it feel like a blocker.
-7. **Before connecting real orders:** run it for at least a few days logging what it *would* do against live prices, to catch "we forgot to handle X" bugs before they cost anything. Short, not a formal multi-week paper-trading program — just enough to not be flying blind on brand-new order-placement code.
-
-**Final validated params to build against** (don't re-derive — this is settled, see "Done This Session" above for the full validation trail):
+**Final validated params** (unchanged, already built against — see `backtest.stream_configs.stream_config_id=36` v8 for full notes):
 ```
 primary_timeframe: 4h | fear_dip dip_pct=1.0 | 5 slots, $20 equal weight (compounds from there)
 cumulative_drop_pcts: [1, 2, 5, 10] | trailing_stop_pct: 5.0 | trail_arm_gain_pct: 4
 capitulation_stop_pct: 15 | compound: True
 ```
-`backtest.stream_configs.stream_config_id = 36` (v8) has this exact config with full notes if anything needs to be cross-checked.
+Model-level finalized result: `backtest.model_tests.model_test_id=106`, +84.7% ann (Full History), 482 trades.
+
+**Before merging `feature/model3-live-build` into `main`:** `tests/live/test_blended_math.py`, `test_blended_state_machine.py`, `test_blended_isolation.py` must all still pass (`pytest tests/live/ -v` — excluding the pre-existing broken `test_signal_parity.py`, see above).
 
 ---
 
@@ -222,18 +254,30 @@ Live executor uses `live.*` schema only — not affected.
 ### GitHub Actions Workflows
 | Workflow | Trigger | What It Does |
 |---|---|---|
-| `executor.yml` | Every 30 min (cron-job.org) | Runs `src.live.executor` tick |
-| `market_data.yml` | Every 15 min (cron-job.org) | Fetches candles + updates sentiment |
-| `healthcheck.yml` | Every 2h (cron-job.org) | Dead man's switch — alerts if executor silent > 2h |
+| `executor.yml` | Every 30 min (cron-job.org) | Runs `src.live.executor` tick (Model 1, checks out `live-model-1`) |
+| `market_data.yml` | Every 15 min (cron-job.org) | Fetches candles + updates sentiment (shared, both models) |
+| `healthcheck.yml` | Every 2h (cron-job.org) | Model 1 dead man's switch — alerts if executor silent > 2h |
+| `executor_m3.yml` | Not yet registered on cron-job.org | Runs `src.live.blended_executor` tick (Model 3, checks out `live-model-3` — branch not cut yet). Separate `DRY_RUN_M3` secret. |
+| `healthcheck_m3.yml` | Not yet registered on cron-job.org | Model 3 dead man's switch (`src.live.blended_healthcheck`) — independent of Model 1's |
 
-### Alert System (`src/live/notifier.py`)
+### Alert System
+`src/live/notifier.py` (Model 1):
 | Function | When It Fires |
 |---|---|
 | `alert_order_placed()` | Limit buy submitted to Kraken |
 | `alert_opened()` | Limit buy filled |
 | `alert_closed()` | Trailing stop triggered, position closed |
 | `alert_order_expired()` | Order timed out unfilled, slot freed |
-| `alert_system_down(hours)` | Executor silent > 2h (executor self-check or healthcheck) |
+| `alert_system_down(hours)` | Executor silent > 2h (executor self-check or healthcheck) — shared by both models |
+
+`src/live/blended_notifier.py` (Model 3 — reuses `notifier._dispatch`, distinct copy):
+| Function | When It Fires |
+|---|---|
+| `alert_blend_order_placed()` | Slot-1 or cascade-add limit buy submitted |
+| `alert_blend_opened()` | Slot-1 fill confirmed, position now OPEN |
+| `alert_blend_add_filled()` | A cascade add filled, includes new blended avg cost |
+| `alert_blend_order_expired()` | Slot-1 or add order timed out unfilled |
+| `alert_blend_closed()` | Position closed — copy distinguishes trailing_stop vs. capitulation_stop |
 
 ### Model 1 Streams (LIVE)
 - **Momentum Rider v2** (stream_id=1) — 4h | EMA 30/120 | 7% trail | $33.33
@@ -246,12 +290,13 @@ Live executor uses `live.*` schema only — not affected.
 - **Breakout Scout v3** (config_id=12): range_breakout 1h, SL 3%, 1 slot, $25/lot
 - **Momentum Rider v4** (config_id=16): ema_crossover 4h, single slot, 8% trail, $25/lot
 
-### Model 3 Candidate — Grid Stacker Blended (BACKTESTED, NO LIVE CODE YET)
+### Model 3 — Grid Stacker Blended (LIVE CODE BUILT + TESTED, NOT DEPLOYED)
 - **stream_id=11**, final config **stream_config_id=36 (v8)**, `slot_mode='blended'` — a new engine mode (`_run_blended_slots()` in `src/backtester/engine.py`), not a variant of cascade/staggered.
 - Solo stream, uses the model's full $100 (not split across multiple streams like Model 1/2).
 - Config: 4h | fear_dip dip_pct=1.0 | 5 slots equal $20 | cumulative_drop_pcts=[1,2,5,10] | trailing_stop_pct=5.0 | trail_arm_gain_pct=4 | capitulation_stop_pct=15 | compound=True.
-- Backtested 84.77% ann (Full History), zero real losses except one real capitulation event (Aug 2024, -21.3%, only surfaces at looser trail settings than the final config). Full validation trail in "Done This Session" above.
-- **No live execution code exists for this slot_mode.** See "TOMORROW'S SESSION" above — this is the entire scope of the next session.
+- Backtested 84.77% ann (Full History), zero real losses except one real capitulation event (Aug 2024, -21.3%, only surfaces at looser trail settings than the final config). Full validation trail in the 2026-08-01 session below.
+- Finalized as a proper model: `backtest.models` (model_version=3) + `backtest.model_streams` + `backtest.model_tests.model_test_id=106` (+84.7% ann, 482 trades, matches stream-level number).
+- **Live execution code (`src/live/blended_*.py`, `deploy_model3.py`) is built and passing 16/16 tests.** Not yet deployed to Supabase — see "What's Next" above for the remaining steps (fund Kraken, deploy DB rows, cut `live-model-3` branch, register cron-job.org, dry-run trial, then go live).
 
 ### App Architecture
 - Multipage app: `src/app/app.py` — port 8504 in dev (`streamlit run src/app/app.py --server.port 8504`)
@@ -272,6 +317,17 @@ Live executor uses `live.*` schema only — not affected.
 | `backtest.models` | Model version registry (model_id, model_version, status) |
 | `backtest_bak.*` | Pre-v3 snapshot, permanent |
 
+### Live Schema — Model 3 additions (Supabase only, additive to the tables above)
+| Table | What it holds |
+|---|---|
+| `live.blended_positions` | One row per stack (not per fill) — status, avg_cost_basis, total_qty, capitulation_armed, pending-entry/pending-add tracking, position_capital_base |
+| `live.blended_fills` | Child rows per fill — fill_number, price, capital, qty, order_id |
+| `live.blended_capital` | Model 3's own capital ledger (model_id → available_capital), never Kraken's actual balance |
+| `live.executor_state.model_id` | New nullable column — lets Model 1 and Model 3 each own a heartbeat row instead of fighting over the old `id=1` singleton |
+| `live.executor_runs.model_id` | New nullable column — tags which model a run log row belongs to |
+
+Migration: `src/data/migration_v4_model3.sql` (applied to both local Postgres and Supabase, 2026-08-02).
+
 ### Known Bugs Fixed (lifetime)
 | File | Bug | Fix |
 |---|---|---|
@@ -286,3 +342,8 @@ Live executor uses `live.*` schema only — not affected.
 | `order_manager.py` | Expiry check ran after Kraken API call — expired lots stuck if Kraken unreachable | Check our own expiry timestamp first |
 | `engine.py` (`_run_blended_slots`) | Breakeven floor double-counted the buy fee (already baked into `avg_ep` via reduced qty), landing ~+0.25% instead of true $0 | `breakeven = avg_ep / (1 - fee)` instead of `avg_ep * (1 + fee*2)` |
 | `engine.py` (`_run_blended_slots`) | Cascade adds filled instantly at the trigger candle's close, zero simulated latency — unlike slot 1's realistic pending-limit-with-expiry | Route adds through the same `pending_add` limit-order-with-expiry mechanism as slot 1 |
+| `model_engine.py` | `initial_capital = lot_size_usd * slot_count` for every slot_mode — wrong for blended, where lot_size_usd already IS total capital (5x inflation) | Special-cased blended mode to use `lot_size_usd` directly |
+| `blended_executor.py` | Fallback `INSERT` into `live.executor_state` didn't specify `id`, defaulted to `1`, collided with Model 1's row | Insert with `id = model_id` explicitly |
+| `blended_position_monitor.py` | Breakeven floor used `MAKER_FEE` but the real exit is a `TAKER_FEE` market sell — could realize a small real loss | `breakeven = avg_ep / (1 - TAKER_FEE)`, matching `place_exit`'s real pnl formula |
+| `deploy_model3.py` | Queried `backtest.stream_configs` over `SUPABASE_DATABASE_URL` — Supabase has no `backtest` schema | Split into a local-Postgres read + a Supabase write, two separate connections |
+| `deploy_model3.py` | SQLAlchemy `text()` doesn't safely parse `:name::type` (cast right after a bind param) | `CAST(:params AS jsonb)` instead |
