@@ -13,7 +13,9 @@ This reminder must stay at the top of every handoff until confirmed complete.
 
 **Model 2 is assembled and backtested.** Run 3 selected as deployment config. Not yet deployed — deprioritized behind Model 3.
 
-**Model 3 live execution code is BUILT, tested (22/22), cleaned up, and DEPLOYED to Supabase (DB rows only — no Kraken orders yet).** "Grid Stacker Blended" has a full live state machine (entry → cascade adds → trailing/capitulation stop exit), isolated from Model 1 at every layer (separate DB tables, separate executor process, separate GitHub Actions workflow, separate capital ledger — never reads Kraken's actual account balance). `live.models.model_id=3`, `live.streams.stream_id=4`, `live.blended_capital` seeded at $100.00 — confirmed via direct Supabase query, Model 1's `live.lots` unchanged (still 1 row). **Not yet live-trading** — still needs: `live-model-3` branch cut, `DRY_RUN_M3` GitHub secret, cron-job.org registration, and a dry-run logging trial before any real Kraken order is placed. See "What's Next" for the exact remaining steps.
+**Model 3 is LIVE — trading for real, as of 2026-08-02 ~00:35 UTC.** "Grid Stacker Blended", $100 real capital in Kraken. `DRY_RUN_M3=false`. Real Kraken connectivity confirmed (`Kraken connected — USD: $166.54 BTC: 0.00053149` — whole-account balance, shared with Model 1; Model 3 sizes off its own `live.blended_capital` ledger, never this figure). Cron-job.org's two Model 3 jobs (`executor_m3.yml` every 30min, `healthcheck_m3.yml` every 2h) both confirmed firing successfully, dispatching with `ref:live-model-3` (switched from `ref:main` after the incident below made clear why that matters). `live-model-3` branch is fast-forwarded to match `main` exactly as of commit `3a11cf6`.
+
+**Explicit user decision, not the original plan:** the original plan called for a multi-day dry-run logging trial before going live. User explicitly chose to skip it ("I don't mind a little turbulence... would rather have a good order happen for real than miss out because it's a dry-run") — flagged clearly before flipping the switch that real order placement had zero live Kraken mileage (only ever tested against a mock), user accepted that knowingly. **As of this handoff, no signal has fired yet and no real order has been placed** — first real trade, whenever it happens, has genuinely never been observed end-to-end in production. Watch the first one closely.
 
 **Model Dashboard is BUILT** — `3_model_dashboard.py` live in the multipage app (port 8504).
 
@@ -27,6 +29,10 @@ This reminder must stay at the top of every handoff until confirmed complete.
 **Blast radius assessed and found clean:** during the outage, Model 1's one open lot (Breakout Scout, entry $62,710.10, high_water_mark $66,808.20, 10% trail → stop level $60,127.38) was unmonitored, but BTC's low across the entire outage window never dropped below ~$62,993 — the stop was never actually breached, confirmed by backfilling the missed candles and checking the min/max. No missed stop, no incorrect fill, no data loss. Kraken connectivity itself was never affected (confirmed $166.54 USD / 0.00053149 BTC balance readable throughout).
 
 **Note on SMS alerts:** user reported only receiving email, not SMS, for the system-down alert during this incident. Root cause not yet confirmed — possibly the documented T-Mobile burst-rate-limiting (see "Alert Coverage" below) or a misconfigured `ALERT_TO_SMS` gateway address. Needs a follow-up check next session (can't diagnose further without reading the actual secret value).
+
+**A related bug surfaced when Model 3's executor was first triggered for real** (commit `3a11cf6`): `signal_engine.check()` internally calls `engine.py`'s `load_market_data()`, which reads `DATABASE_URL` specifically (not `SUPABASE_DATABASE_URL`, with a localhost fallback) — same root cause as the incident above, different file. `executor_m3.yml` only set `SUPABASE_DATABASE_URL`; fixed by also mapping the same secret to `DATABASE_URL`. Local testing hadn't caught this because local `.env` has `DATABASE_URL` pointing at a Postgres that also happens to have synced market data, masking the CI-only gap. Fixed and verified by simulating the CI env exactly before pushing.
+
+**Also fixed proactively:** switched Model 3's two cron-job.org jobs from `ref:main` to `ref:live-model-3` (matching checkout) before this class of bug could ever bite Model 3 the way it bit Model 1 — `live-model-3` was fast-forwarded to `main`'s tip first so the switch didn't regress anything.
 
 ---
 
@@ -184,27 +190,30 @@ All changes cherry-picked. Conflict resolved: `live-model-1` had a `_preflight_c
 
 ## What's Next
 
-### 🎯 NEXT SESSION — Cut the branch and start Model 3's logging trial
+### 🎯 NEXT SESSION — Dashboards need to support Model 3 (and show both models cleanly)
 
-The live code is built, tested (22/22), cleaned up, and the DB rows are deployed for real (see "Done This Session" above). Remaining steps, in order:
+Model 3 is live and trading (see "Current State" above). **Right now there is no way to see it working** — both dashboard pages assume Model 1's `live.lots` shape and don't know Model 3 exists. This is the priority for next session; everything else is secondary.
 
-1. ✅ **Deploy the DB rows** — done 2026-08-02. `live.models.model_id=3`, `live.streams.stream_id=4`, `live.blended_capital` seeded at $100.00. Zero Kraken interaction so far, still fully reversible.
-2. ⬜ **Fund Kraken with Model 3's $100.** Not done yet — needed before the dry-run trial can meaningfully validate real order placement (dry-run doesn't call Kraken at all, but the trial after it, and going fully live, both need the capital actually sitting there).
-3. ⬜ **Cut the `live-model-3` branch** from `main` (merge `feature/model3-live-build` into `main` first), same pattern as `live-model-1`. `.github/workflows/executor_m3.yml` and `healthcheck_m3.yml` already check out `ref: live-model-3` — they'll 404 until the branch exists.
-4. ⬜ **GitHub secrets** — add `DRY_RUN_M3` (separate from Model 1's `DRY_RUN`, so each model's live/dry-run state toggles independently). `KRAKEN_API_KEY`/`KRAKEN_API_SECRET`/`ALERT_*` are already shared secrets Model 1 uses — same Kraken account, no reason for a second API key.
-5. ⬜ **cron-job.org** — register a new job POSTing to `executor_m3.yml`'s workflow-dispatch endpoint (same pattern as Model 1's two existing jobs — free, no meaningful limit for this usage). Suggest every 30 min, matching Model 1's cadence (Model 3's primary timeframe is 4h, so this is plenty frequent).
-6. ⬜ **Start in `--dry-run` / `DRY_RUN_M3=true`** and log for at least a few days against live prices before flipping to real orders — catches "forgot to handle X" bugs on brand-new order-placement code without risking money. Short trial, not a formal paper-trading program (matches the project's stated philosophy — see CLAUDE.md "no mandatory paper trading phase").
-7. ⬜ **Flip `DRY_RUN_M3=false`** only after the logging trial looks clean and after explicit go-ahead — this is the one step that should never happen without a direct decision to do so.
+**Researched this session so next session can start from facts, not rediscovery** (full detail from an Explore-agent survey of `2_live_monitor.py`, `3_model_dashboard.py`, and `db.py`):
 
-**Final validated params** (unchanged, already built against — see `backtest.stream_configs.stream_config_id=36` v8 for full notes):
-```
-primary_timeframe: 4h | fear_dip dip_pct=1.0 | 5 slots, $20 equal weight (compounds from there)
-cumulative_drop_pcts: [1, 2, 5, 10] | trailing_stop_pct: 5.0 | trail_arm_gain_pct: 4
-capitulation_stop_pct: 15 | compound: True
-```
-Model-level finalized result: `backtest.model_tests.model_test_id=106`, +84.7% ann (Full History), 482 trades.
+#### 1. Live Monitor (`src/app/pages/2_live_monitor.py`) — needs to work for both models
 
-**Before merging `feature/model3-live-build` into `main`:** `tests/live/test_blended_math.py`, `test_blended_state_machine.py`, `test_blended_isolation.py` must all still pass (`pytest tests/live/ -v` — excluding the pre-existing broken `test_signal_parity.py`, see above).
+- Currently **completely single-model with no model awareness at all**: `load_open_lots`/`load_pending_lots`/`load_closed_lots` (and the trailing-stop lookup) query `live.lots` with **no `model_id` filter whatsoever** — it shows every lot from every model mixed together with no labeling. Once Model 3 has real lots-shaped... except it won't, because Model 3 doesn't produce `live.lots` rows at all (see below) — so today, Model 3 activity is just invisible here, not mixed in incorrectly.
+- `load_model_info()` assumes exactly one row in `live.models` has `status='active'` — that assumption is already false (Model 1 AND Model 3 are both `status='active'` right now), so whichever one the query happens to return first is what gets shown as "the" model.
+- **Needs**: some notion of "which model(s) am I looking at" — a toggle/tabs (Model 1 / Model 3 / both) is probably right given the user's ask to "still be able to see both production working branch models" easily. A combined view is harder to get right (different position shapes) — tabs or a selector is the more tractable v1.
+
+#### 2. Model Dashboard (`src/app/pages/3_model_dashboard.py`) — needs blended/compounding support, mirroring what Stream Tester already solved
+
+- Already has a **live/backtest source toggle and a model selector** — good bones. But: the model selector (`load_models()` in `db.py`) reads from `backtest.models` (local Postgres) — **Model 3 needs a `backtest.models` row for it to even appear in the sidebar** (it has one — `finalize_model3.py` created `backtest.models` model_id for it locally — but worth double-checking the selector's query actually surfaces it correctly given it's keyed differently than live's `model_id=3`).
+- The Live path calls `db.load_dashboard_lots(model_id, "live", None)`, hardcoded to query `live.lots` (`db.py` line ~663) — wrong shape for Model 3 (`avg_cost_basis`, `total_qty`, `total_deployed`, `capitulation_armed`, fills-as-child-rows, no `slot_number`/`entry_price`/`high_water_mark` single-fill fields).
+- **This is the same display problem Stream Tester already solved for BACKTEST blended trades** — `_render_blended_trade_log()` in `src/app/dashboard.py` renders a hierarchical "Blend N" expander (rollup + nested fills) for `slot_mode='blended'` backtest results. That function reads a pandas DataFrame with list-valued columns (`fill_prices`, `fill_qtys`, etc.) from a backtest payload — **not** from live DB tables, so it can't be reused directly, but it's the right visual/structural pattern to mirror. The live version needs its own loader joining `live.blended_positions` + `live.blended_fills` (grouped by `position_id`, fills ordered by `fill_number`) shaped similarly, likely a new `load_dashboard_blended_positions(model_id)` in `db.py` alongside a new render function (or an adapted call into `_render_blended_trade_log` if the live loader shapes its output to match what that function already expects — worth checking whether that's cleaner than writing a parallel renderer).
+- Compounding needs surfacing too — `live.blended_capital.available_capital` is the actual "current capital" number for Model 3, distinct from a fixed `$100` starting capital; the dashboard's capital/equity displays assume a fixed `initial_capital` throughout (works fine for Model 1's flat lot sizing, needs to account for Model 3's growing base).
+
+#### 3. Keep both production models easy to see side-by-side
+
+Both pages need a clean way to flip between (or combine) Model 1 and Model 3 views without the user having to know which table backs which model. Whatever UI pattern gets picked, it should generalize — Model 4+ will hit the exact same "new slot_mode, new live tables" situation eventually if the model tournament keeps producing structurally different strategies.
+
+**Suggested approach for next session:** start with Live Monitor's model toggle (smaller, more contained change), then tackle Model Dashboard's blended live-loader (bigger, more novel — mirrors the Stream Tester blended work from 2026-08-01, same kind of iterative "build → look at real data → fix" loop that took a full session there).
 
 ---
 
