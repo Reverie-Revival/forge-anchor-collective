@@ -277,6 +277,16 @@ All changes cherry-picked. Conflict resolved: `live-model-1` had a `_preflight_c
 
 ## What's Next
 
+### 🎯 TOMORROW — Build a fee-drift detector; also decide on the live-branch fee fix + the deeper fee-accounting gap
+
+Three things stacked up from tonight's fee discovery (see "Done This Session (2026-08-03)" above for full context):
+
+1. **Build a fee-drift safeguard.** The 0.25%/0.40% assumption sat wrong in the code for the entire project until a real trade's numbers didn't match — nobody had ever actually queried Kraken's real fee tier against the constants in code. Build something that queries `kraken._api.query_private('TradeVolume', {'pair': 'XXBTZUSD'})` and compares the returned `fee`/`fees_maker` against `MAKER_FEE`/`TAKER_FEE` in `order_manager.py`, and loudly warns (alert, not just a log line) if they've drifted apart. Natural home: either a new check inside `healthcheck.py`/`blended_healthcheck.py` (already runs every 2h, already has alert plumbing), or a small standalone script run periodically. Fees are tiered by 30-day volume (`nextvolume` in the API response) so this isn't a one-time fix — it needs to keep checking as trading volume grows and the tier changes.
+2. **Decide whether to push last night's fee-constant fix to `live-model-1`/`live-model-3`.** It's on `main` only right now — deliberately held back because it changes the breakeven-floor calculation for both currently-live models' real open positions, and the user was asleep to watch the next tick. Needs an explicit go-ahead, not a default push.
+3. **The deeper live fee-accounting gap** (live code never captures Kraken's real per-trade fee/fill-price, only estimates via constants — see last night's entry for full detail) still needs a dedicated supervised session. Not started.
+
+---
+
 ### Both dashboards now support Model 3 — Live Monitor and Model Dashboard
 
 Live Monitor (model toggle) and Model Dashboard (blended trade log + fixed live loader + fixed capital calc) both done — see "Done This Session" entries above for what changed in each. Nothing mandatory left from the original gap analysis.
