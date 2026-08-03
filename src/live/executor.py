@@ -17,7 +17,8 @@ import argparse
 import logging
 import os
 import sys
-from datetime import datetime, timezone
+import time
+from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 from dotenv import load_dotenv
@@ -37,6 +38,17 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 LIVE_MODEL_VERSION = 1
+
+MARKET_DATA_MAX_RETRIES = 3
+MARKET_DATA_RETRY_DELAY_S = 30
+
+
+class MarketDataStaleError(RuntimeError):
+    """market_data hasn't caught up with a closed candle boundary after
+    retrying. Callers must treat this as a hard failure, not skip it --
+    acting on an incomplete candle (see resample_ohlcv's dropna(), which
+    only drops fully-empty bins, not partially-filled ones) can misfire a
+    real trade off a wrong close/high/low."""
 
 
 def _get_engine():
@@ -64,6 +76,41 @@ def _detect_closed_timeframes(last_tick: datetime, now: datetime) -> set:
     if _candle_closed_between(last_tick, now, 4):
         closed.add("4h")
     return closed
+
+
+def _ensure_market_data_fresh(conn, now: datetime, closed_tfs: set, model_id: int) -> None:
+    """Block until market_data contains the most recently closed 15m bar,
+    retrying a few times to absorb market_data_updater's own cron lag.
+    Every timeframe boundary this executor checks (1h, 4h) falls on a 15m
+    boundary, so verifying the raw 15m data is caught up is sufficient --
+    no need to touch the resample logic itself.
+
+    Raises MarketDataStaleError (and alerts) rather than logging and moving
+    on, since closed_tfs being non-empty means signal checks and/or stop
+    checks are about to run off whatever candle data is present."""
+    if not closed_tfs:
+        return
+
+    boundary = now.replace(minute=(now.minute // 15) * 15, second=0, microsecond=0)
+    expected = boundary - timedelta(minutes=15)
+
+    latest = None
+    for attempt in range(MARKET_DATA_MAX_RETRIES + 1):
+        latest = conn.execute(text("SELECT MAX(timestamp) FROM market_data")).scalar()
+        if latest is not None and latest >= expected:
+            return
+        if attempt < MARKET_DATA_MAX_RETRIES:
+            log.warning(
+                f"market_data stale (latest={latest}, need>={expected}) -- "
+                f"retry {attempt + 1}/{MARKET_DATA_MAX_RETRIES} in {MARKET_DATA_RETRY_DELAY_S}s"
+            )
+            time.sleep(MARKET_DATA_RETRY_DELAY_S)
+
+    notifier.alert_market_data_stale(model_id, latest, expected)
+    raise MarketDataStaleError(
+        f"market_data still stale after {MARKET_DATA_MAX_RETRIES} retries "
+        f"(latest={latest}, need>={expected}) for closed_tfs={closed_tfs}"
+    )
 
 
 def _load_streams(conn) -> dict:
@@ -153,6 +200,7 @@ def _log_tick(conn, last_tick: datetime, closed_tfs: set, open_count: int,
 def tick(conn, streams: dict, kraken: KrakenClient, last_tick: datetime,
          now: datetime, dry_run: bool) -> None:
     closed_tfs = _detect_closed_timeframes(last_tick, now)
+    _ensure_market_data_fresh(conn, now, closed_tfs, LIVE_MODEL_VERSION)
     open_count = conn.execute(text("SELECT COUNT(*) FROM live.lots WHERE status = 'OPEN'")).scalar()
     pending_count = conn.execute(text("SELECT COUNT(*) FROM live.lots WHERE status = 'PENDING'")).scalar()
     log.info(

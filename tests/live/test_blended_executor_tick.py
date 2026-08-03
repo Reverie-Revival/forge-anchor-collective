@@ -98,6 +98,12 @@ def test_tick_places_entry_when_signal_fires(sandbox, monkeypatch):
     monkeypatch.setattr(blended_executor.signal_engine, "check", lambda stream: True)
     monkeypatch.setattr(blended_executor, "_latest_candle_for_stream",
                         lambda stream: {"close": 50000.0, "low": 49500.0})
+    # market_data freshness has its own dedicated coverage in
+    # test_market_data_freshness.py -- stubbed here for the same reason
+    # _latest_candle_for_stream is above: this test exercises tick()'s
+    # orchestration, not real market data, and local dev market_data isn't
+    # kept synced to the current instant.
+    monkeypatch.setattr(blended_executor, "_ensure_market_data_fresh", lambda *a, **kw: None)
 
     streams = _load_streams(engine, model_id)
     now = datetime.now(timezone.utc)
@@ -132,6 +138,12 @@ def test_tick_does_not_double_enter_across_repeated_ticks(sandbox, monkeypatch):
     monkeypatch.setattr(blended_executor.signal_engine, "check", lambda stream: True)
     monkeypatch.setattr(blended_executor, "_latest_candle_for_stream",
                         lambda stream: {"close": 50000.0, "low": 49500.0})
+    # market_data freshness has its own dedicated coverage in
+    # test_market_data_freshness.py -- stubbed here for the same reason
+    # _latest_candle_for_stream is above: this test exercises tick()'s
+    # orchestration, not real market data, and local dev market_data isn't
+    # kept synced to the current instant.
+    monkeypatch.setattr(blended_executor, "_ensure_market_data_fresh", lambda *a, **kw: None)
 
     streams = _load_streams(engine, model_id)
     now = datetime.now(timezone.utc)
@@ -167,6 +179,12 @@ def test_tick_survives_kraken_exception_mid_poll(sandbox, monkeypatch):
     monkeypatch.setattr(blended_executor.signal_engine, "check", lambda stream: True)
     monkeypatch.setattr(blended_executor, "_latest_candle_for_stream",
                         lambda stream: {"close": 50000.0, "low": 49500.0})
+    # market_data freshness has its own dedicated coverage in
+    # test_market_data_freshness.py -- stubbed here for the same reason
+    # _latest_candle_for_stream is above: this test exercises tick()'s
+    # orchestration, not real market data, and local dev market_data isn't
+    # kept synced to the current instant.
+    monkeypatch.setattr(blended_executor, "_ensure_market_data_fresh", lambda *a, **kw: None)
 
     streams = _load_streams(engine, model_id)
     now = datetime.now(timezone.utc)

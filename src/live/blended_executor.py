@@ -34,7 +34,11 @@ from sqlalchemy import create_engine, text
 from src.live import blended_order_manager as order_manager
 from src.live import blended_position_monitor as position_monitor
 from src.live import signal_engine
-from src.live.executor import _detect_closed_timeframes, _latest_candle_for_stream
+from src.live.executor import (
+    _detect_closed_timeframes,
+    _ensure_market_data_fresh,
+    _latest_candle_for_stream,
+)
 from src.live.kraken_client import KrakenClient
 from src.live.notifier import alert_system_down
 
@@ -136,6 +140,7 @@ def _log_tick(conn, model_id: int, last_tick: datetime, closed_tfs: set, open_co
 def tick(conn, streams: dict, kraken: KrakenClient, last_tick: datetime,
          now: datetime, dry_run: bool) -> None:
     closed_tfs = _detect_closed_timeframes(last_tick, now)
+    _ensure_market_data_fresh(conn, now, closed_tfs, LIVE_MODEL_VERSION)
     open_count = conn.execute(text("SELECT COUNT(*) FROM live.blended_positions WHERE status = 'OPEN'")).scalar()
     pending_count = conn.execute(text("SELECT COUNT(*) FROM live.blended_positions WHERE status = 'PENDING_ENTRY'")).scalar()
     log.info(

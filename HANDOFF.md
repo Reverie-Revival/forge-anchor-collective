@@ -1,12 +1,5 @@
 # Handoff — 2026-08-02
 
----
-## ⚠️ ACTION REQUIRED — ORACLE ACCOUNT
-A tenancy deletion was submitted on an Oracle Cloud account (personal Gmail). Deletion takes 30 days.
-**Log into your credit card and confirm zero Oracle charges ever appeared.** The account should be fully deleted by now — verify it's gone and no recurring relationship exists. This has been reminded every session since the deletion was submitted — please confirm and this banner comes down.
-This reminder must stay at the top of every handoff until confirmed complete.
----
-
 ## Current State
 
 **Model 1 is LIVE** — executor running, cron on schedule. Full alert coverage active (order placed, filled, closed, expired, system down).
