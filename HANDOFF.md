@@ -277,13 +277,24 @@ All changes cherry-picked. Conflict resolved: `live-model-1` had a `_preflight_c
 
 ## What's Next
 
-### 🎯 TOMORROW — Build a fee-drift detector; also decide on the live-branch fee fix + the deeper fee-accounting gap
+### 🎯 TOMORROW — Priority order: get the live systems correct first, then clean up the data mess the wrong fees left behind
 
-Three things stacked up from tonight's fee discovery (see "Done This Session (2026-08-03)" above for full context):
+Everything below stems from tonight's fee discovery (see "Done This Session (2026-08-03)" above for full context: real Kraken fees are 0.40% maker / 0.80% taker, double what every model was built against). **User's explicit call: both Model 1 and Model 3 are fine to keep running live as-is (don't pause them) — but they need to be brought in line with the real fees so they actually work as designed, not as an afterthought.** Do the live fixes first; the historical data cleanup is real but lower urgency.
 
-1. **Build a fee-drift safeguard.** The 0.25%/0.40% assumption sat wrong in the code for the entire project until a real trade's numbers didn't match — nobody had ever actually queried Kraken's real fee tier against the constants in code. Build something that queries `kraken._api.query_private('TradeVolume', {'pair': 'XXBTZUSD'})` and compares the returned `fee`/`fees_maker` against `MAKER_FEE`/`TAKER_FEE` in `order_manager.py`, and loudly warns (alert, not just a log line) if they've drifted apart. Natural home: either a new check inside `healthcheck.py`/`blended_healthcheck.py` (already runs every 2h, already has alert plumbing), or a small standalone script run periodically. Fees are tiered by 30-day volume (`nextvolume` in the API response) so this isn't a one-time fix — it needs to keep checking as trading volume grows and the tier changes.
-2. **Decide whether to push last night's fee-constant fix to `live-model-1`/`live-model-3`.** It's on `main` only right now — deliberately held back because it changes the breakeven-floor calculation for both currently-live models' real open positions, and the user was asleep to watch the next tick. Needs an explicit go-ahead, not a default push.
-3. **The deeper live fee-accounting gap** (live code never captures Kraken's real per-trade fee/fill-price, only estimates via constants — see last night's entry for full detail) still needs a dedicated supervised session. Not started.
+#### 1. Fix `live-model-1` for the real fees
+The fee-constant fix (`MAKER_FEE`/`TAKER_FEE` in `order_manager.py`) is on `main` only right now — needs to be ported to `live-model-1` the same way the market_data freshness guard and timeout fix were (separate copy of the file on that branch, same pattern). This changes the breakeven-floor calculation for Model 1's real open position, so review the diff and watch the next tick after pushing.
+
+#### 2. Fix `live-model-3` for the real fees
+Same fix needs to reach `live-model-3`. Unlike Model 1, this branch fast-forwards from `main` rather than carrying independent edits, so once `main`'s fee fix is confirmed good, this should just be `git push origin main:live-model-3` (same mechanism used for the freshness guard and timeout fix). Also changes the breakeven-floor calc for Model 3's real open position — same "watch the next tick" caution applies.
+
+#### 3. Build the fee-drift safeguard
+The 0.25%/0.40% assumption sat wrong for the entire project until a real trade's numbers didn't match — nobody had ever actually queried Kraken's real fee tier against the constants in code. Build something that queries `kraken._api.query_private('TradeVolume', {'pair': 'XXBTZUSD'})` and compares the returned `fee`/`fees_maker` against `MAKER_FEE`/`TAKER_FEE`, and loudly warns (alert, not just a log line) if they've drifted apart. Natural home: either a new check inside `healthcheck.py`/`blended_healthcheck.py` (already runs every 2h, already has alert plumbing), or a small standalone script run periodically. Fees are tiered by 30-day volume (`nextvolume` in the API response), so this needs to keep checking as trading volume grows and the tier changes, not just run once.
+
+#### 4. Clean up Stream Tester / Model Tester — prior runs are largely useless data now
+Every `backtest.stream_tests` and `backtest.model_tests` row saved before 2026-08-03 used the wrong fee assumption, on top of whatever config-drift issues already existed (see Model 1/2's `model_streams` staleness, fixed this session). User's words: "hard to sift through all the garbage data." Needs a real cleanup pass — likely: figure out which historical rows are worth re-running vs. archiving/deleting outright, re-run the ones that matter with correct fees, and get the Stream Tester / Model Tester UIs back to a state where what's shown is trustworthy at a glance (not mixed old-fee and new-fee results with no obvious way to tell them apart). Scope this out properly before diving in — could be a large pass given how much history exists.
+
+#### 5. The deeper live fee-accounting gap (separate, still unstarted)
+Live code never captures Kraken's real per-trade fee/fill-price, only estimates via constants — see last night's entry for full detail (affects both models, buy-side fee never subtracted anywhere in live bookkeeping, Model 1's exit price is also just an estimate). Needs a dedicated supervised session. Not started, not blocking items 1-2 above (those just need the corrected constants live, not a fix to this deeper gap).
 
 ---
 
