@@ -17,6 +17,17 @@ This reminder must stay at the top of every handoff until confirmed complete.
 
 **Model Dashboard is BUILT** — `3_model_dashboard.py` live in the multipage app (port 8504).
 
+**⚠️ INCIDENT — 2026-08-02, ~14:30 UTC to ~00:10 UTC (~9.5h):** Model 1's executor, healthcheck, and market_data cron jobs all went silent simultaneously. Two independent, compounding causes:
+
+1. **cron-job.org's stored GitHub PAT expired** (401 Unauthorized on every dispatch) — the loud, immediately-visible symptom, blocking all three jobs from even reaching GitHub Actions. Fixed: generated a new classic PAT with **no expiration** (removes the recurring-rotation problem going forward) and updated it in cron-job.org for all 5 jobs (Model 1's 3 + Model 3's 2).
+2. **A hidden env-var mismatch on `main`**, only exposed once #1 was fixed and dispatches could actually reach a job: commit `5893c06` (pre-existing, not from this session) renamed the env var `executor.yml`/`market_data.yml`/`healthcheck.yml` pass from `DATABASE_URL` to `SUPABASE_DATABASE_URL` on **`main` only**, deliberately leaving `live-model-1`'s copies on the old name — assuming cron-job.org always dispatched these against `live-model-1`. That assumption was correct for `healthcheck.yml` but **wrong for `executor.yml`/`market_data.yml`**, which have always dispatched with `ref:main` (confirmed via GitHub Actions run history). Once `5893c06` landed on `main`, any `ref:main` dispatch passed the wrong env var name to code (still checked out from `live-model-1` regardless of dispatch ref) that only reads `DATABASE_URL` — silent fallback to a nonexistent local Postgres, `connection refused`.
+   - Immediate fix: switched cron-job.org's executor + market_data jobs to `ref:live-model-1` (matching what was already working for healthcheck).
+   - Durable fix (commit `d215914`): reverted `main`'s copies of all three workflow files back to `DATABASE_URL`, verified byte-identical to `live-model-1`'s copies. Now it no longer matters which ref cron-job.org dispatches with for these three jobs — eliminates this whole class of bug.
+
+**Blast radius assessed and found clean:** during the outage, Model 1's one open lot (Breakout Scout, entry $62,710.10, high_water_mark $66,808.20, 10% trail → stop level $60,127.38) was unmonitored, but BTC's low across the entire outage window never dropped below ~$62,993 — the stop was never actually breached, confirmed by backfilling the missed candles and checking the min/max. No missed stop, no incorrect fill, no data loss. Kraken connectivity itself was never affected (confirmed $166.54 USD / 0.00053149 BTC balance readable throughout).
+
+**Note on SMS alerts:** user reported only receiving email, not SMS, for the system-down alert during this incident. Root cause not yet confirmed — possibly the documented T-Mobile burst-rate-limiting (see "Alert Coverage" below) or a misconfigured `ALERT_TO_SMS` gateway address. Needs a follow-up check next session (can't diagnose further without reading the actual secret value).
+
 ---
 
 ## Done This Session (2026-08-02) — Model 3 live execution built, isolated, and tested
