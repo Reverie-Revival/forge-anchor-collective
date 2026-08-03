@@ -116,28 +116,40 @@ def rerun_streams(cfg_ids: list):
             JOIN backtest.streams s ON sc.stream_id = s.stream_id
             WHERE sc.stream_config_id = ANY(:ids)
         """), {"ids": cfg_ids}).fetchall()
+        # blended mode's lot_size_usd IS the total capital pool (matches
+        # model_engine.py's own special-case) -- the generic $20-per-lot
+        # stream-tester convention is wrong for it; use the real deployed
+        # total from model_streams instead.
+        blended_capital = dict(engine.connect().execute(text("""
+            SELECT sc.stream_config_id, ms.lot_size_usd
+            FROM backtest.model_streams ms
+            JOIN backtest.stream_configs sc ON ms.stream_config_id = sc.stream_config_id
+            WHERE sc.stream_config_id = ANY(:ids) AND sc.slot_mode = 'blended'
+        """), {"ids": cfg_ids}).fetchall())
 
     presets = _presets()
     for stream_config_id, version, params, slot_count, slot_mode, stream_name in rows:
         full_name = f"{stream_name} {version}"
-        print(f"\n=== {full_name} (stream_config_id={stream_config_id}) ===")
+        initial_capital = float(blended_capital[stream_config_id]) if stream_config_id in blended_capital \
+            else STREAM_INITIAL_CAPITAL
+        print(f"\n=== {full_name} (stream_config_id={stream_config_id}, capital=${initial_capital:.2f}) ===")
         for preset_id, preset_name, start_date, end_date in presets:
             result = run_backtest(
                 params=params, start=str(start_date), end=str(end_date) if end_date else None,
                 slot_count=slot_count, slot_mode=slot_mode, stream_name=full_name,
-                lot_size_usd=STREAM_INITIAL_CAPITAL,
+                lot_size_usd=initial_capital,
             )
-            metrics = compute_metrics(result["trades"], STREAM_INITIAL_CAPITAL, result["start"], result["end"])
-            ending  = STREAM_INITIAL_CAPITAL + (metrics["total_pnl"] or 0)
+            metrics = compute_metrics(result["trades"], initial_capital, result["start"], result["end"])
+            ending  = initial_capital + (metrics["total_pnl"] or 0)
             payload = {
                 "stream_name": full_name, "stream_config_id": stream_config_id,
                 "params": params, "result": result, "trades": result["trades"], "df": result["df"],
-                "metrics": metrics, "initial_capital": STREAM_INITIAL_CAPITAL, "ending_balance": ending,
-                "slot_count": slot_count, "slot_mode": slot_mode, "lot_size_usd": STREAM_INITIAL_CAPITAL,
+                "metrics": metrics, "initial_capital": initial_capital, "ending_balance": ending,
+                "slot_count": slot_count, "slot_mode": slot_mode, "lot_size_usd": initial_capital,
             }
             save_stream_test(
                 stream_config_id=stream_config_id, params=params, result=result, metrics=metrics,
-                initial_capital=STREAM_INITIAL_CAPITAL, ending_balance=ending, payload=payload,
+                initial_capital=initial_capital, ending_balance=ending, payload=payload,
                 preset_id=preset_id,
                 notes="Re-run 2026-08-03 with corrected fee math (maker-entry/taker-exit) and "
                       "fee-column tracking. See HANDOFF.md.",
