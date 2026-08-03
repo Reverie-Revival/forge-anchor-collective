@@ -432,6 +432,16 @@ for tab, entry in zip(tabs, tab_entries):
             if payload is not None:
                 render_dashboard(payload, show_save=False,
                                  key_prefix=f"cfg_{selected_config_id}_t{test_id}")
+                if entry["type"] == "preset" and st.button(
+                    "↺ Re-run this preset", key=f"rerun_existing_{test_id}"
+                ):
+                    with st.spinner(f"Re-running {entry['preset']['name']}…"):
+                        try:
+                            _run_and_save(selected_config, entry["preset"])
+                            st.cache_data.clear()
+                            st.rerun()
+                        except Exception as e:
+                            st.error(str(e))
             else:
                 # No pkl — show DB summary
                 ann = existing.get("annualized_return_pct")
