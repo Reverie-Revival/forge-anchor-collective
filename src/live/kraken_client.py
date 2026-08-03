@@ -98,3 +98,23 @@ class KrakenClient:
         if resp.get("error"):
             raise RuntimeError(f"Kraken Ticker error: {resp['error']}")
         return float(resp["result"]["XXBTZUSD"]["c"][0])
+
+    def get_fee_tier(self) -> dict:
+        """
+        Return this account's real current XBT/USD fee tier as decimals
+        (e.g. 0.0040, not "0.4000"). Ground truth for whatever MAKER_FEE/
+        TAKER_FEE assume in code -- fees are tiered by 30-day trading volume
+        and step down as volume grows, so this can't be hardcoded once.
+        """
+        resp = self._api.query_private("TradeVolume", {"pair": "XXBTZUSD"})
+        if resp.get("error"):
+            raise RuntimeError(f"Kraken TradeVolume error: {resp['error']}")
+        result = resp["result"]
+        taker = result["fees"]["XXBTZUSD"]
+        maker = result["fees_maker"]["XXBTZUSD"]
+        return {
+            "maker_fee":   float(maker["fee"]) / 100,
+            "taker_fee":   float(taker["fee"]) / 100,
+            "tier_volume": float(taker["tiervolume"]),
+            "next_volume": float(taker["nextvolume"]),
+        }
