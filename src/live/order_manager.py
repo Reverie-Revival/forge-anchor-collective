@@ -169,15 +169,17 @@ def check_pending(conn, kraken: KrakenClient, dry_run: bool = False) -> tuple[in
 
         if status == "closed" and vol_exec > 0:
             fill_price = float(order.get("price", 0) or 0)
-            log.info(f"Lot {lot.lot_id} filled @ ${fill_price:.2f}")
+            entry_fee_usd = float(order.get("fee", 0) or 0)
+            log.info(f"Lot {lot.lot_id} filled @ ${fill_price:.2f} (fee ${entry_fee_usd:.4f})")
             conn.execute(
                 text("""
                     UPDATE live.lots
                     SET status = 'OPEN', entry_price = :price,
-                        btc_quantity = :qty, high_water_mark = :price
+                        btc_quantity = :qty, high_water_mark = :price,
+                        entry_fee_usd = :fee
                     WHERE lot_id = :lid
                 """),
-                {"price": fill_price, "qty": vol_exec, "lid": lot.lot_id},
+                {"price": fill_price, "qty": vol_exec, "fee": entry_fee_usd, "lid": lot.lot_id},
             )
             notifier.alert_opened(lot.stream_name, lot.model_id, float(lot.opening_capital), fill_price, vol_exec)
             fills += 1
@@ -194,27 +196,59 @@ def check_pending(conn, kraken: KrakenClient, dry_run: bool = False) -> tuple[in
 def place_exit(conn, lot, current_price: float, kraken: KrakenClient, dry_run: bool = False, stream_name: str = "", model_id: int = 0) -> None:
     """
     Place a market sell order to exit an OPEN lot and mark it CLOSED.
-    lot: Row with lot_id, btc_quantity, entry_price, opening_capital
-    current_price: the candle close price (used for P&L estimate in dry run)
+    lot: Row with lot_id, btc_quantity, entry_price, opening_capital, entry_fee_usd
+    current_price: the candle close price (used for P&L estimate in dry run,
+        and as the exit-price fallback if Kraken's post-placement status poll
+        doesn't confirm a real fill yet)
+
+    Market sells fill essentially instantly on Kraken, so right after placing
+    the order we poll get_order_status once for the real fill price and real
+    fee. If that poll doesn't yet show a confirmed fill (rare -- API lag),
+    fall back to the estimate (current_price + fee constants) and flag the
+    row with fee_is_estimated so it's visible for a manual glance later,
+    rather than blocking the lot from closing.
     """
+    entry_fee_usd = float(lot.entry_fee_usd) if lot.entry_fee_usd is not None else None
+    fee_is_estimated = False
+
     if dry_run:
         exit_price = current_price
+        exit_fee_usd = float(lot.opening_capital) * TAKER_FEE
         log.info(f"[DRY RUN] Would market sell lot {lot.lot_id}: "
                  f"{lot.btc_quantity:.8f} BTC @ ~${exit_price:.2f}")
         txid = f"DRY-EXIT-{lot.lot_id}"
     else:
         try:
             txid = kraken.place_order("sell", float(lot.btc_quantity), order_type="market")
-            exit_price = current_price  # actual fill price resolved on next check; use close as estimate
             log.info(f"Market sell placed for lot {lot.lot_id}: "
                      f"{lot.btc_quantity:.8f} BTC txid={txid}")
         except Exception as e:
             log.error(f"Failed to place exit order for lot {lot.lot_id}: {e}")
             return
 
+        try:
+            order = kraken.get_order_status(txid)
+        except Exception as e:
+            log.warning(f"Could not confirm fill for exit order {txid} (lot {lot.lot_id}): {e}")
+            order = {}
+
+        if order.get("status") == "closed" and float(order.get("vol_exec", 0) or 0) > 0:
+            exit_price = float(order.get("price", 0) or 0)
+            exit_fee_usd = float(order.get("fee", 0) or 0)
+        else:
+            log.warning(f"Exit order {txid} (lot {lot.lot_id}) not confirmed filled on first poll -- "
+                        "using estimated price/fee, flagging for manual reconciliation")
+            exit_price = current_price
+            exit_fee_usd = float(lot.opening_capital) * TAKER_FEE
+            fee_is_estimated = True
+
+    if entry_fee_usd is None:
+        entry_fee_usd = float(lot.opening_capital) * MAKER_FEE  # legacy lot, opened before this fix
+        fee_is_estimated = True
+
     gain = (exit_price - float(lot.entry_price)) / float(lot.entry_price)
     capital = float(lot.opening_capital)
-    pnl = capital * gain - capital * (MAKER_FEE + TAKER_FEE)
+    pnl = capital * gain - entry_fee_usd - exit_fee_usd
 
     conn.execute(
         text("""
@@ -222,6 +256,8 @@ def place_exit(conn, lot, current_price: float, kraken: KrakenClient, dry_run: b
             SET status = 'CLOSED',
                 exit_price = :price,
                 exit_order_id = :txid,
+                exit_fee_usd = :exit_fee,
+                fee_is_estimated = :estimated,
                 closing_capital = :closing,
                 realized_pnl = :pnl,
                 exit_reason = 'trailing_stop',
@@ -229,12 +265,14 @@ def place_exit(conn, lot, current_price: float, kraken: KrakenClient, dry_run: b
             WHERE lot_id = :lid
         """),
         {
-            "price":   exit_price,
-            "txid":    txid,
-            "closing": capital + pnl,
-            "pnl":     round(pnl, 4),
-            "now":     datetime.now(timezone.utc),
-            "lid":     lot.lot_id,
+            "price":     exit_price,
+            "txid":      txid,
+            "exit_fee":  round(exit_fee_usd, 4),
+            "estimated": fee_is_estimated,
+            "closing":   capital + pnl,
+            "pnl":       round(pnl, 4),
+            "now":       datetime.now(timezone.utc),
+            "lid":       lot.lot_id,
         },
     )
     if not dry_run:

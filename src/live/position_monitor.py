@@ -37,7 +37,8 @@ def check_all(
 
     open_lots = conn.execute(
         text("""
-            SELECT lot_id, stream_id, entry_price, high_water_mark, btc_quantity, opening_capital
+            SELECT lot_id, stream_id, entry_price, high_water_mark, btc_quantity,
+                   opening_capital, entry_fee_usd
             FROM live.lots
             WHERE status = 'OPEN'
         """)
