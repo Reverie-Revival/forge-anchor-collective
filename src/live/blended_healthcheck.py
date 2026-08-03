@@ -4,6 +4,13 @@ Dead man's switch for Model 3 — run independently of the blended executor
 row (keyed by model_id, not the shared id=1 singleton Model 1 uses) and fires
 an alert if the executor hasn't run in > 2 hours.
 
+Also runs the fee-drift check (src.live.fee_check). Model 1 and Model 3 live
+on separate branches, each with their OWN copy of MAKER_FEE/TAKER_FEE -- these
+drifted independently once already (live-model-3 ran with the wrong 0.25%/
+0.40% constants for weeks after main/live-model-1 were corrected, discovered
+and fixed 2026-08-03). Checking fee drift from only one model's healthcheck
+doesn't protect the other's separate copy, so both healthchecks call it now.
+
 Usage:
     python -m src.live.blended_healthcheck
 """
@@ -16,6 +23,7 @@ from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
 
 from src.live import notifier
+from src.live.fee_check import check_fee_drift
 
 load_dotenv()
 
@@ -69,6 +77,8 @@ def run() -> None:
         notifier.alert_system_down(gap_hours)
     else:
         log.info("Model 3 executor heartbeat OK")
+
+    check_fee_drift()
 
 
 if __name__ == "__main__":

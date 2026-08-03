@@ -58,8 +58,12 @@ def run() -> None:
     else:
         log.info("Executor heartbeat OK")
 
-    # Both live models share one Kraken account, so the fee tier only needs
-    # checking from one healthcheck, not duplicated in blended_healthcheck.py too.
+    # Both live models share one Kraken account, but Model 1 and Model 3 live
+    # on separate branches with their OWN copy of MAKER_FEE/TAKER_FEE -- these
+    # drifted independently once already (live-model-3 ran with the wrong
+    # 0.25%/0.40% constants for weeks after this branch was corrected,
+    # discovered and fixed 2026-08-03). blended_healthcheck.py runs this same
+    # check against its own copy -- not redundant, each branch needs its own.
     check_fee_drift()
 
 

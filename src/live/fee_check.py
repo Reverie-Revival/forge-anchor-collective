@@ -3,13 +3,18 @@ Fee-drift safeguard. Kraken's real fee tier is confirmed live via the
 TradeVolume API, never assumed -- but nothing previously checked that
 MAKER_FEE/TAKER_FEE in code still matched reality. This surfaced once,
 the hard way (Model 3's first real trade filled at double the assumed
-taker rate). Call check_fee_drift() from a periodic job (healthcheck.py
-runs every 2h and already has alert plumbing) to catch the next drift
-automatically instead of waiting for a real trade to expose it again.
+taker rate). Call check_fee_drift() from a periodic job (both healthcheck.py
+and blended_healthcheck.py run every 2h and already have alert plumbing) to
+catch the next drift automatically instead of waiting for a real trade to
+expose it again.
 
-Both live models share one Kraken account, so the fee tier is identical
-for both -- only needs to be checked from one place, not duplicated per
-model.
+Both live models share one Kraken account, so the real fee TIER is the same
+for both. But Model 1 and Model 3 live on separate branches (live-model-1,
+live-model-3), each with its OWN copy of MAKER_FEE/TAKER_FEE in their own
+order_manager.py -- these copies can and did drift independently (live-model-3
+ran with the ORIGINAL WRONG values for weeks after this branch was corrected,
+discovered as a stale-branch bug 2026-08-03). So this check must run from
+BOTH models' healthcheck, not just one.
 
 Usage:
     python -m src.live.fee_check
