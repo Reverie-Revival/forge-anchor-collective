@@ -13,6 +13,7 @@ from sqlalchemy import create_engine, text
 load_dotenv()
 
 from src.backtester.indicators import add_indicators, resample_ohlcv
+from src.fees import TAKER_FEE
 
 st.title("⚓ Forge Anchor — Live Monitor")
 
@@ -24,7 +25,25 @@ GLOSSARY = {
         "calculated as N% below this — it moves up as price rises, never down.",
     "Trail Stop":
         "Trailing stop price = HWM × (1 − trail%). If price falls to this level "
-        "the position is sold at market.",
+        "the position is sold at market. Model 1: active as soon as the position "
+        "is open. Model 3 (Grid Stacker): NOT active until price first rises "
+        "'Trail Arm %' above average cost — see below.",
+    "Trail Arm % (Model 3 only)":
+        "Grid Stacker's trailing stop doesn't start protecting a position the "
+        "moment it opens — it only arms once price rises this % above the "
+        "position's average cost. Below that threshold there is no sell-side "
+        "trigger at all; a price drop instead fires the next cascade buy "
+        "(see below), not a sale. Once armed, the stop is also floored at "
+        "breakeven — it can never voluntarily sell at a real loss.",
+    "Cascade Add (Model 3 only)":
+        "Grid Stacker averages down on the way down, not just holds: each slot "
+        "beyond Slot 1 buys more once price falls a set % below Slot 1's ORIGINAL "
+        "entry (not the prior add) — e.g. 1/2/5/10% for a 5-slot ladder. These are "
+        "buy triggers, unrelated to the trailing stop above.",
+    "Capitulation Stop (Model 3 only)":
+        "A backstop that only arms once ALL slots are filled (out of room to "
+        "average down further). A further drop below the last fill's price "
+        "forces a full exit — the one way this strategy can realize a real loss.",
     "TFs Closed":
         "Timeframes Closed — the candle timeframes (e.g. 1h, 4h) that completed "
         "during an executor run. The executor only acts on a stream when its candle "
@@ -191,16 +210,21 @@ def load_blended_positions(model_id, status):
 @st.cache_data(ttl=60)
 def load_blended_stream_params(model_id):
     """cumulative_drop_pcts / slot_count aren't in load_stream_status()'s
-    output -- needed separately to compute each cascade slot's trigger price."""
+    output -- needed separately to compute each cascade slot's trigger price,
+    the trailing-stop arm/distance state, and the capitulation backstop."""
     rows = _q("SELECT parameters, slot_count FROM live.streams WHERE model_id = :mid LIMIT 1", {"mid": model_id})
     if not rows:
         return {}
     params, slot_count = rows[0]
+    position = params.get("position") or {}
     return {
         "slot_count": int(slot_count),
-        "cumulative_drop_pcts": (params.get("position") or {}).get("cumulative_drop_pcts", []),
-        "entry_expiry_candles": (params.get("position") or {}).get("entry_expiry_candles"),
+        "cumulative_drop_pcts": position.get("cumulative_drop_pcts", []),
+        "entry_expiry_candles": position.get("entry_expiry_candles"),
         "primary_timeframe": params.get("primary_timeframe", "4h"),
+        "trailing_stop_pct": position.get("trailing_stop_pct"),
+        "trail_arm_gain_pct": position.get("trail_arm_gain_pct"),
+        "capitulation_stop_pct": position.get("capitulation_stop_pct"),
     }
 
 
@@ -580,6 +604,7 @@ def _render_slot_ladder(open_positions, pending_positions, fills, blended_params
     pos_fills = fills[fills["position_id"] == pos["position_id"]].copy() if not fills.empty else pd.DataFrame()
     original_entry = float(pos["original_entry_price"]) if pd.notna(pos.get("original_entry_price")) else None
     pending_add_idx = int(pos["pending_add_index"]) if pd.notna(pos.get("pending_add_index")) else None
+    next_slot_n = len(pos_fills) + 1  # the one slot actually waiting on a trigger right now, not every future one
 
     for n in range(1, slot_total + 1):
         fill_number = n - 1  # fill_number is 0-indexed in the DB (0 = slot 1)
@@ -591,7 +616,12 @@ def _render_slot_ladder(open_positions, pending_positions, fills, blended_params
         if not fill_row.empty:
             f = fill_row.iloc[0]
             c2.markdown("🟢 Filled")
-            c3.caption(f"${float(f['price']):,.2f}  ·  ${float(f['capital']):,.2f}  ·  {_fmt_central(f['filled_at'])}")
+            c3.markdown(
+                f"<span style='font-size:0.95rem; font-weight:600'>\\${float(f['price']):,.2f}</span>"
+                f"<span style='font-size:0.8rem; color:#888'>&nbsp;&nbsp;·&nbsp;&nbsp;\\${float(f['capital']):,.2f} deployed"
+                f"&nbsp;&nbsp;·&nbsp;&nbsp;{_fmt_central(f['filled_at'])}</span>",
+                unsafe_allow_html=True,
+            )
         elif n == 1 and pos["status"] == "PENDING_ENTRY":
             c2.markdown("🟡 Order Placed")
             c3.caption(f"Awaiting fill, expires {_fmt_central(pos.get('pending_entry_expiry_at'))}")
@@ -601,18 +631,80 @@ def _render_slot_ladder(open_positions, pending_positions, fills, blended_params
         elif n >= 2 and original_entry and len(cum_drops) >= n - 1:
             drop_pct = cum_drops[n - 2]
             trigger_price = original_entry * (1 - drop_pct / 100)
-            gap_str = ""
-            if current_price:
-                gap = (current_price - trigger_price) / trigger_price * 100
-                gap_str = f"  ·  {gap:+.1f}% away" if gap > 0 else "  ·  trigger cleared, awaiting next tick"
-            c2.markdown("⚪ Not Triggered")
-            c3.caption(f"Needs price ≤ ${trigger_price:,.2f} ({drop_pct}% below Slot 1){gap_str}")
+            gap = ((current_price - trigger_price) / trigger_price * 100) if current_price else None
+
+            if n == next_slot_n and gap is not None:
+                # This is the one slot actually being watched right now -- give it
+                # the same at-a-glance progress bar Slot 1 gets pre-entry, instead
+                # of just text, so "how close are we" is visible without reading numbers.
+                triggered = gap <= 0
+                # Progress toward the trigger: 0% at original entry, 100% at trigger price.
+                total_span = original_entry - trigger_price
+                progress = 1.0 if triggered else max(0.0, min(1.0, (original_entry - current_price) / total_span)) if total_span > 0 else 0.0
+                pct_bar = int(progress * 100)
+                bar_color = "#4ade80" if triggered else ("#fbbf24" if pct_bar >= 66 else "#f87171")
+                gap_str = "trigger cleared, awaiting next tick" if triggered else f"{gap:+.1f}% away"
+                c2.markdown("⚪ Not Triggered")
+                c3.markdown(
+                    f"<div style='margin-bottom:2px; font-size:0.8rem; color:#aaa'>"
+                    f"Needs price ≤ \\${trigger_price:,.2f} ({drop_pct}% below Slot 1) &nbsp;·&nbsp; {gap_str}</div>"
+                    f"<div style='background:#2a2a2a; border-radius:4px; height:6px'>"
+                    f"<div style='background:{bar_color}; width:{pct_bar}%; height:6px; border-radius:4px'></div>"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
+            else:
+                gap_str = f"  ·  {gap:+.1f}% away" if gap is not None and gap > 0 else \
+                           ("  ·  trigger cleared, awaiting next tick" if gap is not None else "")
+                c2.markdown("⚪ Not Triggered")
+                c3.caption(f"Needs price ≤ ${trigger_price:,.2f} ({drop_pct}% below Slot 1){gap_str}")
         else:
             c2.markdown("⚪ Waiting")
             c3.caption("—")
 
     if pos["capitulation_armed"]:
         st.warning("⚠️ All slots filled — capitulation stop is now armed (no more room to average down).")
+
+    # ── How close is this position to selling? ──────────────────────────────
+    # The trailing stop is NOT active until price first rises trail_arm_gain_pct%
+    # above avg_cost_basis -- below that threshold there is no sell-side trigger
+    # at all (a price drop triggers the next cascade BUY above, not a sale).
+    # Showing a naive "HWM x (1-trail%)" number unconditionally (as this page
+    # used to) is misleading before that arming point, since no such stop is
+    # actually live yet.
+    if pos["status"] == "OPEN" and pd.notna(pos.get("avg_cost_basis")) and pd.notna(pos.get("highest_close")):
+        avg_cost = float(pos["avg_cost_basis"])
+        hwm = float(pos["highest_close"])
+        trail_pct = blended_params.get("trailing_stop_pct")
+        arm_pct = blended_params.get("trail_arm_gain_pct")
+        gain_pct = (hwm - avg_cost) / avg_cost * 100
+
+        st.markdown("<div style='margin-top:10px'></div>", unsafe_allow_html=True)
+        if arm_pct and gain_pct < arm_pct:
+            pct_bar = int(max(0.0, min(1.0, gain_pct / arm_pct)) * 100)
+            st.caption(
+                f"**Selling:** trailing stop not armed yet — needs price {arm_pct}% above avg cost "
+                f"(\\${avg_cost:,.2f}) to activate, currently {gain_pct:+.2f}%. Until then a drop only "
+                f"triggers the next cascade buy above, it doesn't sell."
+            )
+            st.markdown(
+                f"<div style='background:#2a2a2a; border-radius:4px; height:6px; margin-top:-6px'>"
+                f"<div style='background:#60a5fa; width:{pct_bar}%; height:6px; border-radius:4px'></div>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+        elif trail_pct:
+            naive_stop = hwm * (1 - trail_pct / 100)
+            breakeven = avg_cost / (1 - TAKER_FEE)
+            effective_stop = max(naive_stop, breakeven)
+            floored = effective_stop > naive_stop
+            dist_pct = ((current_price - effective_stop) / effective_stop * 100) if current_price else None
+            dist_str = f"  ·  currently {dist_pct:+.1f}% above it" if dist_pct is not None else ""
+            floor_note = " (floored at breakeven, never sells at a loss)" if floored else ""
+            st.caption(
+                f"**Selling:** trailing stop is armed — sells at market if price hits "
+                f"\\${effective_stop:,.2f}{floor_note}{dist_str}"
+            )
 
 
 # ── Model selector + refresh ─────────────────────────────────────────────────
@@ -761,12 +853,6 @@ if not IS_BLENDED:
 else:
     # Model 3: one blended stack per stream -- multiple fills rolled into a
     # single weighted-average position, not one row per slot like Model 1.
-    trail_rows = _q("""
-        SELECT stream_name, parameters->'position'->>'trailing_stop_pct' AS trail_pct
-        FROM live.streams WHERE model_id = :mid
-    """, {"mid": SELECTED_MODEL_ID})
-    trail_map = {r[0]: float(r[1]) for r in trail_rows if r[1]}
-
     stacks = pd.concat([open_positions, pending_positions]) if not (open_positions.empty and pending_positions.empty) else pd.DataFrame()
 
     if stacks.empty:
@@ -798,10 +884,11 @@ else:
                     st.caption("⚠️ Capitulation armed (out of slots)")
 
             if pos["status"] == "OPEN" and pd.notna(pos["highest_close"]):
-                hwm = float(pos["highest_close"])
-                trail = trail_map.get(pos["stream_name"])
-                if trail:
-                    st.caption(f"HWM \\${hwm:,.2f}  ·  Trail stop \\${hwm * (1 - trail/100):,.2f}  ({trail}% below HWM)")
+                # Real armed/not-armed trailing-stop distance is shown in the
+                # Slot Status section below (_render_slot_ladder) -- this used
+                # to show an unconditional "HWM x (1-trail%)" number here too,
+                # which is misleading before the trail actually arms (see there).
+                st.caption(f"HWM \\${float(pos['highest_close']):,.2f}")
 
             if not pos_fills.empty:
                 with st.expander(f"Fills ({n_fills})"):

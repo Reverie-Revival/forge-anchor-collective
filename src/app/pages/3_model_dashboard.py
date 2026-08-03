@@ -15,6 +15,7 @@ from src.app.db import (
     load_current_btc_price, load_blended_starting_capital,
 )
 from src.app.model_dashboard import STREAM_COLORS, DEFAULT_COLORS
+from src.fees import TAKER_FEE
 
 st.set_page_config(page_title="Model Dashboard", layout="wide")
 
@@ -137,20 +138,35 @@ def _render_slot_status(open_pos: pd.DataFrame, closed: pd.DataFrame, unrealized
         hwm          = float(op["high_water_mark"]) if pd.notna(op.get("high_water_mark")) else avg_cost
         eff_hwm      = max(hwm, btc_price) if btc_price else hwm
         trail_pct    = op.get("trailing_stop_pct")
-        trail_stop   = eff_hwm * (1 - trail_pct / 100) if trail_pct else None
+        arm_pct      = op.get("trail_arm_gain_pct")
+        gain_pct     = (eff_hwm - avg_cost) / avg_cost * 100 if avg_cost else 0.0
+        armed        = not arm_pct or gain_pct >= arm_pct
+        # Never active below the arm threshold -- a naive HWM*(1-trail%) number
+        # here would imply a live stop that isn't actually there yet. Once
+        # armed, floor it at breakeven so it never reads as a voluntary-loss
+        # price (matches place_exit's real formula, see blended_order_manager.py).
+        trail_stop   = max(eff_hwm * (1 - trail_pct / 100), avg_cost / (1 - TAKER_FEE)) if trail_pct and armed else None
         days_open    = (today - pd.Timestamp(op["opened_at"].date())).days
 
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Slots Filled", f"{slots_filled} / {slot_total}")
-        c2.metric("Capital Deployed", f"${deployed:,.2f}" + (f" of ${pool:,.2f}" if pool else ""))
+        c2.metric("Capital Deployed", f"${deployed:,.2f}")
         c3.metric("Blended Avg Cost", f"${avg_cost:,.2f}")
         c4.metric("Days Open", str(days_open))
+        if pool:
+            c2.caption(f"of ${pool:,.2f} pool")
 
         c5, c6, c7 = st.columns(3)
         sign = "+" if unreal >= 0 else ""
         c5.metric("Unrealized P&L", f"{sign}${unreal:,.2f}", delta=f"{sign}{unreal_pct:.1f}%", delta_color=_delta_color(unreal))
         c6.metric("BTC Now", f"${btc_price:,.2f}" if btc_price else "—")
-        c7.metric("Trail Stop", f"${trail_stop:,.2f}" if trail_stop else "—")
+        if trail_stop:
+            c7.metric("Trail Stop", f"${trail_stop:,.2f}")
+        elif arm_pct:
+            c7.metric("Trail Stop", "Not armed")
+            c7.caption(f"needs +{arm_pct}% (at +{gain_pct:.1f}%)")
+        else:
+            c7.metric("Trail Stop", "—")
 
         if slots_filled >= slot_total:
             st.warning("⚠️ All slots filled — capitulation stop is now armed (no more room to average down).")
@@ -227,11 +243,15 @@ with st.sidebar:
     # Model 3 (model_id=4, model_version=3), which is what surfaced this.
     model_opts = {f"Model {m['model_version']}": m["model_id"] for m in models}
     model_version_by_id = {m["model_id"]: m["model_version"] for m in models}
-    model_label = st.selectbox("Model", list(model_opts.keys()), index=min(1, len(model_opts) - 1))
+    model_labels = list(model_opts.keys())
+    # Default to Model 3 -- the one currently live and checked most often.
+    # Falls back to the last (most recent) model if Model 3 ever isn't listed.
+    default_model_idx = model_labels.index("Model 3") if "Model 3" in model_labels else len(model_labels) - 1
+    model_label = st.selectbox("Model", model_labels, index=default_model_idx)
     model_id = model_opts[model_label]
     model_version = model_version_by_id[model_id]
 
-    source = st.radio("Data source", ["Backtest", "Live"], horizontal=True)
+    source = st.radio("Data source", ["Backtest", "Live"], index=1, horizontal=True)
 
     model_test_id = None
     if source == "Backtest":
@@ -556,8 +576,14 @@ if not open_pos.empty:
         unreal_pct = unreal / cap * 100 if cap else 0.0
         hwm        = float(op["high_water_mark"]) if pd.notna(op.get("high_water_mark")) else ep
         trail_pct  = op.get("trailing_stop_pct")
+        arm_pct    = op.get("trail_arm_gain_pct")
         eff_hwm    = max(hwm, btc_price) if btc_price else hwm
-        trail_stop = eff_hwm * (1 - trail_pct / 100) if trail_pct else None
+        armed      = not arm_pct or (eff_hwm - ep) / ep * 100 >= arm_pct if ep else True
+        # Blended (Model 3) positions have an arm gate + breakeven floor that
+        # single-lot positions (Model 1) don't -- see _render_slot_status above
+        # for the full explanation. arm_pct is only ever set for blended rows.
+        trail_stop = (max(eff_hwm * (1 - trail_pct / 100), ep / (1 - TAKER_FEE)) if arm_pct
+                      else eff_hwm * (1 - trail_pct / 100)) if trail_pct and armed else None
         rows.append({
             "Stream":          op["full_stream_name"],
             "Slot":            int(op["slot_number"]),

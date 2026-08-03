@@ -218,7 +218,11 @@ with st.sidebar:
     st.header("Stream Tester")
 
     st.markdown('<p class="config-group-header">Stream</p>', unsafe_allow_html=True)
-    selected_stream_name = st.selectbox("", stream_names, label_visibility="collapsed")
+    # Default to Model 3's live stream (Grid Stacker Blended) -- the one
+    # people actually check most often. Falls back to the first stream
+    # alphabetically if it's ever renamed or removed.
+    default_stream_idx = stream_names.index("Grid Stacker Blended") if "Grid Stacker Blended" in stream_names else 0
+    selected_stream_name = st.selectbox("", stream_names, index=default_stream_idx, label_visibility="collapsed")
 
     selected_stream = stream_by_name[selected_stream_name]
     stream_id       = selected_stream["stream_id"]

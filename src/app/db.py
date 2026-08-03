@@ -682,6 +682,7 @@ def load_dashboard_lots(model_id: int, source: str, model_test_id: int = None, m
                     s.stream_name, sc.version, sc.slot_mode, sc.slot_count,
                     s.stream_name || ' ' || sc.version AS full_stream_name,
                     (sc.parameters->'position'->>'trailing_stop_pct')::float AS trailing_stop_pct,
+                    (sc.parameters->'position'->>'trail_arm_gain_pct')::float AS trail_arm_gain_pct,
                     NULL::numeric AS capital_base,
                     NULL::numeric[] AS fill_prices, NULL::numeric[] AS fill_qtys,
                     NULL::numeric[] AS fill_capitals, NULL::timestamptz[] AS fill_timestamps
@@ -764,7 +765,8 @@ def _load_dashboard_blended_lots_live(engine, live_model_id: int) -> pd.DataFram
                 bp.opened_at, bp.closed_at, bp.exit_reason,
                 ls.stream_name, NULL::text AS version, ls.slot_mode, ls.slot_count,
                 ls.stream_name AS full_stream_name,
-                (ls.parameters->'position'->>'trailing_stop_pct')::float AS trailing_stop_pct
+                (ls.parameters->'position'->>'trailing_stop_pct')::float AS trailing_stop_pct,
+                (ls.parameters->'position'->>'trail_arm_gain_pct')::float AS trail_arm_gain_pct
             FROM live.blended_positions bp
             JOIN live.streams ls ON bp.stream_id = ls.stream_id
             WHERE bp.model_id = :mid AND bp.status IN ('OPEN', 'CLOSED')
