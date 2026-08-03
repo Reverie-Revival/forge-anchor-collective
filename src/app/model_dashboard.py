@@ -6,8 +6,9 @@ import streamlit as st
 import plotly.graph_objects as go
 import pandas as pd
 
-from .utils import SP500_HISTORICAL_AVG, fetch_sp500, grade_info
-from .db import load_model_history, load_timeframe_presets, save_model_test
+from .utils import SP500_HISTORICAL_AVG, fetch_sp500, grade_info, candle_hours
+from .db import load_model_history, load_timeframe_presets, save_model_test, load_models
+from .dashboard import _render_blended_trade_log
 
 # Stream colors — consistent across all charts
 STREAM_COLORS = {
@@ -140,9 +141,13 @@ def render_model_dashboard(payload: dict, show_save: bool = True, key_prefix: st
     )
 
     # Header
+    model_version = next(
+        (m["model_version"] for m in load_models() if m["model_id"] == payload.get("model_id")),
+        payload.get("model_id", "?"),
+    )
     col_title, col_grade = st.columns([3, 1])
     with col_title:
-        st.subheader(f"Model 1 — {n_streams} Streams")
+        st.subheader(f"Model {model_version} — {n_streams} Stream{'s' if n_streams != 1 else ''}")
         st.caption(f"{period_str}  ·  \\${total_capital:.2f} capital  ·  {alloc_summary}  ·  {cm['total_trades']} trades")
     with col_grade:
         st.markdown(
@@ -400,29 +405,53 @@ def render_model_dashboard(payload: dict, show_save: bool = True, key_prefix: st
             )
             st.plotly_chart(fig_dd, use_container_width=True, key=f"{key_prefix}_dd")
 
-    # Trade log
-    with st.expander(f"Combined Trade Log ({cm['total_trades']} trades)", expanded=False):
-        log = all_closed.copy()
-        log["return_pct"] = (
-            (log["exit_price"] - log["entry_price"]) / log["entry_price"] * 100
-        ).round(2)
-        log["gain_loss"]   = log["pnl"].round(4)
-        log["entry_price"] = log["entry_price"].round(2)
-        log["exit_price"]  = log["exit_price"].round(2)
-        st.dataframe(
-            log[[
-                "stream_name", "slot", "entry_ts", "exit_ts",
-                "entry_price", "exit_price", "capital",
-                "gain_loss", "return_pct", "exit_reason",
-            ]].rename(columns={
-                "stream_name": "Stream", "slot": "Slot",
-                "entry_ts": "Entered", "exit_ts": "Exited",
-                "entry_price": "BTC In", "exit_price": "BTC Out",
-                "capital": "$ In", "gain_loss": "P&L ($)",
-                "return_pct": "Return %", "exit_reason": "Exit Reason",
-            }),
-            use_container_width=True,
-        )
+    # Blended streams (e.g. Grid Stacker) get their own hierarchical trade log --
+    # "capital"/"entry_price" on their trade rows are pooled/averaged across
+    # multiple fills, which renders misleadingly in the flat generic table below.
+    # Reuses Stream Tester's own blended log renderer so both views agree.
+    blended_streams = [sr for sr in stream_results if sr.get("slot_mode") == "blended"]
+    blended_names   = {sr["stream_name"] for sr in blended_streams}
+    for sr in blended_streams:
+        s_trades = sr["trades"]
+        if s_trades.empty or "fill_prices" not in s_trades.columns:
+            continue
+        s_closed = s_trades[s_trades["exit_reason"] != "partial"].sort_values("entry_ts")
+        c_hrs    = candle_hours(sr["result"].get("params", {}))
+        total_fills = sum(len(fp) for fp in s_closed["fill_prices"])
+        with st.expander(
+            f"{sr['stream_name']} Trade Log ({len(s_closed)} blends, {total_fills} fills, "
+            f"${sr['lot_size_usd']:.2f} total capital)",
+            expanded=False,
+        ):
+            _render_blended_trade_log(s_closed, c_hrs, f"{key_prefix}_{sr['stream_id']}")
+
+    # Trade log (non-blended streams only -- see above)
+    flat_closed = all_closed[~all_closed["stream_name"].isin(blended_names)] if blended_names else all_closed
+    with st.expander(f"Combined Trade Log ({len(flat_closed)} trades)", expanded=False):
+        if flat_closed.empty:
+            st.caption("All trades in this model come from blended streams -- see their trade logs above.")
+        else:
+            log = flat_closed.copy()
+            log["return_pct"] = (
+                (log["exit_price"] - log["entry_price"]) / log["entry_price"] * 100
+            ).round(2)
+            log["gain_loss"]   = log["pnl"].round(4)
+            log["entry_price"] = log["entry_price"].round(2)
+            log["exit_price"]  = log["exit_price"].round(2)
+            st.dataframe(
+                log[[
+                    "stream_name", "slot", "entry_ts", "exit_ts",
+                    "entry_price", "exit_price", "capital",
+                    "gain_loss", "return_pct", "exit_reason",
+                ]].rename(columns={
+                    "stream_name": "Stream", "slot": "Slot",
+                    "entry_ts": "Entered", "exit_ts": "Exited",
+                    "entry_price": "BTC In", "exit_price": "BTC Out",
+                    "capital": "$ In", "gain_loss": "P&L ($)",
+                    "return_pct": "Return %", "exit_reason": "Exit Reason",
+                }),
+                use_container_width=True,
+            )
 
     if show_save:
         _render_model_save(payload, key_prefix)
