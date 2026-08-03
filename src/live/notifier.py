@@ -80,6 +80,21 @@ def alert_system_down(hours: float) -> None:
     )
 
 
+def alert_market_data_stale(model_id: int, latest_ts, expected_ts) -> None:
+    _dispatch(
+        email_subject=f"Forge: Market Data Stale - Model {model_id}",
+        email_body=(
+            f"Forge | Model {model_id}\n"
+            f"market_data did not catch up in time for this tick and the tick was aborted.\n"
+            f"Latest candle in market_data: {latest_ts}\n"
+            f"Needed data through: {expected_ts}\n"
+            f"No signals were checked and no stops were evaluated this cycle.\n"
+            f"Check the market_data_updater workflow/cron for failures -- this tick will retry next cycle."
+        ),
+        sms_body=f"Model {model_id}: market_data STALE, tick aborted -- check market_data cron",
+    )
+
+
 def alert_opened(stream_name: str, model_id: int, usd_in: float, fill_price: float, qty: float) -> None:
     _dispatch(
         email_subject=f"Forge: Opened - Model {model_id} | {stream_name}",
