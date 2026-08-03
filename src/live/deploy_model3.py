@@ -27,10 +27,19 @@ load_dotenv()
 
 LIVE_MODEL_VERSION = 3
 BACKTEST_STREAM_CONFIG_ID = 36    # Grid Stacker Blended v8 -- the locked, validated config
-BASED_ON_MODEL_TEST_ID = 106      # backtest.model_tests row from src.backtester.finalize_model3,
-                                   # local Postgres only (Supabase has no backtest schema --
-                                   # same soft-reference pattern as Model 1's deploy.py; not a
-                                   # real cross-database FK). Full History, +84.7% ann, 482 trades.
+BASED_ON_MODEL_TEST_ID = 106      # backtest.model_tests row at the time Model 3 was deployed
+                                   # (Full History preset, +84.7% ann/482 trades, pre-fee-fix math).
+                                   # Local Postgres only (Supabase has no backtest schema -- same
+                                   # soft-reference pattern as Model 1's deploy.py; not a real
+                                   # cross-database FK). NOTE: this specific row no longer exists --
+                                   # it was deleted and replaced (new id) by the 2026-08-03 fee-
+                                   # correction cleanup, and again by a 2026-08-03 later-session
+                                   # re-verification re-run. live.models.based_on_model_test_id was
+                                   # already written with 106 before that happened, so it's a
+                                   # harmless dangling soft-reference in the live table -- this
+                                   # constant only matters again if Model 3 is ever redeployed from
+                                   # scratch, at which point it should point at the current Full
+                                   # History row instead.
 LIVE_STARTING_CAPITAL = 100.00
 DESCRIPTION = "Model 3 — Grid Stacker Blended v8 — solo stream, $100, compounding"
 
