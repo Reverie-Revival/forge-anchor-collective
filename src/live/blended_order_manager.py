@@ -15,15 +15,20 @@ has itself realized, and can never draw on capital that belongs to Model 1
 in the same Kraken account.
 
 Fee model -- every entry (slot 1 and every cascade add) is a maker limit buy;
-every exit is a taker market sell. This file never applies a fee rate itself
-at order-placement time (order volume = capital / limit_price, same as
-order_manager.py's convention -- Kraken bills the maker fee separately, it
-doesn't reduce vol_exec). TAKER_FEE is applied once, for real, in place_exit's
-pnl calc below. blended_position_monitor.py's breakeven floor MUST use the
-same TAKER_FEE (not MAKER_FEE) so "never voluntarily realize a loss" actually
-holds against the real exit mechanism -- a mismatch there previously let a
-position close at a small real loss; caught by
-tests/live/test_blended_state_machine.py, now fixed and covered.
+every exit is a taker market sell. Order volume = capital / limit_price
+(Kraken bills the fee separately, it doesn't reduce vol_exec). Real per-trade
+fees (not the MAKER_FEE/TAKER_FEE constants) now drive every P&L calc: each
+fill's real `fee` from Kraken is captured in live.blended_fills.fee_usd at
+entry/add time, summed and combined with the real exit fee in place_exit's
+pnl calc. MAKER_FEE/TAKER_FEE only remain as narrow fallbacks -- for legacy
+fills predating this fix (NULL fee_usd) and for the rare case where the
+post-exit status poll doesn't confirm a fill yet (see place_exit). The
+pre-trade breakeven floor in blended_position_monitor.py is a deliberate
+exception -- it's evaluated before the exit order exists, so it MUST stay
+TAKER_FEE-based (not MAKER_FEE) so "never voluntarily realize a loss" holds
+against the real exit mechanism -- a mismatch there previously let a position
+close at a small real loss; caught by tests/live/test_blended_state_machine.py,
+now fixed and covered.
 
 All DB writes use the passed connection (caller manages the transaction).
 In dry_run mode, Kraken calls are skipped and logged instead.
@@ -34,7 +39,7 @@ from datetime import datetime, timezone, timedelta
 from sqlalchemy import text
 
 from src.live.kraken_client import KrakenClient
-from src.live.order_manager import TAKER_FEE, _tf_minutes
+from src.live.order_manager import MAKER_FEE, TAKER_FEE, _tf_minutes
 from src.backtester.slot_math import slot_capitals_for as _slot_capitals_for
 from src.live import blended_notifier as notifier
 
@@ -244,19 +249,21 @@ def check_pending_entry(conn, kraken: KrakenClient, streams: dict, dry_run: bool
 def _apply_entry_fill(conn, pos, order: dict, vol_exec: float, now, stream: dict) -> None:
     """Record slot 1's fill (full or partial -- either way it's real BTC bought) and open the position."""
     fill_price = float(order.get("price", 0) or 0)
+    fee_usd = float(order.get("fee", 0) or 0)
     weights = (stream["parameters"].get("slots") or {}).get("slot_capital_weight")
     slot_capitals = _slot_capitals_for(float(pos.position_capital_base), weights, stream["slot_count"])
     slot1_capital = slot_capitals[0]
 
-    log.info(f"Position {pos.position_id} slot 1 filled @ ${fill_price:.2f} (vol_exec={vol_exec:.8f})")
+    log.info(f"Position {pos.position_id} slot 1 filled @ ${fill_price:.2f} "
+             f"(vol_exec={vol_exec:.8f}, fee ${fee_usd:.4f})")
     conn.execute(
         text("""
             INSERT INTO live.blended_fills
-                (position_id, fill_number, price, capital, qty, order_id, filled_at)
-            VALUES (:pid, 0, :price, :capital, :qty, :oid, :now)
+                (position_id, fill_number, price, capital, qty, order_id, fee_usd, filled_at)
+            VALUES (:pid, 0, :price, :capital, :qty, :oid, :fee, :now)
         """),
         {"pid": pos.position_id, "price": fill_price, "capital": slot1_capital,
-         "qty": vol_exec, "oid": pos.pending_entry_order_id, "now": now},
+         "qty": vol_exec, "oid": pos.pending_entry_order_id, "fee": fee_usd, "now": now},
     )
     conn.execute(
         text("""
@@ -425,6 +432,7 @@ def check_pending_add(conn, kraken: KrakenClient, streams: dict, dry_run: bool =
 def _apply_add_fill(conn, pos, order: dict, vol_exec: float, now, stream: dict) -> None:
     """Record a cascade add's fill (full or partial) and fold it into the blended average."""
     fill_price = float(order.get("price", 0) or 0)
+    fee_usd = float(order.get("fee", 0) or 0)
     weights = (stream["parameters"].get("slots") or {}).get("slot_capital_weight")
     slot_count = stream["slot_count"]
     slot_capitals = _slot_capitals_for(float(pos.position_capital_base), weights, slot_count)
@@ -435,15 +443,16 @@ def _apply_add_fill(conn, pos, order: dict, vol_exec: float, now, stream: dict) 
     new_avg = new_deployed / new_qty
 
     log.info(f"Position {pos.position_id} add #{pos.pending_add_index} filled @ ${fill_price:.2f} "
-             f"(vol_exec={vol_exec:.8f}) -- new avg cost ${new_avg:.2f}")
+             f"(vol_exec={vol_exec:.8f}, fee ${fee_usd:.4f}) -- new avg cost ${new_avg:.2f}")
     conn.execute(
         text("""
             INSERT INTO live.blended_fills
-                (position_id, fill_number, price, capital, qty, order_id, filled_at)
-            VALUES (:pid, :fnum, :price, :capital, :qty, :oid, :now)
+                (position_id, fill_number, price, capital, qty, order_id, fee_usd, filled_at)
+            VALUES (:pid, :fnum, :price, :capital, :qty, :oid, :fee, :now)
         """),
         {"pid": pos.position_id, "fnum": pos.pending_add_index, "price": fill_price,
-         "capital": add_capital, "qty": vol_exec, "oid": pos.pending_add_order_id, "now": now},
+         "capital": add_capital, "qty": vol_exec, "oid": pos.pending_add_order_id,
+         "fee": fee_usd, "now": now},
     )
     capitulation_armed = (pos.pending_add_index + 1) == slot_count
     conn.execute(
@@ -467,17 +476,39 @@ def place_exit(conn, position, exit_price: float, exit_reason: str,
     """
     Market-sell the whole blended stack and close the position.
 
-    Uses TAKER_FEE for the exit (real market order) vs. the MAKER_FEE-only
-    round trip the backtester assumed for trailing-stop touches -- same
-    known fee delta already accepted for Model 1's live exits.
+    exit_price: the computed stop-trigger price -- used as-is in dry run, and
+    as the fallback if Kraken's post-placement status poll doesn't confirm a
+    real fill yet (market sells fill essentially instantly, so this is rare).
+    Real fee is summed from live.blended_fills.fee_usd (every entry + cascade
+    add) plus the real exit fee, replacing the old TAKER_FEE-only estimate.
     """
     total_qty = float(position.total_qty)
     total_deployed = float(position.total_deployed)
+    fee_is_estimated = False
+
+    # Per-fill, not a single SUM(fee_usd) -- a position can have a MIX of
+    # legacy fills (NULL fee_usd, opened before this fix) and real ones (e.g.
+    # slot 1 filled pre-migration, a later cascade add filled after). SQL SUM
+    # silently ignores NULLs, which would undercount the legacy fill's fee
+    # entirely and leave fee_is_estimated False -- wrong on both counts.
+    fills = conn.execute(
+        text("SELECT capital, fee_usd FROM live.blended_fills WHERE position_id = :pid"),
+        {"pid": position.position_id},
+    ).fetchall()
+    total_entry_fees_usd = 0.0
+    for fill in fills:
+        if fill.fee_usd is not None:
+            total_entry_fees_usd += float(fill.fee_usd)
+        else:
+            total_entry_fees_usd += float(fill.capital) * MAKER_FEE  # legacy fill, opened before this fix
+            fee_is_estimated = True
 
     if dry_run:
         log.info(f"[DRY RUN] Would market sell position {position.position_id}: "
                  f"{total_qty:.8f} BTC @ ~${exit_price:.2f} ({exit_reason})")
         txid = f"DRY-EXIT-{position.position_id}"
+        real_exit_price = exit_price
+        exit_fee_usd = total_qty * exit_price * TAKER_FEE
     else:
         try:
             txid = kraken.place_order("sell", total_qty, order_type="market")
@@ -487,19 +518,36 @@ def place_exit(conn, position, exit_price: float, exit_reason: str,
             log.error(f"Failed to place exit order for position {position.position_id}: {e}")
             return
 
-    gross = total_qty * exit_price
-    pnl = gross * (1 - TAKER_FEE) - total_deployed
+        try:
+            order = kraken.get_order_status(txid)
+        except Exception as e:
+            log.warning(f"Could not confirm fill for exit order {txid} (position {position.position_id}): {e}")
+            order = {}
+
+        if order.get("status") == "closed" and float(order.get("vol_exec", 0) or 0) > 0:
+            real_exit_price = float(order.get("price", 0) or 0)
+            exit_fee_usd = float(order.get("fee", 0) or 0)
+        else:
+            log.warning(f"Exit order {txid} (position {position.position_id}) not confirmed filled on "
+                        "first poll -- using estimated price/fee, flagging for manual reconciliation")
+            real_exit_price = exit_price
+            exit_fee_usd = total_qty * exit_price * TAKER_FEE
+            fee_is_estimated = True
+
+    pnl = (total_qty * real_exit_price) - exit_fee_usd - total_deployed - total_entry_fees_usd
     closing_capital = total_deployed + pnl
 
     conn.execute(
         text("""
             UPDATE live.blended_positions
             SET status = 'CLOSED', exit_price = :price, exit_order_id = :txid,
+                exit_fee_usd = :exit_fee, fee_is_estimated = :estimated,
                 closing_capital = :closing, realized_pnl = :pnl,
                 exit_reason = :reason, closed_at = :now
             WHERE position_id = :pid
         """),
-        {"price": exit_price, "txid": txid, "closing": round(closing_capital, 2),
+        {"price": real_exit_price, "txid": txid, "exit_fee": round(exit_fee_usd, 4),
+         "estimated": fee_is_estimated, "closing": round(closing_capital, 2),
          "pnl": round(pnl, 2), "reason": exit_reason, "now": datetime.now(timezone.utc),
          "pid": position.position_id},
     )

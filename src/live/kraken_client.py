@@ -71,6 +71,8 @@ class KrakenClient:
           status:   'pending' | 'open' | 'closed' | 'canceled' | 'expired'
           vol_exec: volume filled so far (string)
           price:    average fill price (string)
+          fee:      real fee charged on this order so far, in USD (string) —
+                    a dollar amount, NOT a rate like get_fee_tier()'s output.
         Returns empty dict if txid not found in either QueryOrders or TradesHistory.
 
         Note: Kraken's QueryOrders can return empty for orders that filled
@@ -89,7 +91,12 @@ class KrakenClient:
             return {}
         for trade in resp2["result"].get("trades", {}).values():
             if trade.get("ordertxid") == txid:
-                return {"status": "closed", "vol_exec": trade["vol"], "price": trade["price"]}
+                return {
+                    "status": "closed",
+                    "vol_exec": trade["vol"],
+                    "price": trade["price"],
+                    "fee": trade.get("fee", "0"),
+                }
         return {}
 
     def get_ticker_price(self) -> float:

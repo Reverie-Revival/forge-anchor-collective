@@ -21,6 +21,11 @@ class FakeKraken:
                    real partial fill sitting on the book. cancel_order locks
                    in whatever partial amount filled (status -> "canceled",
                    vol_exec stays > 0) -- cancelling does NOT undo a fill.
+      "delayed" -- mirrors a real market order that Kraken hasn't confirmed
+                   yet on the FIRST get_order_status poll (reports "open",
+                   vol_exec=0) but fills for real by the second poll -- used
+                   to test the estimated-fallback path on exits without ever
+                   actually losing a fill.
     """
 
     def __init__(self):
@@ -40,18 +45,45 @@ class FakeKraken:
         mode = self.next_fill_mode
         self.next_fill_mode = "full"   # reset to the default for the next order
 
+        # Deterministic nonzero fee (0.4% of notional) so a bug that silently
+        # drops the real `fee` field can't hide behind fee == 0 in tests.
+        fee_rate = 0.004
+
         if mode == "full":
-            self.orders[txid] = {"status": "closed", "vol_exec": f"{volume_btc:.8f}", "price": f"{fill_price:.2f}"}
+            fee = volume_btc * fill_price * fee_rate
+            self.orders[txid] = {
+                "status": "closed", "vol_exec": f"{volume_btc:.8f}",
+                "price": f"{fill_price:.2f}", "fee": f"{fee:.4f}",
+            }
         elif mode == "none":
-            self.orders[txid] = {"status": "open", "vol_exec": "0.00000000", "price": "0.00", "_requested": volume_btc}
+            self.orders[txid] = {
+                "status": "open", "vol_exec": "0.00000000", "price": "0.00",
+                "fee": "0.0000", "_requested": volume_btc,
+            }
         elif mode == "partial":
             filled = volume_btc * self.next_partial_fraction
-            self.orders[txid] = {"status": "open", "vol_exec": f"{filled:.8f}", "price": f"{fill_price:.2f}", "_requested": volume_btc}
+            fee = filled * fill_price * fee_rate
+            self.orders[txid] = {
+                "status": "open", "vol_exec": f"{filled:.8f}", "price": f"{fill_price:.2f}",
+                "fee": f"{fee:.4f}", "_requested": volume_btc,
+            }
+        elif mode == "delayed":
+            fee = volume_btc * fill_price * fee_rate
+            self.orders[txid] = {
+                "status": "closed", "vol_exec": f"{volume_btc:.8f}",
+                "price": f"{fill_price:.2f}", "fee": f"{fee:.4f}",
+                "_polls": 0,
+            }
         return txid
 
     def get_order_status(self, txid):
         order = dict(self.orders[txid])
+        if "_polls" in self.orders[txid]:
+            self.orders[txid]["_polls"] += 1
+            if self.orders[txid]["_polls"] == 1:
+                return {"status": "open", "vol_exec": "0.00000000", "price": "0.00", "fee": "0.0000"}
         order.pop("_requested", None)
+        order.pop("_polls", None)
         return order
 
     def cancel_order(self, txid):

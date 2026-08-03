@@ -78,11 +78,12 @@ def check_all(
         if trail_pct and armed:
             stop_price = new_hwm * (1 - trail_pct / 100.0)
             if trail_arm_gain_pct:
-                # Must match place_exit's real pnl formula exactly
-                # (gross * (1 - TAKER_FEE) - total_deployed) -- a real market
-                # sell, not the backtester's single-fee-rate assumption -- or
-                # the "never voluntarily realize a loss" floor can be pierced
-                # by the maker/taker fee delta.
+                # Necessarily an estimate, not a real-fee lookup -- this floor
+                # is evaluated BEFORE the exit order exists, so there's no
+                # real fee to read yet. Deliberately still TAKER_FEE-based
+                # (not MAKER_FEE) so the "never voluntarily realize a loss"
+                # floor holds against place_exit's real market-sell fee,
+                # which is normally close to but not exactly this rate.
                 breakeven = avg_ep / (1 - TAKER_FEE)
                 stop_price = max(stop_price, breakeven)
 
