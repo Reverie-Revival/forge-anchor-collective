@@ -638,11 +638,32 @@ def next_model_run_number(model_id: int, alloc_h: str) -> int:
     return max(int(r[0]) for r in rows) + 1
 
 
-def load_dashboard_lots(model_id: int, source: str, model_test_id: int = None) -> pd.DataFrame:
-    """Load per-trade lot rows for the model dashboard."""
+def _live_model_id_for_version(model_version: int):
+    """backtest.models.model_id and live.models.model_id are separate serial
+    sequences that only coincide by chance (e.g. Model 1 = 1 in both) --
+    model_version is the actual shared identity. Returns None if this model
+    was never deployed live (e.g. Model 2)."""
     try:
-        engine = get_local_engine() if source == "backtest" else get_engine()
+        with get_engine().connect() as conn:
+            row = conn.execute(
+                text("SELECT model_id FROM live.models WHERE model_version = :v"),
+                {"v": model_version},
+            ).fetchone()
+        return row[0] if row else None
+    except Exception:
+        return None
+
+
+def load_dashboard_lots(model_id: int, source: str, model_test_id: int = None, model_version: int = None) -> pd.DataFrame:
+    """Load per-trade lot rows for the model dashboard.
+
+    model_id is backtest.models.model_id (the sidebar's selection) for both
+    sources -- for source="live" it's resolved internally to live.models.model_id
+    via model_version before querying, since the two id spaces are unrelated.
+    """
+    try:
         if source == "backtest":
+            engine = get_local_engine()
             where = "bl.model_id = :mid AND bl.model_test_id = :mtid"
             params = {"mid": model_id, "mtid": model_test_id}
             query = f"""
@@ -651,35 +672,161 @@ def load_dashboard_lots(model_id: int, source: str, model_test_id: int = None) -
                     bl.opening_capital, bl.closing_capital, bl.realized_pnl,
                     bl.entry_price, bl.exit_price, bl.high_water_mark,
                     bl.opened_at, bl.closed_at, bl.exit_reason,
-                    s.stream_name, sc.version,
+                    s.stream_name, sc.version, sc.slot_mode, sc.slot_count,
                     s.stream_name || ' ' || sc.version AS full_stream_name,
-                    (sc.parameters->'position'->>'trailing_stop_pct')::float AS trailing_stop_pct
+                    (sc.parameters->'position'->>'trailing_stop_pct')::float AS trailing_stop_pct,
+                    NULL::numeric AS capital_base,
+                    NULL::numeric[] AS fill_prices, NULL::numeric[] AS fill_qtys,
+                    NULL::numeric[] AS fill_capitals, NULL::timestamptz[] AS fill_timestamps
                 FROM backtest.lots bl
                 JOIN backtest.streams s ON bl.stream_id = s.stream_id
                 JOIN backtest.stream_configs sc ON bl.stream_config_id = sc.stream_config_id
                 WHERE {where}
                 ORDER BY bl.opened_at
             """
-        else:
-            query = """
-                SELECT
-                    ll.lot_id, ll.slot_number, ll.lot_sequence, ll.status,
-                    ll.opening_capital, ll.closing_capital, ll.realized_pnl,
-                    ll.entry_price, ll.exit_price, ll.high_water_mark,
-                    ll.opened_at, ll.closed_at, ll.exit_reason,
-                    ls.stream_name, NULL::text AS version,
-                    ls.stream_name AS full_stream_name,
-                    (ls.parameters->'position'->>'trailing_stop_pct')::float AS trailing_stop_pct
-                FROM live.lots ll
-                JOIN live.streams ls ON ll.stream_id = ls.stream_id
-                WHERE ll.model_id = :mid
-                ORDER BY ll.opened_at
-            """
-            params = {"mid": model_id}
+            with engine.connect() as conn:
+                return pd.read_sql(text(query), conn, params=params)
+
+        # source == "live"
+        if model_version is None:
+            return pd.DataFrame()
+        live_model_id = _live_model_id_for_version(model_version)
+        if live_model_id is None:
+            return pd.DataFrame()
+
+        engine = get_engine()
         with engine.connect() as conn:
-            return pd.read_sql(text(query), conn, params=params)
+            slot_mode_row = conn.execute(
+                text("SELECT slot_mode FROM live.streams WHERE model_id = :mid LIMIT 1"),
+                {"mid": live_model_id},
+            ).fetchone()
+        is_blended = bool(slot_mode_row) and slot_mode_row[0] == "blended"
+
+        if is_blended:
+            return _load_dashboard_blended_lots_live(engine, live_model_id)
+
+        query = """
+            SELECT
+                ll.lot_id, ll.slot_number, ll.lot_sequence, ll.status,
+                ll.opening_capital, ll.closing_capital, ll.realized_pnl,
+                ll.entry_price, ll.exit_price, ll.high_water_mark,
+                ll.opened_at, ll.closed_at, ll.exit_reason,
+                ls.stream_name, NULL::text AS version, ls.slot_mode, ls.slot_count,
+                ls.stream_name AS full_stream_name,
+                (ls.parameters->'position'->>'trailing_stop_pct')::float AS trailing_stop_pct,
+                NULL::numeric AS capital_base,
+                NULL::numeric[] AS fill_prices, NULL::numeric[] AS fill_qtys,
+                NULL::numeric[] AS fill_capitals, NULL::timestamptz[] AS fill_timestamps
+            FROM live.lots ll
+            JOIN live.streams ls ON ll.stream_id = ls.stream_id
+            WHERE ll.model_id = :mid
+            ORDER BY ll.opened_at
+        """
+        with engine.connect() as conn:
+            return pd.read_sql(text(query), conn, params={"mid": live_model_id})
     except Exception:
         return pd.DataFrame()
+
+
+def _load_dashboard_blended_lots_live(engine, live_model_id: int) -> pd.DataFrame:
+    """Shapes live.blended_positions + live.blended_fills into the same
+    per-trade row shape the rest of the dashboard already expects (one row
+    per blended position, standing in for one row per lot), plus real
+    per-fill detail (fill_prices/fill_qtys/fill_capitals/fill_timestamps)
+    for a Stream-Tester-style nested trade log -- unlike backtest.lots,
+    live.blended_fills genuinely has this detail, so it's not a lossy
+    rollup here.
+
+    opening_capital = actually-deployed capital (SUM of this position's fills),
+    matching backtest.lots' semantics exactly -- NOT position_capital_base,
+    which is the full frozen pool regardless of how many slots have filled so
+    far. capital_base carries the pool size separately (for "dry powder
+    remaining" style stats); backtest has no equivalent, hence NULL there."""
+    with engine.connect() as conn:
+        positions = pd.read_sql(text("""
+            SELECT
+                bp.position_id AS lot_id,
+                COALESCE((SELECT COUNT(*) FROM live.blended_fills bf WHERE bf.position_id = bp.position_id), 0) AS slot_number,
+                bp.position_id AS lot_sequence,
+                bp.status,
+                COALESCE((SELECT SUM(bf.capital) FROM live.blended_fills bf WHERE bf.position_id = bp.position_id), 0) AS opening_capital,
+                bp.position_capital_base AS capital_base,
+                bp.closing_capital, bp.realized_pnl,
+                bp.avg_cost_basis AS entry_price, bp.exit_price,
+                bp.highest_close AS high_water_mark,
+                bp.opened_at, bp.closed_at, bp.exit_reason,
+                ls.stream_name, NULL::text AS version, ls.slot_mode, ls.slot_count,
+                ls.stream_name AS full_stream_name,
+                (ls.parameters->'position'->>'trailing_stop_pct')::float AS trailing_stop_pct
+            FROM live.blended_positions bp
+            JOIN live.streams ls ON bp.stream_id = ls.stream_id
+            WHERE bp.model_id = :mid AND bp.status IN ('OPEN', 'CLOSED')
+            ORDER BY bp.opened_at
+        """), conn, params={"mid": live_model_id})
+
+        if positions.empty:
+            return positions
+
+        fills = pd.read_sql(text("""
+            SELECT position_id, price, qty, capital, filled_at
+            FROM live.blended_fills
+            WHERE position_id = ANY(:ids)
+            ORDER BY position_id, fill_number
+        """), conn, params={"ids": positions["lot_id"].tolist()})
+
+    # Map status -> what the rest of the dashboard expects ("CASH"/"OPEN"/"CLOSED" for
+    # backtest.lots vs "PENDING_ENTRY"/"OPEN"/"CLOSED" for blended positions).
+    fills_by_pos = fills.groupby("position_id") if not fills.empty else {}
+
+    def _agg(pos_id, col):
+        if fills.empty or pos_id not in fills_by_pos.groups:
+            return None
+        return fills_by_pos.get_group(pos_id)[col].tolist()
+
+    positions["fill_prices"]     = positions["lot_id"].apply(lambda pid: _agg(pid, "price"))
+    positions["fill_qtys"]       = positions["lot_id"].apply(lambda pid: _agg(pid, "qty"))
+    positions["fill_capitals"]   = positions["lot_id"].apply(lambda pid: _agg(pid, "capital"))
+    positions["fill_timestamps"] = positions["lot_id"].apply(lambda pid: _agg(pid, "filled_at"))
+    return positions
+
+
+def load_blended_starting_capital(model_id: int, source: str, model_version: int = None):
+    """The dashboard's usual total_capital calc (first opening_capital seen per
+    slot) assumes a fixed lot size per slot -- true for Models 1/2, false for a
+    compounding blended model where each closed position's opening_capital is
+    just whatever got actually deployed (1-5 slots worth), not the frozen pool
+    size. Returns the real starting capital for a blended model instead:
+    backtest.model_streams.lot_size_usd IS the pool size directly; live has no
+    persisted historical seed, so it's backed out as current capital minus all
+    realized P&L to date."""
+    try:
+        if source == "backtest":
+            with get_local_engine().connect() as conn:
+                row = conn.execute(
+                    text("SELECT SUM(lot_size_usd) FROM backtest.model_streams WHERE model_id = :mid"),
+                    {"mid": model_id},
+                ).fetchone()
+            return float(row[0]) if row and row[0] is not None else None
+
+        if model_version is None:
+            return None
+        live_model_id = _live_model_id_for_version(model_version)
+        if live_model_id is None:
+            return None
+        with get_engine().connect() as conn:
+            cap_row = conn.execute(
+                text("SELECT available_capital FROM live.blended_capital WHERE model_id = :mid"),
+                {"mid": live_model_id},
+            ).fetchone()
+            pnl_row = conn.execute(
+                text("SELECT COALESCE(SUM(realized_pnl), 0) FROM live.blended_positions WHERE model_id = :mid AND status = 'CLOSED'"),
+                {"mid": live_model_id},
+            ).fetchone()
+        if not cap_row:
+            return None
+        return float(cap_row[0]) - float(pnl_row[0])
+    except Exception:
+        return None
 
 
 def load_current_btc_price(source: str = "local"):
