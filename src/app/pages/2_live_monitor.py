@@ -86,14 +86,19 @@ def _q(sql, params=None):
 # ── Data loaders ──────────────────────────────────────────────────────────────
 
 @st.cache_data(ttl=60)
-def load_executor_runs():
-    rows = _q("""
+def load_executor_runs(model_id):
+    # Model 1's executor.py never sets model_id on its own rows (predates
+    # multi-model support) -- Model 3's blended_executor.py does. So "Model 1"
+    # rows are the NULL ones, not a model_id=1 match.
+    where = "model_id IS NULL" if model_id == 1 else "model_id = :mid"
+    rows = _q(f"""
         SELECT run_id, ran_at, last_tick_at, closed_tfs, open_lots, pending_lots,
                signals_fired, entries_placed, fills, expirations, stops_triggered, error
         FROM live.executor_runs
+        WHERE {where}
         ORDER BY ran_at DESC
         LIMIT 200
-    """)
+    """, {"mid": model_id})
     return pd.DataFrame([dict(r._mapping) for r in rows]) if rows else pd.DataFrame()
 
 
@@ -109,7 +114,7 @@ def load_market_data_runs():
 
 
 @st.cache_data(ttl=60)
-def load_open_lots():
+def load_open_lots(model_id):
     rows = _q("""
         SELECT ll.lot_id, ls.stream_name, ll.slot_number, ll.entry_price,
                ll.high_water_mark, ll.btc_quantity, ll.opening_capital,
@@ -117,9 +122,9 @@ def load_open_lots():
                ls.parameters->>'primary_timeframe' AS timeframe
         FROM live.lots ll
         JOIN live.streams ls ON ll.stream_id = ls.stream_id
-        WHERE ll.status = 'OPEN'
+        WHERE ll.status = 'OPEN' AND ll.model_id = :mid
         ORDER BY ll.opened_at DESC
-    """)
+    """, {"mid": model_id})
     return pd.DataFrame([dict(r._mapping) for r in rows]) if rows else pd.DataFrame()
 
 
@@ -130,20 +135,20 @@ def load_current_price():
 
 
 @st.cache_data(ttl=60)
-def load_pending_lots():
+def load_pending_lots(model_id):
     rows = _q("""
         SELECT ll.lot_id, ls.stream_name, ll.slot_number, ll.entry_price,
                ll.btc_quantity, ll.opening_capital, ll.opened_at, ll.entry_order_id
         FROM live.lots ll
         JOIN live.streams ls ON ll.stream_id = ls.stream_id
-        WHERE ll.status = 'PENDING'
+        WHERE ll.status = 'PENDING' AND ll.model_id = :mid
         ORDER BY ll.opened_at DESC
-    """)
+    """, {"mid": model_id})
     return pd.DataFrame([dict(r._mapping) for r in rows]) if rows else pd.DataFrame()
 
 
 @st.cache_data(ttl=60)
-def load_closed_lots():
+def load_closed_lots(model_id):
     rows = _q("""
         SELECT ll.lot_id, ls.stream_name, ll.slot_number,
                ll.entry_price, ll.exit_price, ll.opening_capital,
@@ -151,24 +156,62 @@ def load_closed_lots():
                ll.opened_at, ll.closed_at, ll.exit_reason
         FROM live.lots ll
         JOIN live.streams ls ON ll.stream_id = ls.stream_id
-        WHERE ll.status = 'CLOSED'
+        WHERE ll.status = 'CLOSED' AND ll.model_id = :mid
         ORDER BY ll.closed_at DESC
-    """)
+    """, {"mid": model_id})
     return pd.DataFrame([dict(r._mapping) for r in rows]) if rows else pd.DataFrame()
 
 
 @st.cache_data(ttl=60)
-def load_model_info():
+def load_model_info(model_id):
     rows = _q("""
         SELECT model_id, model_version, description, deployed_at, status
-        FROM live.models WHERE status = 'active' LIMIT 1
-    """)
+        FROM live.models WHERE model_id = :mid
+    """, {"mid": model_id})
     return dict(rows[0]._mapping) if rows else {}
 
 
 @st.cache_data(ttl=60)
-def load_stream_status():
-    streams_rows = _q("SELECT stream_id, stream_name, parameters FROM live.streams ORDER BY stream_id")
+def load_blended_positions(model_id, status):
+    rows = _q("""
+        SELECT bp.position_id, ls.stream_name, bp.status, bp.original_entry_price,
+               bp.avg_cost_basis, bp.total_qty, bp.total_deployed, bp.highest_close,
+               bp.capitulation_armed, bp.position_capital_base, bp.opened_at,
+               bp.pending_entry_expiry_at, bp.pending_add_order_id, bp.pending_add_expiry_at,
+               bp.exit_price, bp.closing_capital, bp.realized_pnl, bp.exit_reason, bp.closed_at
+        FROM live.blended_positions bp
+        JOIN live.streams ls ON bp.stream_id = ls.stream_id
+        WHERE bp.model_id = :mid AND bp.status = :status
+        ORDER BY bp.created_at DESC
+    """, {"mid": model_id, "status": status})
+    return pd.DataFrame([dict(r._mapping) for r in rows]) if rows else pd.DataFrame()
+
+
+@st.cache_data(ttl=60)
+def load_blended_fills(position_ids: tuple):
+    if not position_ids:
+        return pd.DataFrame()
+    rows = _q("""
+        SELECT position_id, fill_number, price, capital, qty, order_id, filled_at
+        FROM live.blended_fills
+        WHERE position_id = ANY(:ids)
+        ORDER BY position_id, fill_number
+    """, {"ids": list(position_ids)})
+    return pd.DataFrame([dict(r._mapping) for r in rows]) if rows else pd.DataFrame()
+
+
+@st.cache_data(ttl=60)
+def load_blended_capital(model_id):
+    rows = _q("SELECT available_capital, updated_at FROM live.blended_capital WHERE model_id = :mid", {"mid": model_id})
+    return dict(rows[0]._mapping) if rows else {}
+
+
+@st.cache_data(ttl=60)
+def load_stream_status(model_id):
+    streams_rows = _q(
+        "SELECT stream_id, stream_name, parameters FROM live.streams WHERE model_id = :mid ORDER BY stream_id",
+        {"mid": model_id},
+    )
     if not streams_rows:
         return []
 
@@ -272,6 +315,30 @@ def load_stream_status():
                     "label": f"Range breakout ({core_p.get('breakout_lookback', 24)}-candle high)",
                     "current": f"Price ${price:,.0f}  /  Range High ${bh:,.0f}  ({gap:+.1f}%)",
                     "pass": broke, "note": note, "progress": _p,
+                })
+
+            elif core == "fear_dip":
+                # Mirrors src/backtester/signals.py's fear_dip check exactly:
+                # fires when close drops dip_pct% below either an SMA or the
+                # previous candle's close (if no sma_period configured).
+                price = float(last["close"])
+                dip_pct = core_p.get("dip_pct", 3.0)
+                sma_period = core_p.get("sma_period")
+                if sma_period and "sma_dip" in last.index and not pd.isna(last["sma_dip"]):
+                    baseline = float(last["sma_dip"])
+                    baseline_label = f"SMA{sma_period}"
+                else:
+                    baseline = float(prev["close"])
+                    baseline_label = "prev close"
+                trigger = baseline * (1 - dip_pct / 100)
+                fired = price < trigger
+                gap = (price - trigger) / trigger * 100 if trigger else float("nan")
+                note = "dipped this candle ✓" if fired else f"{abs(gap):.2f}% above dip trigger"
+                _p = 1.0 if fired else (min(trigger / price, 0.95) if price > 0 else 0.0)
+                conditions.append({
+                    "label": f"Fear dip ({dip_pct}% below {baseline_label})",
+                    "current": f"Price ${price:,.0f}  /  Trigger ${trigger:,.0f}  ({gap:+.2f}%)",
+                    "pass": fired, "note": note, "progress": _p,
                 })
 
             # RSI filter
@@ -454,24 +521,48 @@ def _pnl_color(val):
     return "color: #4ade80" if val > 0 else ("color: #f87171" if val < 0 else "")
 
 
-# ── Refresh button ────────────────────────────────────────────────────────────
+# ── Model selector + refresh ─────────────────────────────────────────────────
 
-col_title, col_refresh = st.columns([6, 1])
+MODEL_LABELS = {1: "Model 1", 3: "Model 3"}
+
+col_select, col_refresh = st.columns([6, 1])
+with col_select:
+    model_choice = st.radio(
+        "Model", list(MODEL_LABELS.values()), horizontal=True, label_visibility="collapsed",
+    )
 with col_refresh:
     if st.button("↻ Refresh", use_container_width=True):
         st.cache_data.clear()
         st.rerun()
 
+SELECTED_MODEL_ID = {v: k for k, v in MODEL_LABELS.items()}[model_choice]
+IS_BLENDED = SELECTED_MODEL_ID == 3   # Model 3 (Grid Stacker Blended) uses live.blended_* tables, not live.lots
+
 # ── Load all data ─────────────────────────────────────────────────────────────
 
-exec_runs     = load_executor_runs()
-mdata_runs    = load_market_data_runs()
-open_lots     = load_open_lots()
-pending_lots  = load_pending_lots()
-closed_lots   = load_closed_lots()
-model_info    = load_model_info()
-stream_statuses = load_stream_status()
-current_price = load_current_price()
+exec_runs        = load_executor_runs(SELECTED_MODEL_ID)
+mdata_runs       = load_market_data_runs()   # shared across models -- one BTC feed
+model_info       = load_model_info(SELECTED_MODEL_ID)
+stream_statuses  = load_stream_status(SELECTED_MODEL_ID)
+current_price    = load_current_price()
+
+if IS_BLENDED:
+    open_positions    = load_blended_positions(SELECTED_MODEL_ID, "OPEN")
+    pending_positions = load_blended_positions(SELECTED_MODEL_ID, "PENDING_ENTRY")
+    closed_positions  = load_blended_positions(SELECTED_MODEL_ID, "CLOSED")
+    all_position_ids  = tuple(pd.concat([open_positions, pending_positions])["position_id"]) if not (open_positions.empty and pending_positions.empty) else tuple()
+    fills             = load_blended_fills(all_position_ids)
+    capital_info      = load_blended_capital(SELECTED_MODEL_ID)
+    open_count        = len(open_positions)
+    pending_count     = len(pending_positions) + int((open_positions["pending_add_order_id"].notna()).sum()) if not open_positions.empty else len(pending_positions)
+    total_pnl         = closed_positions["realized_pnl"].sum() if not closed_positions.empty else 0.0
+else:
+    open_lots     = load_open_lots(SELECTED_MODEL_ID)
+    pending_lots  = load_pending_lots(SELECTED_MODEL_ID)
+    closed_lots   = load_closed_lots(SELECTED_MODEL_ID)
+    open_count    = len(open_lots)
+    pending_count = len(pending_lots)
+    total_pnl     = closed_lots["realized_pnl"].sum() if not closed_lots.empty else 0.0
 
 # ── Section 1: System Status ──────────────────────────────────────────────────
 
@@ -499,13 +590,12 @@ with c2:
         st.metric("Last Market Data Run", "No data")
 
 with c3:
-    st.metric("Open Positions", len(open_lots))
+    st.metric("Open Positions", open_count)
 
 with c4:
-    st.metric("Pending Orders", len(pending_lots))
+    st.metric("Pending Orders", pending_count)
 
 with c5:
-    total_pnl = closed_lots["realized_pnl"].sum() if not closed_lots.empty else 0.0
     st.metric("Realized P&L", f"${total_pnl:+.2f}")
 
 if model_info:
@@ -513,58 +603,121 @@ if model_info:
     deployed_str = _ago(deployed) if deployed else "—"
     st.caption(f"Model {model_info.get('model_version')} · {model_info.get('description')} · deployed {deployed_str}")
 
+if IS_BLENDED and capital_info:
+    st.caption(
+        f"Compounding capital: \\${float(capital_info['available_capital']):,.2f} "
+        f"(started at \\$100) · updated {_fmt_central(capital_info.get('updated_at'))}"
+    )
+
 st.divider()
 
 # ── Section 2: Open Positions ─────────────────────────────────────────────────
 
 st.markdown('<p class="section-label">Open Positions</p>', unsafe_allow_html=True)
 
-if open_lots.empty:
-    st.caption("No open positions.")
+if not IS_BLENDED:
+    if open_lots.empty:
+        st.caption("No open positions.")
+    else:
+        display = open_lots.copy()
+        # Compute trail stop and unrealized P&L estimate using last known HWM
+        display["trail_stop"] = None
+        display["est_pnl_pct"] = None
+
+        rows = _q("""
+            SELECT stream_name, parameters->'position'->>'trailing_stop_pct' AS trail_pct
+            FROM live.streams
+        """)
+        trail_map = {r[0]: float(r[1]) for r in rows if r[1]}
+
+        for idx, row in display.iterrows():
+            hwm = float(row["high_water_mark"] or row["entry_price"])
+            trail = trail_map.get(row["stream_name"])
+            if trail:
+                display.at[idx, "trail_stop"] = f"${hwm * (1 - trail/100):,.2f}  ({trail}% below HWM ${hwm:,.0f})"
+            ep = float(row["entry_price"])
+            display.at[idx, "est_pnl_pct"] = f"{((hwm - ep) / ep * 100):+.2f}% (HWM)"
+
+        display["current_price"] = current_price
+
+        cols_show = ["stream_name", "opening_capital", "entry_price", "current_price", "high_water_mark",
+                     "trail_stop", "est_pnl_pct", "opened_at"]
+        labels = {
+            "stream_name": "Stream", "opening_capital": "Capital ($)",
+            "entry_price": "Entry Price", "current_price": "Current Price", "high_water_mark": "HWM",
+            "trail_stop": "Trail Stop", "est_pnl_pct": "Est. Gain (HWM)",
+            "opened_at": "Opened",
+        }
+        display = display[cols_show].rename(columns=labels)
+        display["Opened"] = pd.to_datetime(display["Opened"]).apply(_fmt_central)
+        display["Entry Price"] = display["Entry Price"].apply(lambda x: f"${float(x):,.2f}")
+        display["Current Price"] = display["Current Price"].apply(lambda x: f"${float(x):,.2f}" if x is not None else "—")
+        display["HWM"] = display["HWM"].apply(lambda x: f"${float(x):,.2f}" if x else "—")
+        st.dataframe(display, use_container_width=True, hide_index=True)
+
+    if not pending_lots.empty:
+        st.caption(f"**{len(pending_lots)} pending order(s) awaiting fill:**")
+        p_display = pending_lots[["stream_name", "opening_capital", "entry_price", "opened_at", "entry_order_id"]].copy()
+        p_display.columns = ["Stream", "Capital ($)", "Limit Price", "Placed", "Order ID"]
+        p_display["Placed"] = pd.to_datetime(p_display["Placed"]).apply(_fmt_central)
+        p_display["Limit Price"] = p_display["Limit Price"].apply(lambda x: f"${float(x):,.2f}")
+        st.dataframe(p_display, use_container_width=True, hide_index=True)
+
 else:
-    display = open_lots.copy()
-    # Compute trail stop and unrealized P&L estimate using last known HWM
-    display["trail_stop"] = None
-    display["est_pnl_pct"] = None
-
-    rows = _q("""
+    # Model 3: one blended stack per stream -- multiple fills rolled into a
+    # single weighted-average position, not one row per slot like Model 1.
+    trail_rows = _q("""
         SELECT stream_name, parameters->'position'->>'trailing_stop_pct' AS trail_pct
-        FROM live.streams
-    """)
-    trail_map = {r[0]: float(r[1]) for r in rows if r[1]}
+        FROM live.streams WHERE model_id = :mid
+    """, {"mid": SELECTED_MODEL_ID})
+    trail_map = {r[0]: float(r[1]) for r in trail_rows if r[1]}
 
-    for idx, row in display.iterrows():
-        hwm = float(row["high_water_mark"] or row["entry_price"])
-        trail = trail_map.get(row["stream_name"])
-        if trail:
-            display.at[idx, "trail_stop"] = f"${hwm * (1 - trail/100):,.2f}  ({trail}% below HWM ${hwm:,.0f})"
-        ep = float(row["entry_price"])
-        display.at[idx, "est_pnl_pct"] = f"{((hwm - ep) / ep * 100):+.2f}% (HWM)"
+    stacks = pd.concat([open_positions, pending_positions]) if not (open_positions.empty and pending_positions.empty) else pd.DataFrame()
 
-    display["current_price"] = current_price
+    if stacks.empty:
+        st.caption("No open or pending position.")
+    else:
+        for _, pos in stacks.iterrows():
+            pos_fills = fills[fills["position_id"] == pos["position_id"]].copy() if not fills.empty else pd.DataFrame()
+            n_fills = len(pos_fills)
 
-    cols_show = ["stream_name", "opening_capital", "entry_price", "current_price", "high_water_mark",
-                 "trail_stop", "est_pnl_pct", "opened_at"]
-    labels = {
-        "stream_name": "Stream", "opening_capital": "Capital ($)",
-        "entry_price": "Entry Price", "current_price": "Current Price", "high_water_mark": "HWM",
-        "trail_stop": "Trail Stop", "est_pnl_pct": "Est. Gain (HWM)",
-        "opened_at": "Opened",
-    }
-    display = display[cols_show].rename(columns=labels)
-    display["Opened"] = pd.to_datetime(display["Opened"]).dt.strftime("%Y-%m-%d %H:%M UTC")
-    display["Entry Price"] = display["Entry Price"].apply(lambda x: f"${float(x):,.2f}")
-    display["Current Price"] = display["Current Price"].apply(lambda x: f"${float(x):,.2f}" if x is not None else "—")
-    display["HWM"] = display["HWM"].apply(lambda x: f"${float(x):,.2f}" if x else "—")
-    st.dataframe(display, use_container_width=True, hide_index=True)
+            hc1, hc2, hc3 = st.columns([3, 4, 3])
+            with hc1:
+                st.markdown(f"**{pos['stream_name']}**")
+                st.caption(f"{pos['status']}  ·  {n_fills} slot(s) filled")
+            with hc2:
+                if pos["status"] == "PENDING_ENTRY":
+                    st.caption(f"Awaiting slot-1 fill, expires {_fmt_central(pos['pending_entry_expiry_at'])}")
+                else:
+                    avg_cost = float(pos["avg_cost_basis"]) if pd.notna(pos["avg_cost_basis"]) else None
+                    st.caption(
+                        f"Avg Entry \\${avg_cost:,.2f}  ·  Current \\${current_price:,.2f}"
+                        if avg_cost and current_price else "—"
+                    )
+                    if pd.notna(pos["pending_add_order_id"]):
+                        st.caption(f"Cascade add pending, expires {_fmt_central(pos['pending_add_expiry_at'])}")
+            with hc3:
+                capital_base = float(pos["position_capital_base"]) if pd.notna(pos["position_capital_base"]) else None
+                st.caption(f"Capital base: ${capital_base:,.2f}" if capital_base else "—")
+                if pos["capitulation_armed"]:
+                    st.caption("⚠️ Capitulation armed (out of slots)")
 
-if not pending_lots.empty:
-    st.caption(f"**{len(pending_lots)} pending order(s) awaiting fill:**")
-    p_display = pending_lots[["stream_name", "opening_capital", "entry_price", "opened_at", "entry_order_id"]].copy()
-    p_display.columns = ["Stream", "Capital ($)", "Limit Price", "Placed", "Order ID"]
-    p_display["Placed"] = pd.to_datetime(p_display["Placed"]).dt.strftime("%Y-%m-%d %H:%M UTC")
-    p_display["Limit Price"] = p_display["Limit Price"].apply(lambda x: f"${float(x):,.2f}")
-    st.dataframe(p_display, use_container_width=True, hide_index=True)
+            if pos["status"] == "OPEN" and pd.notna(pos["highest_close"]):
+                hwm = float(pos["highest_close"])
+                trail = trail_map.get(pos["stream_name"])
+                if trail:
+                    st.caption(f"HWM \\${hwm:,.2f}  ·  Trail stop \\${hwm * (1 - trail/100):,.2f}  ({trail}% below HWM)")
+
+            if not pos_fills.empty:
+                with st.expander(f"Fills ({n_fills})"):
+                    f_display = pos_fills.copy()
+                    f_display["Filled"] = f_display["filled_at"].apply(_fmt_central)
+                    f_display["Price"] = f_display["price"].apply(lambda x: f"${float(x):,.2f}")
+                    f_display["Capital ($)"] = f_display["capital"].apply(lambda x: f"${float(x):,.2f}")
+                    f_display = f_display[["fill_number", "Price", "Capital ($)", "qty", "Filled"]]
+                    f_display.columns = ["Slot", "Price", "Capital ($)", "BTC Qty", "Filled"]
+                    st.dataframe(f_display, use_container_width=True, hide_index=True)
+            st.divider()
 
 st.divider()
 
@@ -638,7 +791,7 @@ else:
         display = display[ran_col >= cutoff]
 
     display["Status"] = display["error"].apply(lambda e: "🔴 error" if e else "🟢 clean")
-    display["Ran At"] = pd.to_datetime(display["ran_at"]).dt.strftime("%Y-%m-%d %H:%M UTC")
+    display["Ran At"] = pd.to_datetime(display["ran_at"]).apply(_fmt_central)
     display["TFs Closed"] = display["closed_tfs"].apply(_fmt_tfs)
     display["Signals"] = display["signals_fired"].apply(_fmt_signals)
     display["Open"] = display["open_lots"].fillna("—")
@@ -658,7 +811,7 @@ else:
     if not exec_errors.empty:
         with st.expander(f"⚠️ {len(exec_errors)} run(s) with errors"):
             for _, row in exec_errors.iterrows():
-                ran = pd.to_datetime(row["ran_at"]).strftime("%Y-%m-%d %H:%M UTC")
+                ran = _fmt_central(pd.to_datetime(row["ran_at"]))
                 st.code(f"{ran}\n{row['error']}")
 
 st.divider()
@@ -679,11 +832,9 @@ else:
             ran_col = ran_col.dt.tz_localize("UTC")
         display = display[ran_col >= cutoff]
     display["Status"] = display["error"].apply(lambda e: "🔴 error" if e else "🟢 clean")
-    display["Ran At"] = pd.to_datetime(display["ran_at"]).dt.strftime("%Y-%m-%d %H:%M UTC")
+    display["Ran At"] = pd.to_datetime(display["ran_at"]).apply(_fmt_central)
     display["Candles Fetched"] = display["candles_fetched"].fillna("—")
-    display["Latest Candle"] = display["latest_candle"].apply(
-        lambda x: pd.to_datetime(x).strftime("%Y-%m-%d %H:%M UTC") if pd.notna(x) else "—"
-    )
+    display["Latest Candle"] = display["latest_candle"].apply(_fmt_central)
     display["Error"] = display["error"].fillna("")
 
     cols = ["Status", "Ran At", "Candles Fetched", "Latest Candle", "Error"]
@@ -696,41 +847,80 @@ st.divider()
 
 st.markdown('<p class="section-label">Closed Trades</p>', unsafe_allow_html=True)
 
-if closed_lots.empty:
-    st.caption("No closed trades yet.")
+if not IS_BLENDED:
+    if closed_lots.empty:
+        st.caption("No closed trades yet.")
+    else:
+        display = closed_lots.copy()
+        display["P&L"] = display["realized_pnl"].apply(
+            lambda x: f"${float(x):+.2f}" if pd.notna(x) else "—"
+        )
+        display["Return"] = display.apply(
+            lambda r: f"{(float(r['realized_pnl']) / float(r['opening_capital']) * 100):+.2f}%"
+            if pd.notna(r["realized_pnl"]) and float(r["opening_capital"]) > 0 else "—", axis=1
+        )
+        display["Entry Price"] = display["entry_price"].apply(lambda x: f"${float(x):,.2f}")
+        display["Exit Price"] = display["exit_price"].apply(lambda x: f"${float(x):,.2f}" if pd.notna(x) else "—")
+        display["Opened"] = pd.to_datetime(display["opened_at"]).apply(_fmt_central)
+        display["Closed"] = pd.to_datetime(display["closed_at"]).apply(_fmt_central)
+        display["Hold"] = (
+            pd.to_datetime(display["closed_at"]) - pd.to_datetime(display["opened_at"])
+        ).apply(lambda d: f"{int(d.total_seconds() // 3600)}h" if pd.notna(d) else "—")
+
+        cols_show = ["stream_name", "opening_capital", "Entry Price", "Exit Price",
+                     "P&L", "Return", "Opened", "Closed", "Hold", "exit_reason"]
+        labels = {
+            "stream_name": "Stream", "opening_capital": "Capital ($)",
+            "exit_reason": "Exit Reason",
+        }
+        display = display[cols_show].rename(columns=labels)
+        st.dataframe(display, use_container_width=True, hide_index=True)
+
+        # Summary row
+        total_trades = len(closed_lots)
+        winners = (closed_lots["realized_pnl"] > 0).sum()
+        win_rate = winners / total_trades * 100 if total_trades > 0 else 0
+        summary_pnl = closed_lots["realized_pnl"].sum()
+
+        sc1, sc2, sc3 = st.columns(3)
+        sc1.metric("Total Trades", total_trades)
+        sc2.metric("Win Rate", f"{win_rate:.0f}%  ({winners}/{total_trades})")
+        sc3.metric("Total Realized P&L", f"${summary_pnl:+.2f}")
+
 else:
-    display = closed_lots.copy()
-    display["P&L"] = display["realized_pnl"].apply(
-        lambda x: f"${float(x):+.2f}" if pd.notna(x) else "—"
-    )
-    display["Return"] = display.apply(
-        lambda r: f"{(float(r['realized_pnl']) / float(r['opening_capital']) * 100):+.2f}%"
-        if pd.notna(r["realized_pnl"]) and float(r["opening_capital"]) > 0 else "—", axis=1
-    )
-    display["Entry Price"] = display["entry_price"].apply(lambda x: f"${float(x):,.2f}")
-    display["Exit Price"] = display["exit_price"].apply(lambda x: f"${float(x):,.2f}" if pd.notna(x) else "—")
-    display["Opened"] = pd.to_datetime(display["opened_at"]).dt.strftime("%m-%d %H:%M")
-    display["Closed"] = pd.to_datetime(display["closed_at"]).dt.strftime("%m-%d %H:%M")
-    display["Hold"] = (
-        pd.to_datetime(display["closed_at"]) - pd.to_datetime(display["opened_at"])
-    ).apply(lambda d: f"{int(d.total_seconds() // 3600)}h" if pd.notna(d) else "—")
+    if closed_positions.empty:
+        st.caption("No closed positions yet.")
+    else:
+        display = closed_positions.copy()
+        display["P&L"] = display["realized_pnl"].apply(
+            lambda x: f"${float(x):+.2f}" if pd.notna(x) else "—"
+        )
+        display["Return"] = display.apply(
+            lambda r: f"{(float(r['realized_pnl']) / float(r['position_capital_base']) * 100):+.2f}%"
+            if pd.notna(r["realized_pnl"]) and pd.notna(r["position_capital_base"]) and float(r["position_capital_base"]) > 0 else "—", axis=1
+        )
+        display["Avg Entry"] = display["avg_cost_basis"].apply(lambda x: f"${float(x):,.2f}" if pd.notna(x) else "—")
+        display["Exit Price"] = display["exit_price"].apply(lambda x: f"${float(x):,.2f}" if pd.notna(x) else "—")
+        display["Capital Base ($)"] = display["position_capital_base"].apply(lambda x: f"${float(x):,.2f}" if pd.notna(x) else "—")
+        display["Opened"] = pd.to_datetime(display["opened_at"]).apply(_fmt_central)
+        display["Closed"] = pd.to_datetime(display["closed_at"]).apply(_fmt_central)
+        display["Hold"] = (
+            pd.to_datetime(display["closed_at"]) - pd.to_datetime(display["opened_at"])
+        ).apply(lambda d: f"{int(d.total_seconds() // 3600)}h" if pd.notna(d) else "—")
 
-    cols_show = ["stream_name", "opening_capital", "Entry Price", "Exit Price",
-                 "P&L", "Return", "Opened", "Closed", "Hold", "exit_reason"]
-    labels = {
-        "stream_name": "Stream", "opening_capital": "Capital ($)",
-        "exit_reason": "Exit Reason",
-    }
-    display = display[cols_show].rename(columns=labels)
-    st.dataframe(display, use_container_width=True, hide_index=True)
+        cols_show = ["stream_name", "Capital Base ($)", "Avg Entry", "Exit Price",
+                     "P&L", "Return", "Opened", "Closed", "Hold", "exit_reason"]
+        labels = {"stream_name": "Stream", "exit_reason": "Exit Reason"}
+        display = display[cols_show].rename(columns=labels)
+        st.dataframe(display, use_container_width=True, hide_index=True)
 
-    # Summary row
-    total_trades = len(closed_lots)
-    winners = (closed_lots["realized_pnl"] > 0).sum()
-    win_rate = winners / total_trades * 100 if total_trades > 0 else 0
-    total_pnl = closed_lots["realized_pnl"].sum()
+        # Summary row
+        total_trades = len(closed_positions)
+        winners = (closed_positions["realized_pnl"] > 0).sum()
+        win_rate = winners / total_trades * 100 if total_trades > 0 else 0
+        summary_pnl = closed_positions["realized_pnl"].sum()
 
-    sc1, sc2, sc3 = st.columns(3)
-    sc1.metric("Total Trades", total_trades)
-    sc2.metric("Win Rate", f"{win_rate:.0f}%  ({winners}/{total_trades})")
-    sc3.metric("Total Realized P&L", f"${total_pnl:+.2f}")
+        sc1, sc2, sc3 = st.columns(3)
+        sc1.metric("Total Positions", total_trades)
+        sc2.metric("Win Rate", f"{win_rate:.0f}%  ({winners}/{total_trades})")
+        sc3.metric("Total Realized P&L", f"${summary_pnl:+.2f}")
