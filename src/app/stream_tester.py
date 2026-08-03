@@ -146,7 +146,7 @@ with st.expander("🔧 Parameter Reference"):
         ("**min_hold_candles**",     "Stop cannot fire before this many candles — lets the trade develop",
          "e.g. 48 (= 48 hours on 1h timeframe)"),
         ("**max_hold_candles**",     "Force-exit after N candles regardless of P&L", "optional"),
-        ("**entry_order_type**",     "Always `limit` (Kraken maker fee = 0.25% vs 0.40% taker)", "limit"),
+        ("**entry_order_type**",     "Always `limit` (Kraken maker fee = 0.40% vs 0.80% taker)", "limit"),
         ("**entry_expiry_candles**", "Cancel pending limit order if not filled within N candles",
          "default 2"),
         ("**partial_exit**",        "Take a portion off at a target gain, trail the remainder — "

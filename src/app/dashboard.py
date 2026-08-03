@@ -417,21 +417,17 @@ def _render_blended_trade_log(closed: pd.DataFrame, c_hrs: float, key_prefix: st
         else:
             result_word = "WIN" if row["pnl"] > 0.001 else ("FLAT" if abs(row["pnl"]) <= 0.001 else "LOSS")
 
-        # BACKTEST DISPLAY ONLY -- mirrors _run_blended_slots' own convention of a
-        # single maker fee on both sides, because the backtester simulates every
-        # exit as a limit-touch, not a real market order. Live Model 3 exits are
-        # real market sells at TAKER_FEE (0.80% -- Kraken's lowest volume tier,
-        # confirmed via TradeVolume API 2026-08-03) -- do NOT reuse this
-        # MAKER_FEE-both-sides math for a future live blended trade log; see
-        # src/live/blended_order_manager.py's fee model docstring and
-        # src/live/blended_position_monitor.py for the correct live version.
+        # BACKTEST DISPLAY ONLY -- mirrors _run_blended_slots' own convention: limit
+        # entry (maker), market exit (taker). Matches src/live/blended_order_manager.py's
+        # fee model and src/live/blended_position_monitor.py's breakeven floor.
         # The buy-side fee here is already baked into smaller BTC quantities
         # (qty = capital*(1-fee)/price), so it's NOT a separate subtraction
         # anywhere below -- only the sell-side fee is.
         MAKER_FEE  = 0.0040  # real rate (was wrongly 0.25%) -- see order_manager.py
+        TAKER_FEE  = 0.0080  # real rate (was wrongly 0.40%) -- see order_manager.py
         gross_sale = total_qty * row["exit_price"]
         buy_fee    = capital_in * MAKER_FEE
-        sell_fee   = gross_sale * MAKER_FEE
+        sell_fee   = gross_sale * TAKER_FEE
         fees_paid  = buy_fee + sell_fee
 
         # Collapsed summary: the win/loss story at a glance, no expanding needed.
@@ -456,7 +452,7 @@ def _render_blended_trade_log(closed: pd.DataFrame, c_hrs: float, key_prefix: st
 
             r2c1, r2c2, r2c3 = st.columns(3)
             r2c1.metric("Total BTC Bought", f"{total_qty:.6f}")
-            r2c2.metric("Blended Avg Cost", f"${row['entry_price']:,.2f}", help="Raw buy price grossed up by the 0.25% buy fee -- the true cost per BTC after paying to buy it.")
+            r2c2.metric("Blended Avg Cost", f"${row['entry_price']:,.2f}", help="Raw buy price grossed up by the 0.40% buy fee -- the true cost per BTC after paying to buy it.")
             r2c3.metric("Current Price" if is_still_open else "Sale Price", f"${row['exit_price']:,.2f}")
 
             r3c1, r3c2, r3c3 = st.columns(3)
