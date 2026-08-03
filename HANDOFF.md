@@ -1,8 +1,8 @@
 # Handoff — 2026-08-02
 
-## ⚠️ Real fees were wrong for every model until 2026-08-03 — now corrected
+## ✅ Real fees were wrong for every model — now corrected everywhere, including the live branches
 
-Kraken's real current fee tier (confirmed live via the `TradeVolume` API, not assumed): **maker 0.40%, taker 0.80%** — double what every backtest and live formula assumed (0.25%/0.40%) since the project started. Fixed in code, all backtests re-run. See the 2026-08-03 "Done This Session" entry below for the full story, including a second, unresolved gap (live code doesn't capture Kraken's *real* per-trade fee at all, only estimates via constants) that needs a dedicated supervised session, not a quick fix.
+Kraken's real current fee tier (confirmed live via the `TradeVolume` API, re-checked twice, not assumed): **maker 0.40%, taker 0.80%** — double what every backtest and live formula assumed (0.25%/0.40%) since the project started. Two separate bugs, both fixed: (1) the constants themselves were wrong, (2) the backtest engine's round-trip math applied the maker rate to both legs instead of maker-entry/taker-exit, which also under-priced the breakeven floor. Fixed in code, deployed to `main`, `live-model-1`, and `live-model-3`. QA'd against Model 3's full backtest history — no trade realizes a real loss through the breakeven floor anymore except the one designed capitulation-stop backstop. See the 2026-08-03 "Done This Session" entries below for the full story, including a second, unresolved gap (live code doesn't capture Kraken's *real* per-trade fee at all, only estimates via constants) that still needs a dedicated supervised session, not a quick fix.
 
 ## Current State
 
@@ -277,15 +277,20 @@ All changes cherry-picked. Conflict resolved: `live-model-1` had a `_preflight_c
 
 ## What's Next
 
-### 🎯 TOMORROW — Priority order: get the live systems correct first, then clean up the data mess the wrong fees left behind
+### ✅ DONE (2026-08-03, later session) — Fee round-trip math was still wrong even after the constant fix; found, fixed, QA'd, deployed to all three branches
 
-Everything below stems from tonight's fee discovery (see "Done This Session (2026-08-03)" above for full context: real Kraken fees are 0.40% maker / 0.80% taker, double what every model was built against). **User's explicit call: both Model 1 and Model 3 are fine to keep running live as-is (don't pause them) — but they need to be brought in line with the real fees so they actually work as designed, not as an afterthought.** Do the live fixes first; the historical data cleanup is real but lower urgency.
+The constant fix (0.25%/0.40% → 0.40%/0.80%) from earlier tonight only corrected the *values* — it didn't check *which* value got applied where. User asked directly: "are you sure of what the fees are both ways?" That surfaced a second, bigger bug: **`src/backtester/engine.py` computed round-trip fees as `fee*2` with `fee` defaulting to `MAKER_FEE` — i.e. every slot mode (single, staggered, cascade, blended) assumed BOTH legs filled at the maker rate (0.80% round trip).** But this project's own design has market orders on exit, which always pay the taker rate — real round-trip cost is `MAKER_FEE + TAKER_FEE` (1.20%), not `MAKER_FEE*2`. Same bug hit the breakeven-floor math in cascade/blended modes: the floor was priced off the maker rate for the exit leg, so "never voluntarily realize a loss" was under-provisioned by the maker/taker delta (~0.4%) and could still lock in a small real loss.
 
-#### 1. Fix `live-model-1` for the real fees
-The fee-constant fix (`MAKER_FEE`/`TAKER_FEE` in `order_manager.py`) is on `main` only right now — needs to be ported to `live-model-1` the same way the market_data freshness guard and timeout fix were (separate copy of the file on that branch, same pattern). This changes the breakeven-floor calculation for Model 1's real open position, so review the diff and watch the next tick after pushing.
+**Re-confirmed fees live via `TradeVolume` API before touching anything** — still lowest tier, maker 0.40% / taker 0.80%, unchanged since yesterday's discovery.
 
-#### 2. Fix `live-model-3` for the real fees
-Same fix needs to reach `live-model-3`. Unlike Model 1, this branch fast-forwards from `main` rather than carrying independent edits, so once `main`'s fee fix is confirmed good, this should just be `git push origin main:live-model-3` (same mechanism used for the freshness guard and timeout fix). Also changes the breakeven-floor calc for Model 3's real open position — same "watch the next tick" caution applies.
+**Fixed:** `engine.py` now uses `MAKER_FEE` for entry and `TAKER_FEE` for every exit-side calculation (pnl and breakeven floor), across all slot modes — matching `order_manager.py`'s and `blended_position_monitor.py`'s already-correct live formulas. Also fixed two display-only copies of the same wrong assumption: `dashboard.py`'s blended trade log (`sell_fee` was `MAKER_FEE`, now `TAKER_FEE`) and a stale 0.25%/0.40% mention in `stream_tester.py`'s glossary.
+
+**QA:** re-ran Model 3's full-history backtest (594 trades) — zero `trailing_stop` exits realize a real loss now (worst is -3.6e-12, floating-point noise). Only the one designed `capitulation_stop` trade takes a real loss, as intended (that backstop is supposed to). `tests/live/` 27/27 still pass (unaffected — no hardcoded fee-derived values). `tests/live/test_signal_parity.py` has a pre-existing unrelated collection error (references a dropped `locked_test_id` column) — confirmed present before this session's changes too, not something introduced here, not fixed (out of scope).
+
+**Deployed to all three branches** (`main` 6744d94, `live-model-1` 2e4cad9 — targeted port of the constant fix only, since that branch carries independent live-only commits, `live-model-3` fast-forwarded to `main`'s tip via `git push origin main:live-model-3`, confirmed on remote). Both live models now have real open positions running against the corrected breakeven math — watch the next tick on each.
+
+#### 1. ✅ Fix `live-model-1` for the real fees — DONE, see above
+#### 2. ✅ Fix `live-model-3` for the real fees — DONE, see above
 
 #### 3. Build the fee-drift safeguard
 The 0.25%/0.40% assumption sat wrong for the entire project until a real trade's numbers didn't match — nobody had ever actually queried Kraken's real fee tier against the constants in code. Build something that queries `kraken._api.query_private('TradeVolume', {'pair': 'XXBTZUSD'})` and compares the returned `fee`/`fees_maker` against `MAKER_FEE`/`TAKER_FEE`, and loudly warns (alert, not just a log line) if they've drifted apart. Natural home: either a new check inside `healthcheck.py`/`blended_healthcheck.py` (already runs every 2h, already has alert plumbing), or a small standalone script run periodically. Fees are tiered by 30-day volume (`nextvolume` in the API response), so this needs to keep checking as trading volume grows and the tier changes, not just run once.
