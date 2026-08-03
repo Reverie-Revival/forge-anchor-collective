@@ -14,6 +14,7 @@ from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
 
 from src.live import notifier
+from src.live.fee_check import check_fee_drift
 
 load_dotenv()
 
@@ -56,6 +57,10 @@ def run() -> None:
         notifier.alert_system_down(gap_hours)
     else:
         log.info("Executor heartbeat OK")
+
+    # Both live models share one Kraken account, so the fee tier only needs
+    # checking from one healthcheck, not duplicated in blended_healthcheck.py too.
+    check_fee_drift()
 
 
 if __name__ == "__main__":

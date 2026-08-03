@@ -95,6 +95,26 @@ def alert_market_data_stale(model_id: int, latest_ts, expected_ts) -> None:
     )
 
 
+def alert_fee_drift(real_maker: float, real_taker: float, const_maker: float, const_taker: float,
+                    tier_volume: float, next_volume: float) -> None:
+    _dispatch(
+        email_subject="Forge: Fee Tier Drift Detected",
+        email_body=(
+            f"Kraken's real fee tier no longer matches MAKER_FEE/TAKER_FEE in code.\n\n"
+            f"Code assumes:  maker {const_maker*100:.2f}% / taker {const_taker*100:.2f}%\n"
+            f"Kraken reports: maker {real_maker*100:.2f}% / taker {real_taker*100:.2f}%\n\n"
+            f"30-day volume: ${tier_volume:,.2f} (next tier at ${next_volume:,.2f})\n\n"
+            f"Every backtest, P&L estimate, and breakeven-floor calculation is now off "
+            f"until MAKER_FEE/TAKER_FEE are updated in src/live/order_manager.py and "
+            f"src/backtester/engine.py (and both live branches)."
+        ),
+        sms_body=(
+            f"Forge: FEE DRIFT -- code {const_maker*100:.2f}%/{const_taker*100:.2f}%, "
+            f"Kraken now {real_maker*100:.2f}%/{real_taker*100:.2f}%. Update constants."
+        ),
+    )
+
+
 def alert_opened(stream_name: str, model_id: int, usd_in: float, fill_price: float, qty: float) -> None:
     _dispatch(
         email_subject=f"Forge: Opened - Model {model_id} | {stream_name}",
