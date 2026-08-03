@@ -1,5 +1,9 @@
 # Handoff — 2026-08-02
 
+## ⚠️ Real fees were wrong for every model until 2026-08-03 — now corrected
+
+Kraken's real current fee tier (confirmed live via the `TradeVolume` API, not assumed): **maker 0.40%, taker 0.80%** — double what every backtest and live formula assumed (0.25%/0.40%) since the project started. Fixed in code, all backtests re-run. See the 2026-08-03 "Done This Session" entry below for the full story, including a second, unresolved gap (live code doesn't capture Kraken's *real* per-trade fee at all, only estimates via constants) that needs a dedicated supervised session, not a quick fix.
+
 ## Current State
 
 **Model 1 is LIVE** — executor running, cron on schedule. Full alert coverage active (order placed, filled, closed, expired, system down).
@@ -26,6 +30,41 @@
 **A related bug surfaced when Model 3's executor was first triggered for real** (commit `3a11cf6`): `signal_engine.check()` internally calls `engine.py`'s `load_market_data()`, which reads `DATABASE_URL` specifically (not `SUPABASE_DATABASE_URL`, with a localhost fallback) — same root cause as the incident above, different file. `executor_m3.yml` only set `SUPABASE_DATABASE_URL`; fixed by also mapping the same secret to `DATABASE_URL`. Local testing hadn't caught this because local `.env` has `DATABASE_URL` pointing at a Postgres that also happens to have synced market data, masking the CI-only gap. Fixed and verified by simulating the CI env exactly before pushing.
 
 **Also fixed proactively:** switched Model 3's two cron-job.org jobs from `ref:main` to `ref:live-model-3` (matching checkout) before this class of bug could ever bite Model 3 the way it bit Model 1 — `live-model-3` was fast-forwarded to `main`'s tip first so the switch didn't regress anything.
+
+---
+
+## Done This Session (2026-08-03) — Real Kraken fees were double what every model assumed; corrected everywhere; one deeper gap found and deliberately not fixed
+
+**How this surfaced:** while explaining Grid Stacker Blended's entry-signal mechanics to the user (fear_dip: fires when a 4h close is ≥1% below the *previous* 4h close), the conversation moved to how the limit order's price gets set — `kraken.get_ticker_price()`, the current last-trade price, fetched live at signal-fire time. User confirmed that's the intended design. Then: **Model 3's first real trade filled** (slot 1, $62,822.12, $20 deployed, 2026-08-03 04:01 UTC). Checking Kraken's own trade record for it (`TradesHistory`) turned up two things at once:
+
+1. `"maker": false` — it filled as a **taker**, not maker. Exactly the crossing risk flagged earlier: this strategy only fires *during* a dip, so the "current price" fetched at signal time is systematically likely to be stale-high relative to where the book has already moved, making the buy limit cross the spread.
+2. **The fee was $0.16 on a $20.00005 trade — exactly 0.80%.** Double `TAKER_FEE = 0.0040` (0.40%), the constant used everywhere in the codebase.
+
+**Confirmed directly from Kraken, not inferred:** `kraken._api.query_private('TradeVolume', {'pair': 'XXBTZUSD'})` reports this account's real current tier: **maker 0.40%, taker 0.80%** (`tiervolume: 0`, `nextvolume: 2500` — fees step down once 30-day trading volume crosses $2,500; taker drops to 0.60% at minimum at that point, re-check rather than assume when it does). Every backtest for every model, and the live breakeven-floor/P&L-estimate formulas, had been using 0.25%/0.40% — a schedule this project's actual low-volume accounts were never on.
+
+**Fixed:**
+- `MAKER_FEE`/`TAKER_FEE` corrected to 0.0040/0.0080 in `src/backtester/engine.py`, `src/live/order_manager.py` (single source of truth — `blended_order_manager.py`/`blended_position_monitor.py` import `TAKER_FEE` from here, picked up automatically), and the display-only copy in `src/app/dashboard.py`. `tests/live/` (27 tests) still green — no test had a hardcoded expected number tied to the old fee values, all computed dynamically off the imported constants.
+- **Two more real, unrelated bugs found while re-running backtests to get an accurate before/after:** `backtest.model_streams` had drifted from reality for two of three models. Model 1's was still at the `lot_size_usd` **default of $10**, never updated to the real deployed **$33.33/stream** — meaning no model-level backtest had ever actually reflected Model 1's real live allocation, fee assumption aside. Model 2's Momentum Rider row was linked to the **wrong stream_config entirely** (v3 staggered $12.50) instead of Run 3's actual selected composition (v4 single $25, confirmed against the `configuration` JSON saved with that run). Both corrected directly in the DB (backtest schema, freely rebuilt, not live).
+- **Re-ran all three models across all 5 presets** (new script: `src/backtester/rerun_corrected_fees.py`) with corrected fees and corrected compositions, saved as new `model_tests` rows (old rows kept for history, not deleted):
+
+  | Model | Preset | Old ann% (wrong fee, and for M1/M2 also wrong allocation) | New ann% (corrected) |
+  |---|---|---|---|
+  | Model 1 (live) | Full History | +22.2% | +20.2% |
+  | Model 1 (live) | Primary v2 | +15.6% | +13.6% |
+  | Model 2 (Run 3) | Full History | +21.7% | +19.4% |
+  | Model 2 (Run 3) | Primary v2 | +19.2% | +16.9% |
+  | Model 3 (Grid Stacker) | Full History | +84.7% | **+71.7%** |
+  | Model 3 (Grid Stacker) | Primary v2 | +54.3% | +41.5% |
+
+  Model 3 moved the most (trades far more often, so fee drag compounds harder) — and its Full History **max drawdown went from -0.0% to -20.9%**: several trades that looked flat (~$0 P&L) under the old assumption were actually small real losses once taxed at the real rate. Full per-preset numbers in `backtest.model_tests` (Model 1: ids 111-115, Model 2: 116-120, Model 3: 121-125), all tagged with a `notes` field explaining the correction.
+
+- **Docs updated**: `CLAUDE.md`'s "Key Constraints" now says fees are tiered/confirmed-live rather than a fixed assumed number, and points at where to re-check. Memory (`project-live-deployment`, `project-core`) updated with the real numbers and the corrected Run 3 comparison.
+
+**Found, explained, and deliberately NOT fixed tonight — needs a dedicated supervised session:** live code never captures Kraken's *actual* per-trade fee or fill price at all. `kraken_client.py`'s `get_order_status()` discards the `cost`/`fee` fields Kraken's own API returns (confirmed present in both `QueryOrders` and `TradesHistory` responses) and only surfaces `status`/`vol_exec`/`price`. This means:
+  - Every live P&L number, for both Model 1 and Model 3, is still an *estimate* off the `MAKER_FEE`/`TAKER_FEE` constants — never ground truth from the exchange, even after tonight's fix. The constants are now the *right* estimate, but they're still an estimate, and per-trade real maker/taker outcome varies (as trade #1 already showed).
+  - `blended_order_manager.py`/Model 1's `order_manager.py` record `capital`/`opening_capital` as the *intended* allocation ($20.00, $33.33, etc.), not the *real* USD debited (`cost + fee` — $20.16005 for trade #1). The backtester correctly nets the buy-side fee out of BTC quantity (`qty = capital*(1-fee)/price`); live does not do the equivalent anywhere, because `vol_exec` (real, from Kraken) is used directly for quantity while `capital` stays at the pre-fee target. Net effect: the buy-side fee is never subtracted from anything, anywhere, in live code — cost basis and realized P&L are both silently overstated by it.
+  - Model 1's exit price is *also* an estimate (`exit_price = current_price`, the candle close) rather than Kraken's real average fill price for the market sell — the code comment says "actual fill price resolved on next check" but nothing currently does that reconciliation.
+  - **Why not fixed tonight:** this touches the core fill-recording state machine for *both* currently-live models, each with a real open position right now. The user was stepping away for the night ("deal with fallout tomorrow") when this was found — a correctness fix to the constants (safe, tested, backtest-only + estimate-formula impact) is a very different risk profile than rewiring how real fills get recorded for two live systems simultaneously, unsupervised. Recommend a focused future session: read real `cost`/`fee` from Kraken at every fill (entry and exit, both models), use them directly instead of any assumed constant, and reconcile Model 1's exit price the same way. Watch the next several real fills closely once that lands.
 
 ---
 
@@ -79,6 +118,8 @@ User caught a live `executor.yml` run ([run 30780654083](https://github.com/Reve
 **Fixed in `executor.py` and `blended_executor.py`** (both `main` and `live-model-1`'s independent copy): `create_engine(url, connect_args={"connect_timeout": 10})` bounds connection acquisition to 10s; `conn.execute(text("SET statement_timeout = '15s'"))` right after `engine.begin()` bounds every query in the transaction to 15s. A stuck connection or query now fails loudly (clear exception, job fails fast and visibly) instead of hanging silently for the full job timeout. 15s is generous for every query this executor actually runs (all single-table, low-row-count lookups) but far short of the 5-minute budget.
 
 Ported to `main` and `live-model-1` (`live-model-3` gets it for free via fast-forward, same as the freshness guard). Full `tests/live/` suite (27 tests) still green on both after the change.
+
+**Also, while explaining Grid Stacker Blended's entry signal to the user (fear_dip, no sma_period → fires when a 4h close is ≥1% below the *previous* 4h close, no other filters), added a "Slot Status" ladder to Live Monitor for Model 3** (`_render_slot_ladder()` in `2_live_monitor.py`) — replaces the single generic condition card in Section 3 with all 5 cascade slots shown individually: filled (real price/capital/timestamp from `live.blended_fills`), order placed (real expiry from `pending_entry_expiry_at`/`pending_add_expiry_at`), or not yet triggered (the actual `cumulative_drop_pcts`-derived trigger price and live distance from it). When no position is open at all, Slot 1 shows the real fear_dip progress bar (reusing the existing condition data) and Slots 2-5 show "waiting on Slot 1." Needed one new column (`pending_add_index`, to know which slot a pending cascade-add order belongs to) and one new loader (`load_blended_stream_params()`, for `cumulative_drop_pcts`/`slot_count`, which `load_stream_status()` doesn't expose).
 
 ---
 

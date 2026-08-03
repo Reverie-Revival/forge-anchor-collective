@@ -10,7 +10,7 @@ Each **Model** deploys with $100 total capital, split across 3–5 strategy stre
 Capital allocation is configurable per stream: each stream has its own `lot_size_usd` ($ per position) and `slot_count` (max concurrent positions).
 Total model capital = Σ(lot_size_usd × slot_count) across all streams.
 Default starting point: $10/lot × 2 slots per stream — but high-conviction streams can be weighted heavier.
-**Minimum lot size: $10 per slot.** Positions below $10 are impractical given Kraken's minimum order sizes and the 0.50% round-trip fee eating a disproportionate share of a small position.
+**Minimum lot size: $10 per slot.** Positions below $10 are impractical given Kraken's minimum order sizes and the round-trip fee (currently ~1.2% at this project's volume tier, see Key Constraints below) eating a disproportionate share of a small position.
 Models are versioned, deployed independently, and run in parallel with separate capital.
 
 ### Streams
@@ -72,7 +72,7 @@ These are two distinct steps:
 
 - No leverage, ever
 - BTC only (Model 1)
-- Limit orders only (0.25% maker fee, 0.50% round trip)
+- Limit orders on entry, market orders on exit. **Fees are tiered by 30-day volume, not fixed** — confirmed live via Kraken's `TradeVolume` API (`{"pair": "XXBTZUSD"}`), not assumed. At this project's current low-volume tier: **0.40% maker / 0.80% taker**. A "limit" entry is not guaranteed a maker fill — it can cross the spread and pay taker (confirmed on Model 3's first real trade). Re-check the real tier before trusting any fee assumption in code; see `MAKER_FEE`/`TAKER_FEE` in `src/live/order_manager.py` and `src/backtester/engine.py`.
 - No LLM in the live execution path — deterministic rules only
 - All gains measured as realized cash, not unrealized BTC value
 - $0 infrastructure cost — if something requires payment, find a free alternative

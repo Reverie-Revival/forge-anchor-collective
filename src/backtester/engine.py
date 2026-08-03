@@ -12,7 +12,13 @@ from src.data.sentiment import load_sentiment
 
 load_dotenv()
 
-MAKER_FEE = 0.0025  # 0.25% per side
+# Kraken's lowest volume tier (confirmed via TradeVolume API 2026-08-03,
+# tiervolume=0, nextvolume=$2500/30d) -- NOT the tier this constant used to
+# assume. Every $100-scale model here starts at this tier; fees step down
+# as 30-day trading volume crosses $2,500 (taker -> 0.60% next tier). Re-check
+# via `kraken._api.query_private('TradeVolume', {'pair': 'XXBTZUSD'})` if
+# volume has grown, rather than assuming this is still current.
+MAKER_FEE = 0.0040  # 0.40% per side (real rate, was wrongly 0.25%)
 
 # Valid slot modes. 'single' = one slot only.
 # 'staggered'  = N independent slots, round-robin dispatch, optional gap + capital weights.

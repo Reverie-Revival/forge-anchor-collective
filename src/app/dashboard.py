@@ -418,16 +418,17 @@ def _render_blended_trade_log(closed: pd.DataFrame, c_hrs: float, key_prefix: st
             result_word = "WIN" if row["pnl"] > 0.001 else ("FLAT" if abs(row["pnl"]) <= 0.001 else "LOSS")
 
         # BACKTEST DISPLAY ONLY -- mirrors _run_blended_slots' own convention of a
-        # single 0.25% maker fee on both sides (0.5% round trip), because the
-        # backtester simulates every exit as a limit-touch, not a real market
-        # order. Live Model 3 exits are real market sells at TAKER_FEE (0.40%) --
-        # do NOT reuse this MAKER_FEE-both-sides math for a future live blended
-        # trade log; see src/live/blended_order_manager.py's fee model docstring
-        # and src/live/blended_position_monitor.py for the correct live version.
+        # single maker fee on both sides, because the backtester simulates every
+        # exit as a limit-touch, not a real market order. Live Model 3 exits are
+        # real market sells at TAKER_FEE (0.80% -- Kraken's lowest volume tier,
+        # confirmed via TradeVolume API 2026-08-03) -- do NOT reuse this
+        # MAKER_FEE-both-sides math for a future live blended trade log; see
+        # src/live/blended_order_manager.py's fee model docstring and
+        # src/live/blended_position_monitor.py for the correct live version.
         # The buy-side fee here is already baked into smaller BTC quantities
         # (qty = capital*(1-fee)/price), so it's NOT a separate subtraction
         # anywhere below -- only the sell-side fee is.
-        MAKER_FEE  = 0.0025
+        MAKER_FEE  = 0.0040  # real rate (was wrongly 0.25%) -- see order_manager.py
         gross_sale = total_qty * row["exit_price"]
         buy_fee    = capital_in * MAKER_FEE
         sell_fee   = gross_sale * MAKER_FEE
