@@ -3,6 +3,7 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', '..'))
 
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import streamlit as st
@@ -120,6 +121,12 @@ def load_open_lots():
         ORDER BY ll.opened_at DESC
     """)
     return pd.DataFrame([dict(r._mapping) for r in rows]) if rows else pd.DataFrame()
+
+
+@st.cache_data(ttl=60)
+def load_current_price():
+    rows = _q("SELECT close FROM market_data ORDER BY timestamp DESC LIMIT 1")
+    return float(rows[0][0]) if rows else None
 
 
 @st.cache_data(ttl=60)
@@ -412,6 +419,19 @@ def _ago(ts):
     return f"{s // 86400}d ago"
 
 
+CENTRAL_TZ = ZoneInfo("America/Chicago")
+
+
+def _fmt_central(ts):
+    if ts is None or (isinstance(ts, float) and pd.isna(ts)):
+        return "—"
+    if hasattr(ts, "to_pydatetime"):
+        ts = ts.to_pydatetime()
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return ts.astimezone(CENTRAL_TZ).strftime("%Y-%m-%d %H:%M %Z")
+
+
 def _status_dot(error):
     return "🔴" if error else "🟢"
 
@@ -451,6 +471,7 @@ pending_lots  = load_pending_lots()
 closed_lots   = load_closed_lots()
 model_info    = load_model_info()
 stream_statuses = load_stream_status()
+current_price = load_current_price()
 
 # ── Section 1: System Status ──────────────────────────────────────────────────
 
@@ -465,6 +486,7 @@ with c1:
     if last_exec is not None:
         dot = _status_dot(last_exec["error"])
         st.metric("Last Executor Run", _ago(last_exec["ran_at"]), delta=f"{dot} {'error' if last_exec['error'] else 'clean'}", delta_color="off")
+        st.caption(_fmt_central(last_exec["ran_at"]))
     else:
         st.metric("Last Executor Run", "No data")
 
@@ -472,6 +494,7 @@ with c2:
     if last_mdata is not None:
         dot = _status_dot(last_mdata["error"])
         st.metric("Last Market Data Run", _ago(last_mdata["ran_at"]), delta=f"{dot} {'error' if last_mdata['error'] else 'clean'}", delta_color="off")
+        st.caption(_fmt_central(last_mdata["ran_at"]))
     else:
         st.metric("Last Market Data Run", "No data")
 
@@ -518,17 +541,20 @@ else:
         ep = float(row["entry_price"])
         display.at[idx, "est_pnl_pct"] = f"{((hwm - ep) / ep * 100):+.2f}% (HWM)"
 
-    cols_show = ["stream_name", "opening_capital", "entry_price", "high_water_mark",
+    display["current_price"] = current_price
+
+    cols_show = ["stream_name", "opening_capital", "entry_price", "current_price", "high_water_mark",
                  "trail_stop", "est_pnl_pct", "opened_at"]
     labels = {
         "stream_name": "Stream", "opening_capital": "Capital ($)",
-        "entry_price": "Entry Price", "high_water_mark": "HWM",
+        "entry_price": "Entry Price", "current_price": "Current Price", "high_water_mark": "HWM",
         "trail_stop": "Trail Stop", "est_pnl_pct": "Est. Gain (HWM)",
         "opened_at": "Opened",
     }
     display = display[cols_show].rename(columns=labels)
     display["Opened"] = pd.to_datetime(display["Opened"]).dt.strftime("%Y-%m-%d %H:%M UTC")
     display["Entry Price"] = display["Entry Price"].apply(lambda x: f"${float(x):,.2f}")
+    display["Current Price"] = display["Current Price"].apply(lambda x: f"${float(x):,.2f}" if x is not None else "—")
     display["HWM"] = display["HWM"].apply(lambda x: f"${float(x):,.2f}" if x else "—")
     st.dataframe(display, use_container_width=True, hide_index=True)
 
@@ -565,7 +591,7 @@ else:
             st.caption(f"{ss['timeframe']} · {ss['core_signal'].replace('_', ' ')}")
         with hc2:
             ts = ss.get("last_candle_ts")
-            ts_str = pd.to_datetime(ts).strftime("%Y-%m-%d %H:%M UTC") if ts is not None else "—"
+            ts_str = _fmt_central(ts)
             st.caption(f"Last candle: {ts_str}  ·  BTC ${ss['last_close']:,.2f}")
         with hc3:
             label = "🟢 signal firing" if all_pass else "conditions met"
