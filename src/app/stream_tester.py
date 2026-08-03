@@ -13,7 +13,7 @@ from src.app.utils import (
 from src.app.db import (
     RUNS_DIR,
     load_streams, load_stream_configs, load_stream_history, load_timeframe_presets,
-    load_run_payload, save_stream_test,
+    load_run_payload, save_stream_test, load_stream_test_capital,
 )
 from src.app.dashboard import render_dashboard
 from src.backtester.engine import run_backtest
@@ -319,8 +319,10 @@ with st.sidebar:
 
 # ── Run All Presets ──────────────────────────────────────────────────────────
 
-def _run_and_save(cfg: dict, preset: dict, initial_capital: float = 20.0) -> dict:
+def _run_and_save(cfg: dict, preset: dict, initial_capital: float = None) -> dict:
     """Run one backtest for a stream config + preset, save to DB, return the payload."""
+    if initial_capital is None:
+        initial_capital = load_stream_test_capital(cfg["stream_config_id"], cfg["slot_mode"])
     p = cfg["params"]
     result = run_backtest(
         params       = p,

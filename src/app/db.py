@@ -838,6 +838,21 @@ def load_blended_starting_capital(model_id: int, source: str, model_version: int
         return None
 
 
+def load_stream_test_capital(stream_config_id: int, slot_mode: str, default: float = 20.0) -> float:
+    """Blended mode's lot_size_usd IS the stream's total capital pool (matches
+    model_engine.py's special-case), not a per-slot amount -- so the generic
+    per-lot stream-tester default of $20 is wrong for it. If this config is
+    assembled into a model, use that model's real deployed pool size instead."""
+    if slot_mode != "blended":
+        return default
+    with get_local_engine().connect() as conn:
+        row = conn.execute(
+            text("SELECT lot_size_usd FROM backtest.model_streams WHERE stream_config_id = :cid LIMIT 1"),
+            {"cid": stream_config_id},
+        ).fetchone()
+    return float(row[0]) if row and row[0] is not None else default
+
+
 def load_current_btc_price(source: str = "local"):
     """Fetch the most recent BTC close price. source='local' uses local postgres; 'supabase' uses Supabase."""
     try:
