@@ -14,7 +14,9 @@ Kraken's real current fee tier (confirmed live via the `TradeVolume` API, re-che
 
 **Model 3 is LIVE — trading for real, as of 2026-08-02 ~00:35 UTC.** "Grid Stacker Blended", $100 real capital in Kraken. `DRY_RUN_M3=false`. Real Kraken connectivity confirmed (`Kraken connected — USD: $166.54 BTC: 0.00053149` — whole-account balance, shared with Model 1; Model 3 sizes off its own `live.blended_capital` ledger, never this figure). Cron-job.org's two Model 3 jobs (`executor_m3.yml` every 30min, `healthcheck_m3.yml` every 2h) both confirmed firing successfully, dispatching with `ref:live-model-3` (switched from `ref:main` after the incident below made clear why that matters). `live-model-3` branch is fast-forwarded to match `main` exactly as of commit `3a11cf6`.
 
-**Explicit user decision, not the original plan:** the original plan called for a multi-day dry-run logging trial before going live. User explicitly chose to skip it ("I don't mind a little turbulence... would rather have a good order happen for real than miss out because it's a dry-run") — flagged clearly before flipping the switch that real order placement had zero live Kraken mileage (only ever tested against a mock), user accepted that knowingly. **As of this handoff, no signal has fired yet and no real order has been placed** — first real trade, whenever it happens, has genuinely never been observed end-to-end in production. Watch the first one closely.
+**Explicit user decision, not the original plan:** the original plan called for a multi-day dry-run logging trial before going live. User explicitly chose to skip it ("I don't mind a little turbulence... would rather have a good order happen for real than miss out because it's a dry-run") — flagged clearly before flipping the switch that real order placement had zero live Kraken mileage (only ever tested against a mock), user accepted that knowingly.
+
+**Update: first real trade fired and confirmed legitimate.** Slot 1 filled 2026-08-03 04:01:06 UTC at $62,822.12 ($20 deployed), on a real ~1.11% 4h dip (candle closed at $62,793.40 vs. the prior candle's $63,500.00 close — clears the `fear_dip` 1% threshold; no other filters/sentiment gate on this config). Independently re-verified by running a from-scratch backtest starting at Model 3's actual go-live moment (2026-08-02) through the present — it reproduces the exact same single trade, same entry candle, same still-open/unarmed status as the real live position. Not a fluke. Position is currently OPEN, 1/5 slots filled, unarmed (needs +4% gain above avg cost to arm the trailing stop — see "Done This Session" below for the full mechanics writeup).
 
 **Model Dashboard is BUILT** — `3_model_dashboard.py` live in the multipage app (port 8504).
 
@@ -32,6 +34,37 @@ Kraken's real current fee tier (confirmed live via the `TradeVolume` API, re-che
 **A related bug surfaced when Model 3's executor was first triggered for real** (commit `3a11cf6`): `signal_engine.check()` internally calls `engine.py`'s `load_market_data()`, which reads `DATABASE_URL` specifically (not `SUPABASE_DATABASE_URL`, with a localhost fallback) — same root cause as the incident above, different file. `executor_m3.yml` only set `SUPABASE_DATABASE_URL`; fixed by also mapping the same secret to `DATABASE_URL`. Local testing hadn't caught this because local `.env` has `DATABASE_URL` pointing at a Postgres that also happens to have synced market data, masking the CI-only gap. Fixed and verified by simulating the CI env exactly before pushing.
 
 **Also fixed proactively:** switched Model 3's two cron-job.org jobs from `ref:main` to `ref:live-model-3` (matching checkout) before this class of bug could ever bite Model 3 the way it bit Model 1 — `live-model-3` was fast-forwarded to `main`'s tip first so the switch didn't regress anything.
+
+---
+
+## Done This Session (2026-08-03, even later) — Dashboard fixes for Model 3's first real trade, live-vs-backtest sync-check presets
+
+Model 3's first real fill (see "Current State" above) surfaced several dashboard bugs while actually looking at it live for the first time.
+
+**Live Monitor (`2_live_monitor.py`) Slot Status fixes:**
+- Filled-slot line was rendering as raw HTML text (`</span><span style='...'>`) instead of styled output — Streamlit's `$...$` LaTeX-math interpretation ate everything between two unescaped dollar signs in the same markdown call, including the HTML tags. Same known gotcha this file was already patched for elsewhere (see the 2026-08-02 "fix LaTeX-dollar caption bug" entry) — missed it in new code, now escaped throughout (`\$` everywhere a markdown/caption call has a dollar sign).
+- The one slot actually being watched right now (not every future slot) gets a live proximity bar toward its cascade trigger, matching Slot 1's pre-entry bar style.
+- New **"Selling:"** line: shows an arm-progress bar while the trailing stop isn't armed yet (with the "a drop just buys more, doesn't sell" caveat spelled out), and once armed, the real breakeven-floored stop price and live distance to it.
+- Removed the old unconditional "Trail stop $X (5% below HWM)" caption — it implied an active stop before the trail actually arms, which is exactly what confused the "how does this sell if we're already up" question below.
+- Added glossary entries for Trail Arm %, Cascade Add, Capitulation Stop — the glossary only ever described Model 1's simpler always-on trailing stop.
+
+**Model Dashboard (`3_model_dashboard.py`) fixes, same root causes:**
+- "Capital Deployed" metric was truncating (`$20.00 of $10…`) — too wide for a quarter-width `st.metric`. Split into the metric (`$20.00`) plus a caption below (`of $100.00 pool`).
+- Same arm-unaware "Trail Stop" bug as Live Monitor, in two places (the Slot Status current-position card and the Open Positions table). Now shows "Not armed — needs +N% (at +M%)" before arming, real breakeven-floored price after. Required adding `trail_arm_gain_pct` to `load_dashboard_lots()`'s queries in `db.py` (backtest + live-blended) — wasn't being loaded at all before.
+- **Real bug found**: the Model selector was silently defaulting to **Model 2**, not Model 3 (`index=min(1, len-1)` picked list position 1, which happened to be "Model 2"). Fixed to explicitly default to "Model 3" by label match. Data-source toggle now defaults to Live instead of Backtest.
+
+**Stream Tester** now defaults to the "Grid Stacker Blended" stream (the one checked most often) instead of whatever sorted first alphabetically.
+
+**The "4% arm" mechanic, explained and verified against real numbers** (came up via user questions, worth recording): the trailing stop is NOT active until the position's HWM first rises `trail_arm_gain_pct` (4%) above the **blended average cost** — which shifts every time a new cascade slot fills, not the original Slot 1 price. Below that threshold, a price drop only triggers the next cascade buy, never a sale — nothing is watching for an exit at all. Once armed (permanently — HWM never decreases), the stop is `max(HWM × (1 − 5%), avg_cost / (1 − taker_fee))` — the breakeven floor wins immediately after arming, and the plain 5%-trailing calc only takes over once price has climbed further (~$66,657 for the current position, vs. arm at ~$65,335). Caveat for the record: the breakeven floor only backs out the exit-side fee, not the entry-side fee already paid, so "never sells at a loss" is very close but not literally penny-perfect.
+
+**New "Live Sync" timeframe presets** (`timeframe_presets` table + `src/data/seed_presets.sql`, so they survive a DB rebuild) — open-ended windows starting at each model's real go-live date, meant to be re-run anytime to confirm the backtester still reproduces what the live account actually did:
+- **Model 3 Live Sync** (2026-08-02 →): re-run confirmed it reproduces Model 3's real first trade exactly — same entry candle, same still-open/unarmed status.
+- **Model 1 Live Sync** (2026-07-03 →): sanity-checked via CLI (not saved) — **all three Model 1 streams show 0 trades** since go-live, including Breakout Scout, which has a real open live position. Consistent with the user's own prior conclusion that that position was accidental/not a legitimate signal fire (already investigated in an earlier session, not reopened here) — but worth noting since it's the first real example of this preset catching a live/backtest divergence.
+- `seed_presets.sql` also gained `Primary v2`, which existed in the DB already but was never added to this seed file (found while adding the two new ones).
+
+**Also:** restarted the Streamlit dev server — it had been running continuously since **July 26** with no restart, which was very likely the cause of reported sluggishness/UI-stuck symptoms (confirmed the process itself uses trivial memory; broader system memory pressure was unrelated Chrome/VS Code processes with the same multi-week uptime, not this app).
+
+**Deployed:** `main` only (`c90aade`) — this is all Streamlit app/dashboard code plus one DB seed-data change, not live executor code, so no cherry-pick to `live-model-1`/`live-model-3` needed. Both `timeframe_presets` rows already exist directly in local Postgres (via psql, not just the seed file).
 
 ---
 
