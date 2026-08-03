@@ -15,8 +15,16 @@ from src.live import notifier
 
 log = logging.getLogger(__name__)
 
-MAKER_FEE = 0.0025   # 0.25% — limit entry
-TAKER_FEE = 0.0040   # 0.40% — market exit
+# Kraken's lowest volume tier (confirmed via TradeVolume API 2026-08-03,
+# tiervolume=0, nextvolume=$2500/30d) -- both models' accounts start here.
+# Fees step down as 30-day volume crosses $2,500 (taker -> 0.60% next tier).
+# Re-check via `kraken._api.query_private('TradeVolume', {'pair': 'XXBTZUSD'})`
+# if volume has grown, rather than assuming this is still current.
+MAKER_FEE = 0.0040   # 0.40% — limit entry (real rate, was wrongly 0.25%)
+TAKER_FEE = 0.0080   # 0.80% — market exit (real rate, was wrongly 0.40% --
+                     # confirmed directly from Model 3's first real fill: $0.16
+                     # fee on a $20.00005 trade = exactly 0.80%, and it was a
+                     # taker fill despite being placed as a "limit" order)
 
 
 def _tf_minutes(tf: str) -> int:
