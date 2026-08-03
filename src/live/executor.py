@@ -60,7 +60,13 @@ def _get_engine():
         )
     if url.startswith("postgresql://") and "+psycopg2" not in url:
         url = url.replace("postgresql://", "postgresql+psycopg2://", 1)
-    return create_engine(url)
+    # Without these, a stalled connection or a locked/slow query blocks with zero
+    # output until the CI job's own timeout kills it minutes later (see the
+    # 2026-08-03 Model 1 run that sat silent for 5 minutes with no log lines at
+    # all -- not even "Loaded N streams", which comes before any of the new
+    # freshness-guard code runs). Bounded here instead: a stuck connection or
+    # query now fails fast with a clear error.
+    return create_engine(url, connect_args={"connect_timeout": 10})
 
 
 def _candle_closed_between(last: datetime, now: datetime, tf_hours: int) -> bool:
@@ -274,6 +280,7 @@ def run(dry_run: bool = False) -> None:
     now = datetime.now(timezone.utc)
 
     with engine.begin() as conn:
+        conn.execute(text("SET statement_timeout = '15s'"))
         streams = _load_streams(conn)
         if not streams:
             log.error(f"No active streams found for Model {LIVE_MODEL_VERSION}. Run deploy.py first.")

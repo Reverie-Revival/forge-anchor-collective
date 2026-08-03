@@ -64,7 +64,9 @@ def _get_engine():
         )
     if url.startswith("postgresql://") and "+psycopg2" not in url:
         url = url.replace("postgresql://", "postgresql+psycopg2://", 1)
-    return create_engine(url)
+    # See executor.py's _get_engine -- a stalled connection or locked/slow query
+    # otherwise blocks with zero output until the CI job's own timeout kills it.
+    return create_engine(url, connect_args={"connect_timeout": 10})
 
 
 def _load_streams(conn) -> dict:
@@ -228,6 +230,7 @@ def run(dry_run: bool = False) -> None:
     now = datetime.now(timezone.utc)
 
     with engine.begin() as conn:
+        conn.execute(text("SET statement_timeout = '15s'"))
         streams = _load_streams(conn)
         if not streams:
             log.error(f"No active streams found for Model {LIVE_MODEL_VERSION}. Run deploy_model3.py first.")
