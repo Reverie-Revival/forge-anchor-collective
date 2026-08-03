@@ -177,7 +177,8 @@ def load_blended_positions(model_id, status):
         SELECT bp.position_id, ls.stream_name, bp.status, bp.original_entry_price,
                bp.avg_cost_basis, bp.total_qty, bp.total_deployed, bp.highest_close,
                bp.capitulation_armed, bp.position_capital_base, bp.opened_at,
-               bp.pending_entry_expiry_at, bp.pending_add_order_id, bp.pending_add_expiry_at,
+               bp.pending_entry_expiry_at, bp.pending_add_order_id, bp.pending_add_index,
+               bp.pending_add_expiry_at,
                bp.exit_price, bp.closing_capital, bp.realized_pnl, bp.exit_reason, bp.closed_at
         FROM live.blended_positions bp
         JOIN live.streams ls ON bp.stream_id = ls.stream_id
@@ -185,6 +186,22 @@ def load_blended_positions(model_id, status):
         ORDER BY bp.created_at DESC
     """, {"mid": model_id, "status": status})
     return pd.DataFrame([dict(r._mapping) for r in rows]) if rows else pd.DataFrame()
+
+
+@st.cache_data(ttl=60)
+def load_blended_stream_params(model_id):
+    """cumulative_drop_pcts / slot_count aren't in load_stream_status()'s
+    output -- needed separately to compute each cascade slot's trigger price."""
+    rows = _q("SELECT parameters, slot_count FROM live.streams WHERE model_id = :mid LIMIT 1", {"mid": model_id})
+    if not rows:
+        return {}
+    params, slot_count = rows[0]
+    return {
+        "slot_count": int(slot_count),
+        "cumulative_drop_pcts": (params.get("position") or {}).get("cumulative_drop_pcts", []),
+        "entry_expiry_candles": (params.get("position") or {}).get("entry_expiry_candles"),
+        "primary_timeframe": params.get("primary_timeframe", "4h"),
+    }
 
 
 @st.cache_data(ttl=60)
@@ -521,6 +538,83 @@ def _pnl_color(val):
     return "color: #4ade80" if val > 0 else ("color: #f87171" if val < 0 else "")
 
 
+def _render_slot_ladder(open_positions, pending_positions, fills, blended_params, current_price, entry_condition):
+    """
+    Model 3 is one solo stream, but that stream IS 5 weighted cascade slots --
+    a single per-stream condition card doesn't show which of the 5 have
+    actually filled. Shows each slot's real state: filled (real price/date
+    from live.blended_fills), order placed (awaiting fill, real expiry), not
+    yet triggered (the actual cumulative_drop_pcts trigger price, and how
+    far current price is from it), or -- for slot 1 with no position open
+    yet -- the live fear_dip condition progress bar already computed
+    elsewhere on this page.
+    """
+    slot_total = blended_params.get("slot_count", 5)
+    cum_drops  = blended_params.get("cumulative_drop_pcts", [])
+
+    stacks = pd.concat([open_positions, pending_positions]) if not (open_positions.empty and pending_positions.empty) else pd.DataFrame()
+
+    if stacks.empty:
+        st.caption("No position open. Slot 1 fires on the next entry signal:")
+        if entry_condition:
+            c = entry_condition
+            pct = int(c.get("progress", 1.0 if c["pass"] else 0.0) * 100)
+            bar_color = "#4ade80" if c["pass"] else ("#fbbf24" if pct >= 66 else "#f87171")
+            icon = "✓" if c["pass"] else "✗"
+            st.markdown(
+                f"<div style='margin-bottom:8px'>"
+                f"<div style='display:flex; justify-content:space-between; align-items:baseline; margin-bottom:4px'>"
+                f"<span style='font-size:0.85rem'><span style='color:{bar_color}; font-weight:700'>{icon}</span>&nbsp;Slot 1 — {c['label']}</span>"
+                f"<span style='font-size:0.8rem; color:#aaa'>{c['current']}</span>"
+                f"</div>"
+                f"<div style='background:#2a2a2a; border-radius:4px; height:7px'>"
+                f"<div style='background:{bar_color}; width:{pct}%; height:7px; border-radius:4px'></div>"
+                f"</div></div>",
+                unsafe_allow_html=True,
+            )
+        for n in range(2, slot_total + 1):
+            st.caption(f"Slot {n} — waiting on Slot {n - 1} to fill first")
+        return
+
+    pos = stacks.iloc[0]
+    pos_fills = fills[fills["position_id"] == pos["position_id"]].copy() if not fills.empty else pd.DataFrame()
+    original_entry = float(pos["original_entry_price"]) if pd.notna(pos.get("original_entry_price")) else None
+    pending_add_idx = int(pos["pending_add_index"]) if pd.notna(pos.get("pending_add_index")) else None
+
+    for n in range(1, slot_total + 1):
+        fill_number = n - 1  # fill_number is 0-indexed in the DB (0 = slot 1)
+        fill_row = pos_fills[pos_fills["fill_number"] == fill_number] if not pos_fills.empty else pd.DataFrame()
+
+        c1, c2, c3 = st.columns([1, 2, 4])
+        c1.markdown(f"**Slot {n}**")
+
+        if not fill_row.empty:
+            f = fill_row.iloc[0]
+            c2.markdown("🟢 Filled")
+            c3.caption(f"${float(f['price']):,.2f}  ·  ${float(f['capital']):,.2f}  ·  {_fmt_central(f['filled_at'])}")
+        elif n == 1 and pos["status"] == "PENDING_ENTRY":
+            c2.markdown("🟡 Order Placed")
+            c3.caption(f"Awaiting fill, expires {_fmt_central(pos.get('pending_entry_expiry_at'))}")
+        elif pending_add_idx is not None and pending_add_idx == fill_number:
+            c2.markdown("🟡 Order Placed")
+            c3.caption(f"Awaiting fill, expires {_fmt_central(pos.get('pending_add_expiry_at'))}")
+        elif n >= 2 and original_entry and len(cum_drops) >= n - 1:
+            drop_pct = cum_drops[n - 2]
+            trigger_price = original_entry * (1 - drop_pct / 100)
+            gap_str = ""
+            if current_price:
+                gap = (current_price - trigger_price) / trigger_price * 100
+                gap_str = f"  ·  {gap:+.1f}% away" if gap > 0 else "  ·  trigger cleared, awaiting next tick"
+            c2.markdown("⚪ Not Triggered")
+            c3.caption(f"Needs price ≤ ${trigger_price:,.2f} ({drop_pct}% below Slot 1){gap_str}")
+        else:
+            c2.markdown("⚪ Waiting")
+            c3.caption("—")
+
+    if pos["capitulation_armed"]:
+        st.warning("⚠️ All slots filled — capitulation stop is now armed (no more room to average down).")
+
+
 # ── Model selector + refresh ─────────────────────────────────────────────────
 
 MODEL_LABELS = {1: "Model 1", 3: "Model 3"}
@@ -553,6 +647,7 @@ if IS_BLENDED:
     all_position_ids  = tuple(pd.concat([open_positions, pending_positions])["position_id"]) if not (open_positions.empty and pending_positions.empty) else tuple()
     fills             = load_blended_fills(all_position_ids)
     capital_info      = load_blended_capital(SELECTED_MODEL_ID)
+    blended_params    = load_blended_stream_params(SELECTED_MODEL_ID)
     open_count        = len(open_positions)
     pending_count     = len(pending_positions) + int((open_positions["pending_add_order_id"].notna()).sum()) if not open_positions.empty else len(pending_positions)
     total_pnl         = closed_positions["realized_pnl"].sum() if not closed_positions.empty else 0.0
@@ -721,9 +816,12 @@ else:
 
 st.divider()
 
-# ── Section 3: Stream Status ──────────────────────────────────────────────────
+# ── Section 3: Stream Status / Slot Status ────────────────────────────────────
 
-st.markdown('<p class="section-label">Stream Status</p>', unsafe_allow_html=True)
+st.markdown(
+    f'<p class="section-label">{"Slot Status" if IS_BLENDED else "Stream Status"}</p>',
+    unsafe_allow_html=True,
+)
 
 if not stream_statuses:
     st.caption("No stream data available.")
@@ -755,23 +853,27 @@ else:
                 unsafe_allow_html=True,
             )
 
-        for c in ss["conditions"]:
-            pct = int(c.get("progress", 1.0 if c["pass"] else 0.0) * 100)
-            bar_color = "#4ade80" if c["pass"] else ("#fbbf24" if pct >= 66 else "#f87171")
-            icon = "✓" if c["pass"] else "✗"
-            note_part = f" <span style='color:#666; font-size:0.75rem'>— {c['note']}</span>" if c.get("note") else ""
-            st.markdown(
-                f"<div style='margin-bottom:12px'>"
-                f"<div style='display:flex; justify-content:space-between; align-items:baseline; margin-bottom:4px'>"
-                f"<span style='font-size:0.85rem'><span style='color:{bar_color}; font-weight:700'>{icon}</span>&nbsp;{c['label']}{note_part}</span>"
-                f"<span style='font-size:0.8rem; color:#aaa'>{c['current']}</span>"
-                f"</div>"
-                f"<div style='background:#2a2a2a; border-radius:4px; height:7px'>"
-                f"<div style='background:{bar_color}; width:{pct}%; height:7px; border-radius:4px'></div>"
-                f"</div>"
-                f"</div>",
-                unsafe_allow_html=True,
-            )
+        if IS_BLENDED:
+            entry_condition = ss["conditions"][0] if ss["conditions"] else None
+            _render_slot_ladder(open_positions, pending_positions, fills, blended_params, current_price, entry_condition)
+        else:
+            for c in ss["conditions"]:
+                pct = int(c.get("progress", 1.0 if c["pass"] else 0.0) * 100)
+                bar_color = "#4ade80" if c["pass"] else ("#fbbf24" if pct >= 66 else "#f87171")
+                icon = "✓" if c["pass"] else "✗"
+                note_part = f" <span style='color:#666; font-size:0.75rem'>— {c['note']}</span>" if c.get("note") else ""
+                st.markdown(
+                    f"<div style='margin-bottom:12px'>"
+                    f"<div style='display:flex; justify-content:space-between; align-items:baseline; margin-bottom:4px'>"
+                    f"<span style='font-size:0.85rem'><span style='color:{bar_color}; font-weight:700'>{icon}</span>&nbsp;{c['label']}{note_part}</span>"
+                    f"<span style='font-size:0.8rem; color:#aaa'>{c['current']}</span>"
+                    f"</div>"
+                    f"<div style='background:#2a2a2a; border-radius:4px; height:7px'>"
+                    f"<div style='background:{bar_color}; width:{pct}%; height:7px; border-radius:4px'></div>"
+                    f"</div>"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
         st.divider()
 
 # ── Section 4: Executor Run Log ───────────────────────────────────────────────
