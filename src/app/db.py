@@ -237,6 +237,7 @@ def load_stream_history(stream_config_id: int = None) -> pd.DataFrame:
                     st.annualized_return_pct, st.avg_winner_pct, st.avg_loser_pct,
                     st.profit_factor, st.max_drawdown_pct, st.avg_hold_candles,
                     st.notes, st.saved_at,
+                    st.fee_maker_pct, st.fee_taker_pct,
                     COALESCE(
                         tp.name,
                         TO_CHAR(st.custom_start, 'Mon YYYY') || ' → ' ||
@@ -325,6 +326,8 @@ def save_stream_test(
             "dd":     metrics["max_drawdown_pct"],
             "ah":     metrics["avg_hold_candles"],
             "notes":  notes,
+            "fmk":    result.get("maker_fee"),
+            "ftk":    result.get("taker_fee"),
         }
 
         if existing:
@@ -338,7 +341,8 @@ def save_stream_test(
                     total_return_pct = :tr, annualized_return_pct = :ar,
                     avg_winner_pct = :aw, avg_loser_pct = :al,
                     profit_factor = :pf, max_drawdown_pct = :dd,
-                    avg_hold_candles = :ah, notes = :notes, saved_at = NOW()
+                    avg_hold_candles = :ah, notes = :notes, saved_at = NOW(),
+                    fee_maker_pct = :fmk, fee_taker_pct = :ftk
                 WHERE test_id = :tid
             """), {**vals, "tid": test_id})
         else:
@@ -352,7 +356,8 @@ def save_stream_test(
                     parameters, initial_capital, ending_balance,
                     total_trades, win_rate, total_pnl, total_return_pct,
                     annualized_return_pct, avg_winner_pct, avg_loser_pct,
-                    profit_factor, max_drawdown_pct, avg_hold_candles, notes
+                    profit_factor, max_drawdown_pct, avg_hold_candles, notes,
+                    fee_maker_pct, fee_taker_pct
                 ) VALUES (
                     :cid,
                     :sname, :sver, :rnum,
@@ -362,7 +367,8 @@ def save_stream_test(
                     :params, :ic, :eb,
                     :tt, :wr, :tp, :tr,
                     :ar, :aw, :al,
-                    :pf, :dd, :ah, :notes
+                    :pf, :dd, :ah, :notes,
+                    :fmk, :ftk
                 ) RETURNING test_id
             """), vals)
             test_id = row.scalar()
@@ -489,6 +495,7 @@ def load_model_history(model_id: int = None) -> pd.DataFrame:
                     mt.win_rate, mt.total_pnl, mt.total_return_pct,
                     mt.annualized_return_pct, mt.max_drawdown_pct,
                     mt.notes, mt.created_at,
+                    mt.fee_maker_pct, mt.fee_taker_pct,
                     COALESCE(
                         tp.name,
                         TO_CHAR(mt.custom_start, 'Mon YYYY') || ' → ' ||
@@ -856,6 +863,7 @@ def load_dashboard_model_tests(model_id: int) -> pd.DataFrame:
                     ) AS timeframe_label,
                     mt.annualized_return_pct, mt.total_trades, mt.total_pnl,
                     mt.simulation_start, mt.simulation_end, mt.notes,
+                    mt.fee_maker_pct, mt.fee_taker_pct,
                     EXISTS (
                         SELECT 1 FROM backtest.lots bl WHERE bl.model_test_id = mt.model_test_id
                     ) AS has_lots
@@ -876,6 +884,15 @@ def save_model_test(
     notes: str = "",
     history: pd.DataFrame = None,
 ) -> tuple:
+    """
+    Save (or replace) a model test result.
+    Dedup key: (model_id, run_number, preset_id) for preset runs,
+               (model_id, run_number, custom_start, custom_end) for custom.
+    run_number is derived from the allocation hash (next_model_run_number),
+    so re-running the same composition on the same timeframe replaces the
+    existing row in place instead of piling up a duplicate -- same pattern
+    as save_stream_test. Re-seeds backtest.lots to match.
+    """
     engine   = get_local_engine()
     cm       = payload["combined_metrics"]
     alloc    = payload["allocations"]
@@ -885,45 +902,83 @@ def save_model_test(
     run_num       = next_model_run_number(model_id, ah)
     configuration = json.dumps({"allocations": alloc})
 
+    vals = {
+        "model_id":             model_id,
+        "run_number":           run_num,
+        "preset_id":            preset_id,
+        "custom_start":         custom_start,
+        "custom_end":           custom_end,
+        "simulation_start":     payload["start"],
+        "simulation_end":       payload["end"],
+        "configuration":        configuration,
+        "total_capital":        payload["total_capital"],
+        "ending_balance":       payload["total_capital"] + (cm["total_pnl"] or 0),
+        "total_trades":         cm["total_trades"],
+        "win_rate":             cm["win_rate"],
+        "total_pnl":            cm["total_pnl"],
+        "total_return_pct":     cm["total_return_pct"],
+        "annualized_return_pct": cm["annualized_return_pct"],
+        "max_drawdown_pct":     cm["max_drawdown_pct"],
+        "notes":                notes,
+        "fee_maker_pct":        payload.get("maker_fee"),
+        "fee_taker_pct":        payload.get("taker_fee"),
+    }
+
     with engine.connect() as conn:
-        row = conn.execute(text("""
-            INSERT INTO backtest.model_tests (
-                model_id, run_type, run_number,
-                preset_id, custom_start, custom_end,
-                simulation_start, simulation_end,
-                status, configuration,
-                total_capital, ending_balance,
-                total_trades, win_rate, total_pnl,
-                total_return_pct, annualized_return_pct, max_drawdown_pct, notes
-            ) VALUES (
-                :model_id, 'historical', :run_number,
-                :preset_id, :custom_start, :custom_end,
-                :simulation_start, :simulation_end,
-                'completed', :configuration,
-                :total_capital, :ending_balance,
-                :total_trades, :win_rate, :total_pnl,
-                :total_return_pct, :annualized_return_pct, :max_drawdown_pct, :notes
-            ) RETURNING model_test_id
-        """), {
-            "model_id":             model_id,
-            "run_number":           run_num,
-            "preset_id":            preset_id,
-            "custom_start":         custom_start,
-            "custom_end":           custom_end,
-            "simulation_start":     payload["start"],
-            "simulation_end":       payload["end"],
-            "configuration":        configuration,
-            "total_capital":        payload["total_capital"],
-            "ending_balance":       payload["total_capital"] + (cm["total_pnl"] or 0),
-            "total_trades":         cm["total_trades"],
-            "win_rate":             cm["win_rate"],
-            "total_pnl":            cm["total_pnl"],
-            "total_return_pct":     cm["total_return_pct"],
-            "annualized_return_pct": cm["annualized_return_pct"],
-            "max_drawdown_pct":     cm["max_drawdown_pct"],
-            "notes":                notes,
-        })
-        model_test_id = row.scalar()
+        if preset_id is not None:
+            existing = conn.execute(text("""
+                SELECT model_test_id FROM backtest.model_tests
+                WHERE model_id = :model_id AND run_number = :run_number AND preset_id = :preset_id
+            """), vals).fetchone()
+        else:
+            existing = conn.execute(text("""
+                SELECT model_test_id FROM backtest.model_tests
+                WHERE model_id = :model_id AND run_number = :run_number
+                  AND custom_start = :custom_start
+                  AND custom_end IS NOT DISTINCT FROM :custom_end
+            """), vals).fetchone()
+
+        if existing:
+            model_test_id = existing[0]
+            conn.execute(text("""
+                UPDATE backtest.model_tests SET
+                    simulation_start = :simulation_start, simulation_end = :simulation_end,
+                    status = 'completed', configuration = :configuration,
+                    total_capital = :total_capital, ending_balance = :ending_balance,
+                    total_trades = :total_trades, win_rate = :win_rate, total_pnl = :total_pnl,
+                    total_return_pct = :total_return_pct,
+                    annualized_return_pct = :annualized_return_pct,
+                    max_drawdown_pct = :max_drawdown_pct, notes = :notes,
+                    fee_maker_pct = :fee_maker_pct, fee_taker_pct = :fee_taker_pct,
+                    created_at = NOW()
+                WHERE model_test_id = :model_test_id
+            """), {**vals, "model_test_id": model_test_id})
+            conn.execute(text("DELETE FROM backtest.lots WHERE model_test_id = :mtid"),
+                        {"mtid": model_test_id})
+        else:
+            row = conn.execute(text("""
+                INSERT INTO backtest.model_tests (
+                    model_id, run_type, run_number,
+                    preset_id, custom_start, custom_end,
+                    simulation_start, simulation_end,
+                    status, configuration,
+                    total_capital, ending_balance,
+                    total_trades, win_rate, total_pnl,
+                    total_return_pct, annualized_return_pct, max_drawdown_pct, notes,
+                    fee_maker_pct, fee_taker_pct
+                ) VALUES (
+                    :model_id, 'historical', :run_number,
+                    :preset_id, :custom_start, :custom_end,
+                    :simulation_start, :simulation_end,
+                    'completed', :configuration,
+                    :total_capital, :ending_balance,
+                    :total_trades, :win_rate, :total_pnl,
+                    :total_return_pct, :annualized_return_pct, :max_drawdown_pct, :notes,
+                    :fee_maker_pct, :fee_taker_pct
+                ) RETURNING model_test_id
+            """), vals)
+            model_test_id = row.scalar()
+
         _save_lots(conn, model_test_id, model_id, payload.get("stream_results", []))
         conn.commit()
 

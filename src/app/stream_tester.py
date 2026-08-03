@@ -286,14 +286,16 @@ with st.sidebar:
         if pid in saved_preset_ids:
             row = history[history["preset_id"] == pid].iloc[0]
             ann = row["annualized_return_pct"]
+            legacy = pd.isna(row.get("fee_maker_pct")) or pd.isna(row.get("fee_taker_pct"))
+            legacy_tag = "  ⚠️ legacy" if legacy else ""
             _, gl, gc = grade_info(ann if pd.notna(ann) else None)
             st.markdown(
                 f'<span class="grade-badge" style="background:{gc}20;color:{gc};'
                 f'border:1px solid {gc}55;font-size:0.73rem;padding:2px 8px;">'
-                f'✓ {p["name"]}  ·  {ann:+.1f}%</span>' if pd.notna(ann) else
+                f'✓ {p["name"]}  ·  {ann:+.1f}%{legacy_tag}</span>' if pd.notna(ann) else
                 f'<span class="grade-badge" style="background:#33333380;color:#aaa;'
                 f'border:1px solid #55555555;font-size:0.73rem;padding:2px 8px;">'
-                f'✓ {p["name"]}</span>',
+                f'✓ {p["name"]}{legacy_tag}</span>',
                 unsafe_allow_html=True,
             )
         else:

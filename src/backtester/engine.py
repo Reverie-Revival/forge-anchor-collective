@@ -9,21 +9,16 @@ from .indicators import add_indicators, resample_ohlcv, _CANDLES_PER_DAY
 from .signals import generate_signals
 from .slot_math import slot_capitals_for
 from src.data.sentiment import load_sentiment
+from src.fees import MAKER_FEE, TAKER_FEE
 
 load_dotenv()
 
-# Kraken's lowest volume tier (confirmed via TradeVolume API 2026-08-03,
-# tiervolume=0, nextvolume=$2500/30d) -- NOT the tier this constant used to
-# assume. Every $100-scale model here starts at this tier; fees step down
-# as 30-day trading volume crosses $2,500 (taker -> 0.60% next tier). Re-check
-# via `kraken._api.query_private('TradeVolume', {'pair': 'XXBTZUSD'})` if
-# volume has grown, rather than assuming this is still current.
-MAKER_FEE = 0.0040  # 0.40% -- limit entry (real rate, was wrongly 0.25%)
-TAKER_FEE = 0.0080  # 0.80% -- market exit (real rate, was wrongly 0.40%)
-
-# Every slot mode here uses a limit order to enter and a market order to exit
-# (see CLAUDE.md "Key Constraints"), so round-trip cost is MAKER_FEE + TAKER_FEE,
-# never a symmetric fee*2 -- a market exit always pays the taker rate.
+# MAKER_FEE/TAKER_FEE come from src/fees.py -- the same values src/live/order_manager.py
+# uses for real trading. Every slot mode here uses a limit order to enter and a
+# market order to exit (see CLAUDE.md "Key Constraints"), so round-trip cost is
+# MAKER_FEE + TAKER_FEE, never a symmetric fee*2 -- a market exit always pays
+# the taker rate. Every function below also accepts maker_fee/taker_fee overrides
+# so a backtest can be re-run under a hypothetical rate without editing code.
 
 # Valid slot modes. 'single' = one slot only.
 # 'staggered'  = N independent slots, round-robin dispatch, optional gap + capital weights.
@@ -110,7 +105,8 @@ def load_market_data(start: str = None, end: str = None) -> pd.DataFrame:
 
 
 def _run_slot(df: pd.DataFrame, signals: pd.Series, params: dict, slot: int,
-              initial_capital: float = 10.0, fee: float = MAKER_FEE) -> list[dict]:
+              initial_capital: float = 10.0,
+              maker_fee: float = MAKER_FEE, taker_fee: float = TAKER_FEE) -> list[dict]:
     """Simulate a single slot. Returns a list of closed trade dicts."""
     position = params.get("position", {})
     trail_pct = position.get("trailing_stop_pct")
@@ -188,7 +184,7 @@ def _run_slot(df: pd.DataFrame, signals: pd.Series, params: dict, slot: int,
                 if gain >= partial["at_gain_pct"] / 100.0:
                     exit_pct = partial["exit_pct"] / 100.0
                     partial_capital = open_trade["capital"] * exit_pct
-                    pnl = partial_capital * gain - partial_capital * (fee + TAKER_FEE)
+                    pnl = partial_capital * gain - partial_capital * (maker_fee + taker_fee)
                     trades.append({
                         "slot": slot,
                         "entry_ts": open_trade["entry_ts"],
@@ -224,7 +220,7 @@ def _run_slot(df: pd.DataFrame, signals: pd.Series, params: dict, slot: int,
 
                 if exit_price:
                     gain = (exit_price - open_trade["entry_price"]) / open_trade["entry_price"]
-                    pnl  = open_trade["capital"] * gain - open_trade["capital"] * (fee + TAKER_FEE)
+                    pnl  = open_trade["capital"] * gain - open_trade["capital"] * (maker_fee + taker_fee)
                     ep   = open_trade["entry_price"]
                     trades.append({
                         "slot":          slot,
@@ -252,7 +248,7 @@ def _run_slot(df: pd.DataFrame, signals: pd.Series, params: dict, slot: int,
     if open_trade:
         last_row = df.iloc[-1]
         gain = (last_row["close"] - open_trade["entry_price"]) / open_trade["entry_price"]
-        pnl  = open_trade["capital"] * gain - open_trade["capital"] * (fee + TAKER_FEE)
+        pnl  = open_trade["capital"] * gain - open_trade["capital"] * (maker_fee + taker_fee)
         ep   = open_trade["entry_price"]
         trades.append({
             "slot":          slot,
@@ -322,7 +318,8 @@ def _run_staggered_slots(
     params: dict,
     slot_count: int,
     total_capital: float,
-    fee: float = MAKER_FEE,
+    maker_fee: float = MAKER_FEE,
+    taker_fee: float = TAKER_FEE,
 ) -> list[dict]:
     """
     Run multiple independent staggered slots.
@@ -411,7 +408,7 @@ def _run_staggered_slots(
                     if gain >= partial_conf["at_gain_pct"] / 100.0:
                         ep = partial_conf["exit_pct"] / 100.0
                         pcap = t["capital"] * ep
-                        pnl = pcap * gain - pcap * (fee + TAKER_FEE)
+                        pnl = pcap * gain - pcap * (maker_fee + taker_fee)
                         all_trades.append({
                             "slot": slot["slot_number"], "entry_ts": t["entry_ts"],
                             "exit_ts": ts, "entry_price": t["entry_price"],
@@ -435,7 +432,7 @@ def _run_staggered_slots(
 
                     if exit_price:
                         gain = (exit_price - t["entry_price"]) / t["entry_price"]
-                        pnl  = t["capital"] * gain - t["capital"] * (fee + TAKER_FEE)
+                        pnl  = t["capital"] * gain - t["capital"] * (maker_fee + taker_fee)
                         ep   = t["entry_price"]
                         all_trades.append({
                             "slot":          slot["slot_number"],
@@ -476,7 +473,7 @@ def _run_staggered_slots(
             last_row = df.iloc[-1]
             ep   = t["entry_price"]
             gain = (last_row["close"] - ep) / ep
-            pnl  = t["capital"] * gain - t["capital"] * (fee + TAKER_FEE)
+            pnl  = t["capital"] * gain - t["capital"] * (maker_fee + taker_fee)
             all_trades.append({
                 "slot":          slot["slot_number"],
                 "entry_ts":      t["entry_ts"],
@@ -499,7 +496,8 @@ def _run_cascade_slots(
     params: dict,
     slot_count: int,
     total_capital: float,
-    fee: float = MAKER_FEE,
+    maker_fee: float = MAKER_FEE,
+    taker_fee: float = TAKER_FEE,
 ) -> list[dict]:
     """
     Cascade DCA entry: Slot 1 fires on the base signal.
@@ -607,7 +605,7 @@ def _run_cascade_slots(
                     if trail_arm_gain_pct:
                         # Once armed, never trail back below breakeven (entry + round-trip fee) —
                         # the arm threshold alone doesn't guarantee that if trail_pct is wide.
-                        breakeven = t["entry_price"] * (1 + fee + TAKER_FEE)
+                        breakeven = t["entry_price"] * (1 + maker_fee + taker_fee)
                         trail_stop = max(trail_stop, breakeven)
                 else:
                     trail_stop = None
@@ -642,7 +640,7 @@ def _run_cascade_slots(
 
                     if exit_price:
                         gain = (exit_price - t["entry_price"]) / t["entry_price"]
-                        pnl  = t["capital"] * gain - t["capital"] * (fee + TAKER_FEE)
+                        pnl  = t["capital"] * gain - t["capital"] * (maker_fee + taker_fee)
                         ep   = t["entry_price"]
                         all_trades.append({
                             "slot":          slot["slot_number"],
@@ -693,7 +691,7 @@ def _run_cascade_slots(
             last_row = df.iloc[-1]
             ep       = t["entry_price"]
             gain     = (last_row["close"] - ep) / ep
-            pnl      = t["capital"] * gain - t["capital"] * (fee + TAKER_FEE)
+            pnl      = t["capital"] * gain - t["capital"] * (maker_fee + taker_fee)
             all_trades.append({
                 "slot":          slot["slot_number"],
                 "entry_ts":      t["entry_ts"],
@@ -718,7 +716,8 @@ def _run_blended_slots(
     params: dict,
     slot_count: int,
     total_capital: float,
-    fee: float = MAKER_FEE,
+    maker_fee: float = MAKER_FEE,
+    taker_fee: float = TAKER_FEE,
 ) -> list[dict]:
     """
     Blended-average DCA: ONE position, not N independent trades.
@@ -782,7 +781,7 @@ def _run_blended_slots(
         if pending_entry and not position_open:
             lp, ttl = pending_entry
             if row["low"] <= lp <= row["high"]:
-                qty = (slot_capitals[0] * (1 - fee)) / lp
+                qty = (slot_capitals[0] * (1 - maker_fee)) / lp
                 fills = [(lp, slot_capitals[0], qty, ts)]
                 position_open = True
                 original_entry_price = lp
@@ -798,7 +797,7 @@ def _run_blended_slots(
         if pending_add and position_open:
             lp, ttl, add_idx = pending_add
             if row["low"] <= lp <= row["high"]:
-                qty = (slot_capitals[add_idx] * (1 - fee)) / lp
+                qty = (slot_capitals[add_idx] * (1 - maker_fee)) / lp
                 fills.append((lp, slot_capitals[add_idx], qty, ts))
                 pending_add = None
             else:
@@ -819,9 +818,9 @@ def _run_blended_slots(
                 stop_price = highest_close * (1 - trail_pct / 100.0)
                 if trail_arm_gain_pct:
                     # avg_ep already has the buy-side fee baked in (qty was reduced by
-                    # (1-fee) at each fill), so only the sell-side (taker, market order)
-                    # fee needs pricing in here.
-                    breakeven = avg_ep / (1 - TAKER_FEE)
+                    # (1-maker_fee) at each fill), so only the sell-side (taker, market
+                    # order) fee needs pricing in here.
+                    breakeven = avg_ep / (1 - taker_fee)
                     stop_price = max(stop_price, breakeven)
 
             # Capitulation backstop: only once every slot is filled (out of ammo -- no
@@ -844,7 +843,7 @@ def _run_blended_slots(
             if effective_stop is not None and row["low"] <= effective_stop:
                 exit_price = effective_stop
                 gross = total_qty() * exit_price
-                pnl   = gross * (1 - TAKER_FEE) - total_deployed()
+                pnl   = gross * (1 - taker_fee) - total_deployed()
                 all_trades.append({
                     "slot":            len(fills),   # num fills THIS position used, not a persistent slot id
                     "entry_ts":        entry_ts,
@@ -888,7 +887,7 @@ def _run_blended_slots(
         last_row  = df.iloc[-1]
         exit_price = last_row["close"]
         gross = total_qty() * exit_price
-        pnl   = gross * (1 - TAKER_FEE) - total_deployed()
+        pnl   = gross * (1 - taker_fee) - total_deployed()
         all_trades.append({
             "slot":            len(fills),
             "entry_ts":        entry_ts,
@@ -917,6 +916,8 @@ def run_backtest(
     slot_mode: str = 'single',
     stream_name: str = "unnamed",
     lot_size_usd: float = 10.0,
+    maker_fee: float = MAKER_FEE,
+    taker_fee: float = TAKER_FEE,
 ) -> dict:
     """
     Run a full backtest for a single stream configuration.
@@ -925,6 +926,9 @@ def run_backtest(
       'single'     — one slot, lot_size_usd capital
       'scale_down' — slot 2 adds when price drops X% below slot 1's entry (see slot2_trigger_pct in params.position)
       'scale_up'   — slot 2 adds when price rises X% above slot 1's entry AND signal fires
+
+    maker_fee/taker_fee default to the real current Kraken rate (src/fees.py) --
+    override to re-run history under a hypothetical rate without editing code.
 
     Returns a dict with trades DataFrame, market data, params, and metadata.
     """
@@ -957,17 +961,22 @@ def run_backtest(
 
     # --- Slot dispatch ---
     if slot_mode == 'staggered' and slot_count >= 2:
-        all_trades = _run_staggered_slots(df, signals, params, slot_count, lot_size_usd)
+        all_trades = _run_staggered_slots(df, signals, params, slot_count, lot_size_usd,
+                                          maker_fee=maker_fee, taker_fee=taker_fee)
     elif slot_mode == 'cascade' and slot_count >= 2:
-        all_trades = _run_cascade_slots(df, signals, params, slot_count, lot_size_usd)
+        all_trades = _run_cascade_slots(df, signals, params, slot_count, lot_size_usd,
+                                        maker_fee=maker_fee, taker_fee=taker_fee)
     elif slot_mode == 'blended' and slot_count >= 2:
-        all_trades = _run_blended_slots(df, signals, params, slot_count, lot_size_usd)
+        all_trades = _run_blended_slots(df, signals, params, slot_count, lot_size_usd,
+                                        maker_fee=maker_fee, taker_fee=taker_fee)
     else:
-        slot1_trades = _run_slot(df, signals, params, slot=1, initial_capital=lot_size_usd)
+        slot1_trades = _run_slot(df, signals, params, slot=1, initial_capital=lot_size_usd,
+                                 maker_fee=maker_fee, taker_fee=taker_fee)
         all_trades = slot1_trades
         if slot_count >= 2 and slot_mode in ('scale_down', 'scale_up'):
             slot2_signals = _derive_slot2_signals(df, slot1_trades, slot_mode, params, signals)
-            slot2_trades  = _run_slot(df, slot2_signals, params, slot=2, initial_capital=lot_size_usd)
+            slot2_trades  = _run_slot(df, slot2_signals, params, slot=2, initial_capital=lot_size_usd,
+                                      maker_fee=maker_fee, taker_fee=taker_fee)
             all_trades    = slot1_trades + slot2_trades
 
     trades_df = pd.DataFrame(all_trades)
@@ -984,4 +993,6 @@ def run_backtest(
         "end":         df.index[-1] if len(df) else end,
         "slot_count":  slot_count,
         "slot_mode":   slot_mode,
+        "maker_fee":   maker_fee,
+        "taker_fee":   taker_fee,
     }

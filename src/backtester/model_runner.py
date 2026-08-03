@@ -27,6 +27,7 @@ from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
 
 from .model_engine import run_model_backtest
+from src.fees import MAKER_FEE, TAKER_FEE
 
 load_dotenv()
 
@@ -90,6 +91,8 @@ def run_model(
     start: str = None,
     end: str = None,
     model_id: int = 1,
+    maker_fee: float = MAKER_FEE,
+    taker_fee: float = TAKER_FEE,
 ) -> dict:
     """
     Run a model-level backtest. Loads locked streams from DB and applies allocations.
@@ -98,6 +101,9 @@ def run_model(
         Keys are stream full names (e.g. "Momentum Rider v1").
         Any key missing from the dict uses the value locked in backtest.streams.
         slot_mode can also be overridden per-stream here for experimentation.
+
+    maker_fee/taker_fee default to the real current Kraken rate (src/fees.py) --
+    override to re-run history under a hypothetical rate without editing code.
     """
     stream_configs = _load_locked_streams(model_id)
 
@@ -118,7 +124,8 @@ def run_model(
         for sc in stream_configs
     }
 
-    payload = run_model_backtest(stream_configs, start=start, end=end)
+    payload = run_model_backtest(stream_configs, start=start, end=end,
+                                 maker_fee=maker_fee, taker_fee=taker_fee)
     payload["model_id"]    = model_id
     payload["allocations"] = effective_alloc
 
@@ -146,6 +153,8 @@ def run_model(
         "win_rate":          f"{cm['win_rate']*100:.1f}%" if cm["win_rate"] else "—",
         "max_drawdown":      f"{cm['max_drawdown_pct']:.1f}%" if cm["max_drawdown_pct"] is not None else "—",
         "btc_bh_annualized": f"{bh['annualized_return_pct']:+.1f}%" if bh.get("annualized_return_pct") else "—",
+        "maker_fee":         payload["maker_fee"],
+        "taker_fee":         payload["taker_fee"],
         "streams": {
             sr["stream_name"]: {
                 "allocation":  f"${sr['lot_size_usd']:.0f}/lot × {sr['slot_count']} slots ({sr['slot_mode']}) = ${sr['initial_capital']:.0f}",

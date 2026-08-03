@@ -6,9 +6,11 @@ import pandas as pd
 
 from .engine import run_backtest
 from .metrics import compute_metrics, btc_buy_and_hold
+from src.fees import MAKER_FEE, TAKER_FEE
 
 
-def run_model_backtest(stream_configs: list, start: str = None, end: str = None) -> dict:
+def run_model_backtest(stream_configs: list, start: str = None, end: str = None,
+                       maker_fee: float = MAKER_FEE, taker_fee: float = TAKER_FEE) -> dict:
     """
     Run a combined model backtest across all streams.
 
@@ -19,6 +21,9 @@ def run_model_backtest(stream_configs: list, start: str = None, end: str = None)
         lot_size_usd (float) — capital per slot
         slot_count   (int)   — max concurrent positions for this stream
         slot_mode    (str)   — 'single' | 'scale_down' | 'scale_up'
+
+    maker_fee/taker_fee default to the real current Kraken rate (src/fees.py) --
+    override to re-run history under a hypothetical rate without editing code.
 
     Returns a combined payload dict with per-stream results and aggregated metrics.
     """
@@ -42,6 +47,8 @@ def run_model_backtest(stream_configs: list, start: str = None, end: str = None)
             slot_mode=sc.get("slot_mode", "single"),
             stream_name=sc["stream_name"],
             lot_size_usd=sc["lot_size_usd"],
+            maker_fee=maker_fee,
+            taker_fee=taker_fee,
         )
         trades  = result["trades"]
         metrics = compute_metrics(trades, initial_capital, result["start"], result["end"])
@@ -94,4 +101,6 @@ def run_model_backtest(stream_configs: list, start: str = None, end: str = None)
         "bh":               bh,
         "start":            period_start,
         "end":              period_end,
+        "maker_fee":        maker_fee,
+        "taker_fee":        taker_fee,
     }

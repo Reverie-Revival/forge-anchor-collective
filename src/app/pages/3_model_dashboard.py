@@ -243,7 +243,11 @@ with st.sidebar:
 
         def _run_label(row):
             ann = f"{row['annualized_return_pct']:+.1f}%" if pd.notna(row["annualized_return_pct"]) else "—"
-            return f"Run {int(row['run_number'])} · {row['timeframe_label']} · {ann}"
+            if pd.notna(row.get("fee_maker_pct")) and pd.notna(row.get("fee_taker_pct")):
+                fee_tag = f"fee {float(row['fee_maker_pct'])*100:.2f}%/{float(row['fee_taker_pct'])*100:.2f}%"
+            else:
+                fee_tag = "legacy — pre fee-tracking"
+            return f"Run {int(row['run_number'])} · {row['timeframe_label']} · {ann} · {fee_tag}"
 
         seeded = seeded.copy()
         seeded["label"] = seeded.apply(_run_label, axis=1)

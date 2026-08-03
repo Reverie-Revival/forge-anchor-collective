@@ -243,6 +243,11 @@ with st.sidebar:
                 parts.append(f"WR {wr*100:.0f}%")
             if tt is not None and pd.notna(tt):
                 parts.append(f"{tt} trades")
+            fmk, ftk = row.get("fee_maker_pct"), row.get("fee_taker_pct")
+            if pd.notna(fmk) and pd.notna(ftk):
+                parts.append(f"fee {float(fmk)*100:.2f}%/{float(ftk)*100:.2f}%")
+            else:
+                parts.append("⚠️ legacy — pre fee-tracking")
             if parts:
                 st.caption("  ·  ".join(parts))
             if row.get("notes"):
