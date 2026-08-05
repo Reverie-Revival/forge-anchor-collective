@@ -710,6 +710,81 @@ def _run_cascade_slots(
     return all_trades
 
 
+def _tilted_slot_weights(base_weights: list, row: pd.Series, tilt_cfg: dict, slot_count: int) -> list:
+    """
+    Experimental: skew slot_capital_weight based on the Fear & Greed reading at
+    the moment a position opens (locked in for that whole cascade, not
+    re-evaluated per fill).
+
+    tilt_cfg:
+      direction: +1 = front-load fear (bet bigger, earlier, on more extreme
+                 fear readings); -1 = back-load fear (reserve capital for
+                 later slots on more extreme fear readings, betting more pain
+                 may be coming). Backtested: -1 (back-load) clearly wins.
+      strength:  0 = no skew (falls back to base_weights); higher = more
+                 aggressive skew. Backtested sweep across 0.2-0.8: 0.4 is the
+                 real peak (0.3-0.4 the sweet spot) -- decays on both sides,
+                 not "more is better."
+      apply_to_slot1: if False (default), slot 1 stays at its base weight and
+                 only slots 2..N are skewed relative to each other -- keeps
+                 the entry itself simple/unconditional. If True, slot 1 is
+                 included in the skew too.
+      trend_sma_period: optional. If set (and filters.trend_context.sma_period
+                 matches, so the column actually gets computed), scales
+                 `strength` by trend_strength_below/trend_strength_above
+                 depending on whether close is below/above that SMA at entry
+                 -- e.g. lean into the tilt harder in a confirmed downtrend
+                 (more room to fall, back-loading matters more) and dampen it
+                 in an uptrend (a dip is more likely shallow).
+      trend_strength_below / trend_strength_above: multipliers on `strength`,
+                 default 1.0 each (no trend adjustment) if trend_sma_period unset.
+
+    fng_value 50 (neutral) always reduces to base_weights regardless of
+    strength; 0 (extreme fear) / 100 (extreme greed) are the max skew.
+    """
+    fng_value = row.get("fng_value")
+    if not tilt_cfg or fng_value is None or (isinstance(fng_value, float) and pd.isna(fng_value)):
+        return base_weights
+
+    direction = tilt_cfg.get("direction", 1)
+    strength  = tilt_cfg.get("strength", 0.4)
+    apply_to_slot1 = tilt_cfg.get("apply_to_slot1", False)
+
+    trend_period = tilt_cfg.get("trend_sma_period")
+    if trend_period:
+        trend_val = row.get(f"trend_sma_{trend_period}")
+        if trend_val is not None and not pd.isna(trend_val):
+            below = row["close"] < trend_val
+            mult = tilt_cfg.get("trend_strength_below", 1.0) if below else tilt_cfg.get("trend_strength_above", 1.0)
+            strength *= mult
+
+    tilt = direction * (50 - fng_value) / 50.0  # + on fear, - on greed (direction can flip this)
+
+    start_idx = 0 if apply_to_slot1 else 1
+    n = slot_count - start_idx
+    if n <= 0:
+        return base_weights
+
+    # symmetric ramp: the earliest affected slot gets the most positive skew,
+    # the latest the most negative, centered on zero so total weight units
+    # shift between slots rather than growing/shrinking outright.
+    ramp = [(n - 1) / 2.0 - j for j in range(n)]
+
+    # Floor: 0.5x a $20 base weight = $10, CLAUDE.md's stated minimum lot size
+    # (Kraken order minimums + round-trip fee drag make anything smaller
+    # impractical). Only exact for the $20/slot base this was tuned against --
+    # a differently-sized base weight would need a different floor to hold the
+    # same real $10 minimum.
+    min_factor = tilt_cfg.get("min_factor", 0.5)
+
+    new_weights = list(base_weights[:slot_count])
+    for j, idx in enumerate(range(start_idx, slot_count)):
+        factor = 1 + strength * tilt * ramp[j]
+        factor = max(factor, min_factor)
+        new_weights[idx] = base_weights[idx] * factor
+    return new_weights
+
+
 def _run_blended_slots(
     df: pd.DataFrame,
     signals: pd.Series,
@@ -736,19 +811,73 @@ def _run_blended_slots(
     The only way this shows a loss is a forced close at the end of the backtest
     window while still underwater and out of slots (same caveat as the
     independent no-stop cascade design).
+
+    Optional capitulation ladder (capitulation_ladder_pcts + _final_cut_pct,
+    mutually exclusive with capitulation_stop_pct -- if both set, the ladder
+    wins). Once all slots are filled, each rung crossed below slot 1's original
+    entry marks down ONE slot's capital (oldest first, no real sale -- shares
+    and real cash deployed are untouched) to what it would be worth at that
+    price. This only lowers the SYNTHETIC average used to gate the
+    arm/breakeven exit, making a partial bounce enough to trigger a real sale
+    instead of requiring a full recovery to the true average. One rung past
+    the last slot being marked is a real, unconditional exit -- same backstop
+    role capitulation_stop_pct plays, just reached after slot_count chances at
+    a smaller bounce-triggered exit instead of a single line.
+
+    Optional sentiment-tilted slot weighting (position["sentiment_tilt"], see
+    _tilted_slot_weights), slot promotion for stagnant positions
+    (slot_promotion_days / max_promotions_per_position), and a shallow
+    breakeven margin (shallow_breakeven_margin_pct / shallow_slot_threshold)
+    that converts an exact-breakeven exit into a small guaranteed gain.
     """
     position           = params.get("position", {})
     cumulative_drops   = position.get("cumulative_drop_pcts", [])  # % below slot1 entry, per add
     trail_pct          = position.get("trailing_stop_pct")
     trail_arm_gain_pct = position.get("trail_arm_gain_pct")
     expiry             = position.get("entry_expiry_candles", 2)
+
+    # Raises the breakeven floor itself by a small guaranteed margin for shallow
+    # positions -- leaves the 5% peak-trail completely untouched, so big winners
+    # are unaffected. Converts the specific dead-zone case (arms, then reverses
+    # before real profit locks in) from exactly $0 to a small guaranteed gain.
+    shallow_breakeven_margin_pct = position.get("shallow_breakeven_margin_pct")
+    shallow_slot_threshold = position.get("shallow_slot_threshold", 3)
+
+    # "Impatience" promotion. cumulative_drops stays the normal trigger sequence,
+    # unchanged in the normal/fast-moving case. slot_promotion_days (e.g.
+    # [10, 20, 30, 40], same shape/indexing as cumulative_drops) gives each not-yet-
+    # filled add a SECOND, easier trigger -- the PRIOR slot's normal (not promoted)
+    # threshold -- that activates once the position has been open that many days
+    # without selling and without that slot's own normal trigger firing. Slot 2's
+    # promoted level is 0% (slot 1's own entry). Days are counted from slot 1's
+    # fill, independently per slot -- not reset or chained off when an earlier
+    # slot actually promotes or fills. capitulation_stop_pct/the ladder are
+    # unaffected -- still measured off whatever price the last slot actually
+    # filled at, promoted or not.
+    slot_promotion_days = position.get("slot_promotion_days")
+    max_promotions = position.get("max_promotions_per_position")  # None = unlimited
+
     capitulation_stop_pct = position.get("capitulation_stop_pct")  # only armed once ALL slots are filled --
                                                                      # the one backstop for a crash worse than
                                                                      # anything seen historically (out of ammo,
                                                                      # no more room to average down further)
 
+    # Alternative to capitulation_stop_pct (see docstring below): once all slots
+    # fill, progressively mark down the oldest slot's cost basis at each rung
+    # crossed (capitulation_ladder_pcts, one entry per slot) instead of one
+    # single-shot line, with a final unconditional cut past the last rung
+    # (capitulation_ladder_final_cut_pct). Mutually exclusive with
+    # capitulation_stop_pct -- if both are set, the ladder wins.
+    ladder_pcts = position.get("capitulation_ladder_pcts")
+    ladder_final_cut_pct = position.get("capitulation_ladder_final_cut_pct")
+    ladder_enabled = bool(ladder_pcts and ladder_final_cut_pct)
+    if ladder_enabled and len(ladder_pcts) != slot_count:
+        raise ValueError(f"capitulation_ladder_pcts must have {slot_count} entries, got {len(ladder_pcts)}")
+
     weights = (params.get("slots") or {}).get("slot_capital_weight")
+    base_weights = weights if weights and len(weights) >= slot_count else [1] * slot_count
     compound = position.get("compound", False)
+    sentiment_tilt = position.get("sentiment_tilt")  # see _tilted_slot_weights; requires params["sentiment"]=True
 
     available_capital = total_capital  # grows/shrinks as positions close, if compound=True
     slot_capitals = slot_capitals_for(available_capital, weights, slot_count)  # this position's frozen split
@@ -764,6 +893,9 @@ def _run_blended_slots(
     highest_close = None
     entry_ts = None
     candles_held = 0
+    marked_count = 0           # ladder only: how many (oldest-first) slots have been marked down
+    marked_capitals = []       # ladder only: parallel to fills, real capital until marked
+    promotions_used = 0        # slot_promotion_days only: promoted fills used by this position
 
     def total_qty():
         return sum(q for _, _, q, _ in fills)
@@ -809,25 +941,53 @@ def _run_blended_slots(
             highest_close = max(highest_close, row["close"])
             candles_held += 1
             avg_ep = avg_entry_price()
+            synthetic_avg = avg_ep
 
-            gain_pct = (highest_close - avg_ep) / avg_ep * 100
+            # Ladder: once the stack is full, mark down one slot's capital (oldest
+            # first) per step_pct rung crossed -- no real sale, just a lower
+            # reference average that makes the arm/breakeven gate below easier to
+            # clear on a partial bounce. Real deployed capital (used for actual P&L
+            # at exit) is untouched by this.
+            if ladder_enabled and len(fills) == slot_count:
+                if not marked_capitals:
+                    marked_capitals = [c for _, c, _, _ in fills]
+                while marked_count < slot_count:
+                    # rungs are measured below slot 1's original entry, not the last fill --
+                    # e.g. slot 5 already sits 10% below slot 1, so a start_pct of 20 means
+                    # "10% further than where slot 5 filled," not "20% past slot 5."
+                    rung_price = original_entry_price * (1 - ladder_pcts[marked_count] / 100.0)
+                    if row["low"] <= rung_price:
+                        slot_price, slot_capital = fills[marked_count][0], fills[marked_count][1]
+                        marked_capitals[marked_count] = slot_capital * (rung_price / slot_price)
+                        marked_count += 1
+                    else:
+                        break
+                synthetic_avg = sum(marked_capitals) / total_qty()
+
+            gain_pct = (highest_close - synthetic_avg) / synthetic_avg * 100
             armed = (not trail_arm_gain_pct) or gain_pct >= trail_arm_gain_pct
 
+            effective_trail_pct = trail_pct
             stop_price = None
-            if trail_pct and armed:
-                stop_price = highest_close * (1 - trail_pct / 100.0)
+            if effective_trail_pct and armed:
+                stop_price = highest_close * (1 - effective_trail_pct / 100.0)
                 if trail_arm_gain_pct:
-                    # avg_ep already has the buy-side fee baked in (qty was reduced by
-                    # (1-maker_fee) at each fill), so only the sell-side (taker, market
+                    # synthetic_avg already has the buy-side fee baked in (qty was reduced
+                    # by (1-maker_fee) at each fill), so only the sell-side (taker, market
                     # order) fee needs pricing in here.
-                    breakeven = avg_ep / (1 - taker_fee)
+                    breakeven = synthetic_avg / (1 - taker_fee)
+                    if shallow_breakeven_margin_pct and len(fills) <= shallow_slot_threshold:
+                        breakeven *= (1 + shallow_breakeven_margin_pct / 100.0)
                     stop_price = max(stop_price, breakeven)
 
             # Capitulation backstop: only once every slot is filled (out of ammo -- no
-            # more room to average down), a further drop below the LAST fill's price
-            # forces a full exit instead of holding indefinitely into the unknown.
+            # more room to average down), a further drop forces a full exit instead of
+            # holding indefinitely into the unknown. Ladder mode reaches this one step
+            # past the last slot being marked; legacy mode is a single fixed line.
             capitulation_price = None
-            if capitulation_stop_pct and len(fills) == slot_count:
+            if ladder_enabled and len(fills) == slot_count and marked_count == slot_count:
+                capitulation_price = original_entry_price * (1 - ladder_final_cut_pct / 100.0)
+            elif capitulation_stop_pct and len(fills) == slot_count:
                 last_fill_price = fills[-1][0]
                 capitulation_price = last_fill_price * (1 - capitulation_stop_pct / 100.0)
 
@@ -838,7 +998,7 @@ def _run_blended_slots(
                     # only the capitulation stop is active (still underwater), or it's
                     # the more conservative of the two -- either way it's the one that fires
                     effective_stop = capitulation_price
-                    exit_reason_override = "capitulation_stop"
+                    exit_reason_override = "capitulation_ladder_cut" if ladder_enabled else "capitulation_stop"
 
             if effective_stop is not None and row["low"] <= effective_stop:
                 exit_price = effective_stop
@@ -859,11 +1019,15 @@ def _run_blended_slots(
                     "fill_timestamps": [ft for _, _, _, ft in fills],
                     "fill_capitals":   [c for _, c, _, _ in fills],
                     "fill_qtys":       [q for _, _, q, _ in fills],
+                    "marked_slots_used": marked_count if ladder_enabled else None,
                 })
                 position_open = False
                 fills = []
                 original_entry_price = None
                 pending_add = None
+                marked_count = 0
+                marked_capitals = []
+                promotions_used = 0
                 if compound:
                     available_capital += pnl
             else:
@@ -871,14 +1035,27 @@ def _run_blended_slots(
                 # it still has to actually get touched within `expiry` candles, same as slot 1
                 next_idx = len(fills)  # number filled so far == index of the next add
                 if next_idx < slot_count and (next_idx - 1) < len(cumulative_drops) and pending_add is None:
-                    trigger_price = original_entry_price * (1 - cumulative_drops[next_idx - 1] / 100.0)
+                    trigger_pct = cumulative_drops[next_idx - 1]
+                    can_promote = max_promotions is None or promotions_used < max_promotions
+                    if slot_promotion_days and can_promote and (next_idx - 1) < len(slot_promotion_days):
+                        days_open = (ts - entry_ts).total_seconds() / 86400
+                        if days_open >= slot_promotion_days[next_idx - 1]:
+                            # prior slot's own normal threshold (0% for slot 2, promoting off slot 1)
+                            trigger_pct = cumulative_drops[next_idx - 2] if next_idx >= 2 else 0.0
+                            promotions_used += 1
+                    trigger_price = original_entry_price * (1 - trigger_pct / 100.0)
                     if row["close"] <= trigger_price and slot_capitals[next_idx] > 0.01:
                         pending_add = (row["close"], expiry, next_idx)
 
         # --- slot 1: base signal entry ---
         if not position_open and pending_entry is None and signals.iloc[i]:
-            if compound:
-                slot_capitals = slot_capitals_for(available_capital, weights, slot_count)  # re-split using latest capital
+            if compound or sentiment_tilt:
+                capital_base = available_capital if compound else total_capital
+                effective_weights = (
+                    _tilted_slot_weights(base_weights, row, sentiment_tilt, slot_count)
+                    if sentiment_tilt else weights
+                )
+                slot_capitals = slot_capitals_for(capital_base, effective_weights, slot_count)
             if slot_capitals[0] > 0.01:
                 pending_entry = (row["close"], expiry)
 
