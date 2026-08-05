@@ -51,7 +51,7 @@ def render_dashboard(payload: dict, show_save: bool = False, key_prefix: str = "
         )
         st.caption(
             f"{period_str}  ·  {tf} candles  ·  {slot_desc}  ·  "
-            f"{result['signals'].sum()} signals  ·  {trade_count_str}"
+            f"{result['signals']} signals  ·  {trade_count_str}"
         )
     with col_grade:
         st.markdown(
@@ -368,10 +368,18 @@ def render_dashboard(payload: dict, show_save: bool = False, key_prefix: str = "
             st.info("MAE/MFE data not available for this run — use ↺ Re-run All Presets to generate it.")
 
     trade_log_title = f"Trade Log ({trade_count_str})" if has_trades else "Trade Log"
-    with st.expander(trade_log_title, expanded=False):
-        if slot_mode == "blended" and "fill_prices" in closed.columns:
+
+    if slot_mode == "blended" and "fill_prices" in closed.columns:
+        # Unlike st.expander, code inside a closed one still runs every rerun --
+        # for a blended stream that's one nested st.expander + several st.metric
+        # calls PER TRADE (481 trades measured at ~7s total vs ~1.3s without this
+        # section). Gate it behind an explicit checkbox so it only gets built
+        # when actually wanted, not on every Stream/Config/Preset switch.
+        show_log = st.checkbox(f"📋 {trade_log_title}", key=f"{key_prefix}_show_blend_log")
+        if show_log:
             _render_blended_trade_log(closed, c_hrs, key_prefix)
-        else:
+    else:
+        with st.expander(trade_log_title, expanded=False):
             log = closed.copy()
             log["btc_bought"]   = (log["capital"] / log["entry_price"]).round(6)
             log["start_value"]  = log["capital"].round(2)

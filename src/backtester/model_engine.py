@@ -63,6 +63,12 @@ def run_model_backtest(stream_configs: list, start: str = None, end: str = None,
             t["stream_id"]   = sc["stream_id"]
             all_trade_frames.append(t)
 
+        # Drop the raw OHLCV dataframe before storing -- nothing downstream
+        # reads it back, and it multiplies with stream count (each stream
+        # would otherwise carry its own full-history copy into the saved pkl).
+        result_light = {k: v for k, v in result.items() if k != "df"}
+        result_light["signals"] = int(result["signals"].sum())
+
         stream_results.append({
             "stream_id":        sc["stream_id"],
             "stream_config_id": sc.get("stream_config_id"),
@@ -72,7 +78,7 @@ def run_model_backtest(stream_configs: list, start: str = None, end: str = None,
             "slot_mode":       sc.get("slot_mode", "single"),
             "initial_capital": initial_capital,
             "ending_balance":  ending_balance,
-            "result":          result,
+            "result":          result_light,
             "trades":          trades,
             "metrics":         metrics,
         })

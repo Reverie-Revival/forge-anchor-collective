@@ -337,13 +337,18 @@ def _run_and_save(cfg: dict, preset: dict, initial_capital: float = None) -> dic
     ending  = initial_capital + (metrics["total_pnl"] or 0)
     bh      = btc_buy_and_hold(result["df"], initial_capital)
 
+    # Drop the raw OHLCV dataframe before persisting -- render_dashboard never
+    # reads it, and it's most of a saved run's size (up to ~9MB/pkl, x 200+
+    # saved runs). Keep the signal count, not the full boolean series.
+    result_light = {k: v for k, v in result.items() if k != "df"}
+    result_light["signals"] = int(result["signals"].sum())
+
     payload = {
         "stream_name":      cfg["stream_name"],
         "stream_config_id": cfg["stream_config_id"],
         "params":           p,
-        "result":           result,
+        "result":           result_light,
         "trades":           result["trades"],
-        "df":               result["df"],
         "metrics":          metrics,
         "bh":               bh,
         "initial_capital":  initial_capital,
@@ -355,7 +360,7 @@ def _run_and_save(cfg: dict, preset: dict, initial_capital: float = None) -> dic
     save_stream_test(
         stream_config_id = cfg["stream_config_id"],
         params           = p,
-        result           = result,
+        result           = result_light,
         metrics          = metrics,
         initial_capital  = initial_capital,
         ending_balance   = ending,
@@ -419,80 +424,88 @@ if not tab_entries:
     st.info("No presets configured. Add presets in the database to run tests.")
     st.stop()
 
-tabs = st.tabs([e["label"] for e in tab_entries])
+# A single-select control instead of st.tabs -- Streamlit renders every
+# st.tabs() body on every rerun regardless of which tab is visible, so with
+# heavy per-preset payloads (unpickle + full chart build), switching Stream
+# or Config Version was paying that cost N times (once per preset) instead
+# of once. Keyed on the config so switching configs resets to the first entry.
+labels = [e["label"] for e in tab_entries]
+selected_label = st.segmented_control(
+    "Preset", labels, default=labels[0],
+    key=f"preset_select_{selected_config_id}", label_visibility="collapsed",
+)
+entry = next((e for e in tab_entries if e["label"] == selected_label), tab_entries[0])
 
-for tab, entry in zip(tabs, tab_entries):
-    with tab:
-        existing = entry.get("existing")
+existing = entry.get("existing")
 
-        if existing is not None:
-            test_id = int(existing["test_id"])
-            payload = load_run_payload(test_id)
+if existing is not None:
+    test_id = int(existing["test_id"])
+    payload = load_run_payload(test_id)
 
-            if payload is not None:
-                render_dashboard(payload, show_save=False,
-                                 key_prefix=f"cfg_{selected_config_id}_t{test_id}")
-                if entry["type"] == "preset" and st.button(
-                    "↺ Re-run this preset", key=f"rerun_existing_{test_id}"
-                ):
-                    with st.spinner(f"Re-running {entry['preset']['name']}…"):
-                        try:
-                            _run_and_save(selected_config, entry["preset"])
-                            st.cache_data.clear()
-                            st.rerun()
-                        except Exception as e:
-                            st.error(str(e))
-            else:
-                # No pkl — show DB summary
-                ann = existing.get("annualized_return_pct")
-                pf  = existing.get("profit_factor")
-                dd  = existing.get("max_drawdown_pct")
-                wr  = existing.get("win_rate")
-                _, gl, gc = grade_info(ann if pd.notna(ann) else None)
-                st.markdown(
-                    f'<span class="grade-badge" style="background:{gc}22;color:{gc};'
-                    f'border:1px solid {gc}66;font-size:1rem;">{gl}</span>',
-                    unsafe_allow_html=True,
-                )
-                sim_s = str(existing.get("simulation_start") or "")[:10]
-                sim_e = str(existing.get("simulation_end")   or "")[:10]
-                st.caption(
-                    f"{selected_stream_name} {selected_config['version']}  ·  {sim_s} → {sim_e}"
-                )
-                st.divider()
-                c1, c2, c3, c4 = st.columns(4)
-                c1.metric("Annualized Return", f"{ann:+.1f}%" if pd.notna(ann) else "—")
-                c2.metric("Profit Factor",     f"{pf:.2f}"    if pd.notna(pf)  else "—")
-                c3.metric("Max Drawdown",      f"{dd:.1f}%"   if pd.notna(dd)  else "—")
-                c4.metric("Win Rate",          f"{wr*100:.0f}%" if pd.notna(wr) else "—")
+    if payload is not None:
+        render_dashboard(payload, show_save=False,
+                         key_prefix=f"cfg_{selected_config_id}_t{test_id}")
+        if entry["type"] == "preset" and st.button(
+            "↺ Re-run this preset", key=f"rerun_existing_{test_id}"
+        ):
+            with st.spinner(f"Re-running {entry['preset']['name']}…"):
+                try:
+                    _run_and_save(selected_config, entry["preset"])
+                    st.cache_data.clear()
+                    st.rerun()
+                except Exception as e:
+                    st.error(str(e))
+    else:
+        # No pkl — show DB summary
+        ann = existing.get("annualized_return_pct")
+        pf  = existing.get("profit_factor")
+        dd  = existing.get("max_drawdown_pct")
+        wr  = existing.get("win_rate")
+        _, gl, gc = grade_info(ann if pd.notna(ann) else None)
+        st.markdown(
+            f'<span class="grade-badge" style="background:{gc}22;color:{gc};'
+            f'border:1px solid {gc}66;font-size:1rem;">{gl}</span>',
+            unsafe_allow_html=True,
+        )
+        sim_s = str(existing.get("simulation_start") or "")[:10]
+        sim_e = str(existing.get("simulation_end")   or "")[:10]
+        st.caption(
+            f"{selected_stream_name} {selected_config['version']}  ·  {sim_s} → {sim_e}"
+        )
+        st.divider()
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Annualized Return", f"{ann:+.1f}%" if pd.notna(ann) else "—")
+        c2.metric("Profit Factor",     f"{pf:.2f}"    if pd.notna(pf)  else "—")
+        c3.metric("Max Drawdown",      f"{dd:.1f}%"   if pd.notna(dd)  else "—")
+        c4.metric("Win Rate",          f"{wr*100:.0f}%" if pd.notna(wr) else "—")
 
-                # Re-run button for missing pkl
-                if entry["type"] == "preset" and st.button(
-                    "↺ Re-run to restore charts", key=f"rerun_{test_id}"
-                ):
-                    with st.spinner("Running…"):
-                        try:
-                            payload = _run_and_save(selected_config, entry["preset"])
-                            st.cache_data.clear()
-                            st.rerun()
-                        except Exception as e:
-                            st.error(str(e))
+        # Re-run button for missing pkl
+        if entry["type"] == "preset" and st.button(
+            "↺ Re-run to restore charts", key=f"rerun_{test_id}"
+        ):
+            with st.spinner("Running…"):
+                try:
+                    payload = _run_and_save(selected_config, entry["preset"])
+                    st.cache_data.clear()
+                    st.rerun()
+                except Exception as e:
+                    st.error(str(e))
 
-        else:
-            # Not run yet
-            st.markdown(
-                '<div style="color:#666; font-size:0.9rem; padding:24px 0">'
-                'This preset has not been run yet for this config.'
-                '</div>',
-                unsafe_allow_html=True,
-            )
-            if entry["type"] == "preset" and st.button(
-                f"▶ Run {entry['preset']['name']}", key=f"run_{entry['preset']['preset_id']}"
-            ):
-                with st.spinner(f"Running {entry['preset']['name']}…"):
-                    try:
-                        _run_and_save(selected_config, entry["preset"])
-                        st.cache_data.clear()
-                        st.rerun()
-                    except Exception as e:
-                        st.error(str(e))
+else:
+    # Not run yet
+    st.markdown(
+        '<div style="color:#666; font-size:0.9rem; padding:24px 0">'
+        'This preset has not been run yet for this config.'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+    if entry["type"] == "preset" and st.button(
+        f"▶ Run {entry['preset']['name']}", key=f"run_{entry['preset']['preset_id']}"
+    ):
+        with st.spinner(f"Running {entry['preset']['name']}…"):
+            try:
+                _run_and_save(selected_config, entry["preset"])
+                st.cache_data.clear()
+                st.rerun()
+            except Exception as e:
+                st.error(str(e))
