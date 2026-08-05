@@ -143,6 +143,7 @@ def load_stream_configs(stream_id: int = None) -> list:
 
 # ── Stream Tests ─────────────────────────────────────────────────────────────
 
+@st.cache_data(ttl=300)
 def load_run_payload(test_id: int):
     path = RUNS_DIR / f"{test_id}.pkl"
     if not path.exists():
@@ -445,6 +446,7 @@ def next_run_number(stream_nm: str, params_h: str, history: pd.DataFrame) -> int
 
 # ── Model Tester DB ops ──────────────────────────────────────────────────────
 
+@st.cache_data(ttl=300)
 def load_model_run_payload(model_test_id: int):
     path = MODEL_RUNS_DIR / f"{model_test_id}.pkl"
     if not path.exists():
