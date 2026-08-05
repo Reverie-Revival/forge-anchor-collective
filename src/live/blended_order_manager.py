@@ -33,6 +33,7 @@ now fixed and covered.
 All DB writes use the passed connection (caller manages the transaction).
 In dry_run mode, Kraken calls are skipped and logged instead.
 """
+import json
 import logging
 from datetime import datetime, timezone, timedelta
 
@@ -41,9 +42,30 @@ from sqlalchemy import text
 from src.live.kraken_client import KrakenClient
 from src.live.order_manager import MAKER_FEE, TAKER_FEE, _tf_minutes
 from src.backtester.slot_math import slot_capitals_for as _slot_capitals_for
+from src.backtester.slot_math import tilted_slot_weights as _tilted_slot_weights
 from src.live import blended_notifier as notifier
 
 log = logging.getLogger(__name__)
+
+
+def _get_fng_value(conn, on_date=None):
+    """
+    Most recent Fear & Greed reading on or before on_date (default: today) --
+    same "on or before" tolerance as the backtester's day-keyed lookup, since
+    alternative.me's daily update can lag past midnight UTC. Returns None if
+    sentiment_data has no row that old yet (e.g. a brand-new deploy on a day
+    the updater hasn't run), which callers treat as "no tilt this entry" --
+    matching engine.py's fng_value=None short-circuit exactly.
+    """
+    row = conn.execute(
+        text("""
+            SELECT fng_value FROM sentiment_data
+            WHERE date <= COALESCE(:on_date, CURRENT_DATE)
+            ORDER BY date DESC LIMIT 1
+        """),
+        {"on_date": on_date},
+    ).fetchone()
+    return int(row.fng_value) if row is not None else None
 
 
 def get_available_capital(conn, model_id: int) -> float:
@@ -89,17 +111,43 @@ def has_active_position(conn, stream_id: int) -> bool:
 
 
 def place_entry(conn, stream: dict, kraken: KrakenClient, dry_run: bool = False) -> None:
-    """Place slot-1's limit buy and create a PENDING_ENTRY position."""
+    """Place slot-1's limit buy and create a PENDING_ENTRY position.
+
+    If sentiment_tilt is configured, the tilted split is computed HERE, ONCE,
+    using today's Fear & Greed reading, and frozen into frozen_slot_capitals
+    on the position row -- cascade adds must reuse this exact split, never
+    recompute the tilt against a later (different) fng_value. Mirrors
+    engine.py's _run_blended_slots, which locks the tilt in at slot-1 entry
+    for the same reason.
+    """
     stream_id = stream["stream_id"]
     model_id = stream["model_id"]
     params = stream["parameters"]
     tf = params.get("primary_timeframe", "4h")
-    expiry_candles = params.get("position", {}).get("entry_expiry_candles", 2)
+    position_params = params.get("position", {})
+    expiry_candles = position_params.get("entry_expiry_candles", 2)
     slot_count = stream["slot_count"]
     weights = (params.get("slots") or {}).get("slot_capital_weight")
+    sentiment_tilt = position_params.get("sentiment_tilt")
 
     capital_base = get_available_capital(conn, model_id)
-    slot_capitals = _slot_capitals_for(capital_base, weights, slot_count)
+
+    if sentiment_tilt:
+        # tilted_slot_weights indexes base_weights directly -- needs the same
+        # even-split fallback engine.py applies before calling it (plain
+        # _slot_capitals_for has its own equivalent fallback built in, but
+        # this function doesn't).
+        base_weights = weights if weights and len(weights) >= slot_count else [1] * slot_count
+        fng_value = _get_fng_value(conn)
+        # trend_sma_period is a documented but never-adopted refinement (no
+        # locked config uses it) -- not wired to a live SMA lookup. Passing
+        # trend_val=None here is the same as it being unset: tilted_slot_weights
+        # skips the trend adjustment entirely and falls back to plain strength.
+        effective_weights = _tilted_slot_weights(base_weights, fng_value, sentiment_tilt, slot_count)
+    else:
+        effective_weights = weights
+
+    slot_capitals = _slot_capitals_for(capital_base, effective_weights, slot_count)
     slot1_capital = slot_capitals[0]
 
     if slot1_capital < 10.0:
@@ -133,13 +181,15 @@ def place_entry(conn, stream: dict, kraken: KrakenClient, dry_run: bool = False)
         text("""
             INSERT INTO live.blended_positions
                 (model_id, stream_id, status, position_capital_base,
-                 pending_entry_order_id, pending_entry_expiry_at, created_at)
+                 frozen_slot_capitals, pending_entry_order_id,
+                 pending_entry_expiry_at, created_at)
             VALUES
                 (:mid, :sid, 'PENDING_ENTRY', :capital_base,
-                 :txid, :expiry, :now)
+                 CAST(:slot_capitals AS jsonb), :txid, :expiry, :now)
         """),
         {
             "mid": model_id, "sid": stream_id, "capital_base": capital_base,
+            "slot_capitals": json.dumps(slot_capitals),
             "txid": txid, "expiry": expiry_at, "now": datetime.now(timezone.utc),
         },
     )
@@ -188,7 +238,8 @@ def check_pending_entry(conn, kraken: KrakenClient, streams: dict, dry_run: bool
     pending = conn.execute(
         text("""
             SELECT bp.position_id, bp.stream_id, bp.model_id, ls.stream_name,
-                   bp.pending_entry_order_id, bp.pending_entry_expiry_at, bp.position_capital_base
+                   bp.pending_entry_order_id, bp.pending_entry_expiry_at, bp.position_capital_base,
+                   bp.frozen_slot_capitals
             FROM live.blended_positions bp
             JOIN live.streams ls ON ls.stream_id = bp.stream_id
             WHERE bp.status = 'PENDING_ENTRY'
@@ -250,8 +301,15 @@ def _apply_entry_fill(conn, pos, order: dict, vol_exec: float, now, stream: dict
     """Record slot 1's fill (full or partial -- either way it's real BTC bought) and open the position."""
     fill_price = float(order.get("price", 0) or 0)
     fee_usd = float(order.get("fee", 0) or 0)
-    weights = (stream["parameters"].get("slots") or {}).get("slot_capital_weight")
-    slot_capitals = _slot_capitals_for(float(pos.position_capital_base), weights, stream["slot_count"])
+    # Read the split frozen at place_entry() time, not a fresh recompute --
+    # if sentiment_tilt is configured, a fresh call would apply TODAY's
+    # fng_value instead of the one this position actually opened under.
+    # NULL only for positions opened before this column existed.
+    if pos.frozen_slot_capitals is not None:
+        slot_capitals = pos.frozen_slot_capitals
+    else:
+        weights = (stream["parameters"].get("slots") or {}).get("slot_capital_weight")
+        slot_capitals = _slot_capitals_for(float(pos.position_capital_base), weights, stream["slot_count"])
     slot1_capital = slot_capitals[0]
 
     log.info(f"Position {pos.position_id} slot 1 filled @ ${fill_price:.2f} "
@@ -286,20 +344,36 @@ def check_cascade_add_trigger(conn, stream: dict, latest_close: float, kraken: K
     dropped far enough below slot 1's original entry to arm the next
     cascade add. Only one add order is ever in flight at a time -- mirrors
     the backtester's `pending_add is None` gate.
+
+    Also implements slot_promotion_days's "impatience" trigger, exactly as
+    coded in engine.py's _run_blended_slots (not just as its docstring
+    describes it): once the position has been open long enough without this
+    add's normal trigger firing, the PRIOR slot's easier threshold applies
+    -- but promotions_used increments every tick this branch is evaluated
+    while under max_promotions, not just when the promoted trigger actually
+    fires. With max_promotions_per_position=1 (GS: Reflex v2's config), that
+    means the promotion is only actually live for the one candle where the
+    days threshold is first crossed -- if price doesn't touch it that candle,
+    promotions_used is already spent and the trigger reverts to normal for
+    the rest of the position's life. This is the real, tested, Gauntlet-
+    passed behavior -- reproduced deliberately, not "fixed," for exact
+    parity with what was backtested.
     """
     stream_id = stream["stream_id"]
     model_id = stream["model_id"]
     params = stream["parameters"]
-    cumulative_drops = params.get("position", {}).get("cumulative_drop_pcts", [])
+    position_params = params.get("position", {})
+    cumulative_drops = position_params.get("cumulative_drop_pcts", [])
+    slot_promotion_days = position_params.get("slot_promotion_days")
+    max_promotions = position_params.get("max_promotions_per_position")
     slot_count = stream["slot_count"]
-    weights = (params.get("slots") or {}).get("slot_capital_weight")
-    expiry_candles = params.get("position", {}).get("entry_expiry_candles", 2)
+    expiry_candles = position_params.get("entry_expiry_candles", 2)
     tf = params.get("primary_timeframe", "4h")
 
     pos = conn.execute(
         text("""
             SELECT position_id, original_entry_price, position_capital_base,
-                   pending_add_order_id
+                   pending_add_order_id, frozen_slot_capitals, promotions_used, opened_at
             FROM live.blended_positions
             WHERE stream_id = :sid AND status = 'OPEN'
         """),
@@ -317,12 +391,30 @@ def check_cascade_add_trigger(conn, stream: dict, latest_close: float, kraken: K
     if next_idx >= slot_count or (next_idx - 1) >= len(cumulative_drops):
         return  # out of slots or out of ladder config -- capitulation backstop owns this now
 
-    slot_capitals = _slot_capitals_for(float(pos.position_capital_base), weights, slot_count)
+    if pos.frozen_slot_capitals is not None:
+        slot_capitals = pos.frozen_slot_capitals
+    else:
+        weights = (params.get("slots") or {}).get("slot_capital_weight")
+        slot_capitals = _slot_capitals_for(float(pos.position_capital_base), weights, slot_count)
     add_capital = slot_capitals[next_idx]
     if add_capital < 0.01:
         return
 
-    trigger_price = float(pos.original_entry_price) * (1 - cumulative_drops[next_idx - 1] / 100.0)
+    trigger_pct = cumulative_drops[next_idx - 1]
+    promotions_used = pos.promotions_used
+    can_promote = max_promotions is None or promotions_used < max_promotions
+    if slot_promotion_days and can_promote and (next_idx - 1) < len(slot_promotion_days):
+        opened_at = pos.opened_at.replace(tzinfo=timezone.utc) if pos.opened_at.tzinfo is None else pos.opened_at
+        days_open = (datetime.now(timezone.utc) - opened_at).total_seconds() / 86400
+        if days_open >= slot_promotion_days[next_idx - 1]:
+            trigger_pct = cumulative_drops[next_idx - 2] if next_idx >= 2 else 0.0
+            promotions_used += 1
+            conn.execute(
+                text("UPDATE live.blended_positions SET promotions_used = :p WHERE position_id = :pid"),
+                {"p": promotions_used, "pid": pos.position_id},
+            )
+
+    trigger_price = float(pos.original_entry_price) * (1 - trigger_pct / 100.0)
     if latest_close > trigger_price:
         return
 
@@ -369,7 +461,7 @@ def check_pending_add(conn, kraken: KrakenClient, streams: dict, dry_run: bool =
         text("""
             SELECT bp.position_id, bp.stream_id, bp.model_id, ls.stream_name,
                    bp.pending_add_order_id, bp.pending_add_index, bp.pending_add_expiry_at,
-                   bp.total_qty, bp.total_deployed, bp.position_capital_base
+                   bp.total_qty, bp.total_deployed, bp.position_capital_base, bp.frozen_slot_capitals
             FROM live.blended_positions bp
             JOIN live.streams ls ON ls.stream_id = bp.stream_id
             WHERE bp.status = 'OPEN' AND bp.pending_add_order_id IS NOT NULL
@@ -433,9 +525,12 @@ def _apply_add_fill(conn, pos, order: dict, vol_exec: float, now, stream: dict) 
     """Record a cascade add's fill (full or partial) and fold it into the blended average."""
     fill_price = float(order.get("price", 0) or 0)
     fee_usd = float(order.get("fee", 0) or 0)
-    weights = (stream["parameters"].get("slots") or {}).get("slot_capital_weight")
     slot_count = stream["slot_count"]
-    slot_capitals = _slot_capitals_for(float(pos.position_capital_base), weights, slot_count)
+    if pos.frozen_slot_capitals is not None:
+        slot_capitals = pos.frozen_slot_capitals
+    else:
+        weights = (stream["parameters"].get("slots") or {}).get("slot_capital_weight")
+        slot_capitals = _slot_capitals_for(float(pos.position_capital_base), weights, slot_count)
     add_capital = slot_capitals[pos.pending_add_index]
 
     new_qty = float(pos.total_qty) + vol_exec

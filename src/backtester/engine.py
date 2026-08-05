@@ -7,7 +7,7 @@ from sqlalchemy import create_engine, text
 
 from .indicators import add_indicators, resample_ohlcv, _CANDLES_PER_DAY
 from .signals import generate_signals
-from .slot_math import slot_capitals_for
+from .slot_math import slot_capitals_for, tilted_slot_weights
 from src.data.sentiment import load_sentiment
 from src.fees import MAKER_FEE, TAKER_FEE
 
@@ -710,81 +710,6 @@ def _run_cascade_slots(
     return all_trades
 
 
-def _tilted_slot_weights(base_weights: list, row: pd.Series, tilt_cfg: dict, slot_count: int) -> list:
-    """
-    Experimental: skew slot_capital_weight based on the Fear & Greed reading at
-    the moment a position opens (locked in for that whole cascade, not
-    re-evaluated per fill).
-
-    tilt_cfg:
-      direction: +1 = front-load fear (bet bigger, earlier, on more extreme
-                 fear readings); -1 = back-load fear (reserve capital for
-                 later slots on more extreme fear readings, betting more pain
-                 may be coming). Backtested: -1 (back-load) clearly wins.
-      strength:  0 = no skew (falls back to base_weights); higher = more
-                 aggressive skew. Backtested sweep across 0.2-0.8: 0.4 is the
-                 real peak (0.3-0.4 the sweet spot) -- decays on both sides,
-                 not "more is better."
-      apply_to_slot1: if False (default), slot 1 stays at its base weight and
-                 only slots 2..N are skewed relative to each other -- keeps
-                 the entry itself simple/unconditional. If True, slot 1 is
-                 included in the skew too.
-      trend_sma_period: optional. If set (and filters.trend_context.sma_period
-                 matches, so the column actually gets computed), scales
-                 `strength` by trend_strength_below/trend_strength_above
-                 depending on whether close is below/above that SMA at entry
-                 -- e.g. lean into the tilt harder in a confirmed downtrend
-                 (more room to fall, back-loading matters more) and dampen it
-                 in an uptrend (a dip is more likely shallow).
-      trend_strength_below / trend_strength_above: multipliers on `strength`,
-                 default 1.0 each (no trend adjustment) if trend_sma_period unset.
-
-    fng_value 50 (neutral) always reduces to base_weights regardless of
-    strength; 0 (extreme fear) / 100 (extreme greed) are the max skew.
-    """
-    fng_value = row.get("fng_value")
-    if not tilt_cfg or fng_value is None or (isinstance(fng_value, float) and pd.isna(fng_value)):
-        return base_weights
-
-    direction = tilt_cfg.get("direction", 1)
-    strength  = tilt_cfg.get("strength", 0.4)
-    apply_to_slot1 = tilt_cfg.get("apply_to_slot1", False)
-
-    trend_period = tilt_cfg.get("trend_sma_period")
-    if trend_period:
-        trend_val = row.get(f"trend_sma_{trend_period}")
-        if trend_val is not None and not pd.isna(trend_val):
-            below = row["close"] < trend_val
-            mult = tilt_cfg.get("trend_strength_below", 1.0) if below else tilt_cfg.get("trend_strength_above", 1.0)
-            strength *= mult
-
-    tilt = direction * (50 - fng_value) / 50.0  # + on fear, - on greed (direction can flip this)
-
-    start_idx = 0 if apply_to_slot1 else 1
-    n = slot_count - start_idx
-    if n <= 0:
-        return base_weights
-
-    # symmetric ramp: the earliest affected slot gets the most positive skew,
-    # the latest the most negative, centered on zero so total weight units
-    # shift between slots rather than growing/shrinking outright.
-    ramp = [(n - 1) / 2.0 - j for j in range(n)]
-
-    # Floor: 0.5x a $20 base weight = $10, CLAUDE.md's stated minimum lot size
-    # (Kraken order minimums + round-trip fee drag make anything smaller
-    # impractical). Only exact for the $20/slot base this was tuned against --
-    # a differently-sized base weight would need a different floor to hold the
-    # same real $10 minimum.
-    min_factor = tilt_cfg.get("min_factor", 0.5)
-
-    new_weights = list(base_weights[:slot_count])
-    for j, idx in enumerate(range(start_idx, slot_count)):
-        factor = 1 + strength * tilt * ramp[j]
-        factor = max(factor, min_factor)
-        new_weights[idx] = base_weights[idx] * factor
-    return new_weights
-
-
 def _run_blended_slots(
     df: pd.DataFrame,
     signals: pd.Series,
@@ -825,7 +750,7 @@ def _run_blended_slots(
     a smaller bounce-triggered exit instead of a single line.
 
     Optional sentiment-tilted slot weighting (position["sentiment_tilt"], see
-    _tilted_slot_weights), slot promotion for stagnant positions
+    tilted_slot_weights in slot_math.py), slot promotion for stagnant positions
     (slot_promotion_days / max_promotions_per_position), and a shallow
     breakeven margin (shallow_breakeven_margin_pct / shallow_slot_threshold)
     that converts an exact-breakeven exit into a small guaranteed gain.
@@ -877,7 +802,7 @@ def _run_blended_slots(
     weights = (params.get("slots") or {}).get("slot_capital_weight")
     base_weights = weights if weights and len(weights) >= slot_count else [1] * slot_count
     compound = position.get("compound", False)
-    sentiment_tilt = position.get("sentiment_tilt")  # see _tilted_slot_weights; requires params["sentiment"]=True
+    sentiment_tilt = position.get("sentiment_tilt")  # see slot_math.tilted_slot_weights; requires params["sentiment"]=True
 
     available_capital = total_capital  # grows/shrinks as positions close, if compound=True
     slot_capitals = slot_capitals_for(available_capital, weights, slot_count)  # this position's frozen split
@@ -1051,10 +976,20 @@ def _run_blended_slots(
         if not position_open and pending_entry is None and signals.iloc[i]:
             if compound or sentiment_tilt:
                 capital_base = available_capital if compound else total_capital
-                effective_weights = (
-                    _tilted_slot_weights(base_weights, row, sentiment_tilt, slot_count)
-                    if sentiment_tilt else weights
-                )
+                if sentiment_tilt:
+                    fng_value = row.get("fng_value")
+                    if isinstance(fng_value, float) and pd.isna(fng_value):
+                        fng_value = None
+                    trend_period = sentiment_tilt.get("trend_sma_period")
+                    trend_val = row.get(f"trend_sma_{trend_period}") if trend_period else None
+                    if isinstance(trend_val, float) and pd.isna(trend_val):
+                        trend_val = None
+                    effective_weights = tilted_slot_weights(
+                        base_weights, fng_value, sentiment_tilt, slot_count,
+                        trend_val=trend_val, close=row["close"],
+                    )
+                else:
+                    effective_weights = weights
                 slot_capitals = slot_capitals_for(capital_base, effective_weights, slot_count)
             if slot_capitals[0] > 0.01:
                 pending_entry = (row["close"], expiry)
