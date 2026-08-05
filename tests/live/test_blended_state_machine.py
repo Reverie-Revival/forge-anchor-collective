@@ -172,12 +172,6 @@ def test_full_cycle_entry_add_trailing_stop_exit(sandbox):
         assert stops == 0   # armed but not yet triggered
 
     stop_trigger_low = armed_close * (1 - 0.05) - 1   # pierce the 5% trailing stop from this new high
-    # Real market sells now poll Kraken's ticker for the actual fill price
-    # (place_exit's post-placement status poll) rather than trusting the
-    # computed stop-trigger price -- set the fake ticker to what the market
-    # would realistically be showing at this candle's close so the "real"
-    # fill is consistent with the scenario, not left over from the cascade add.
-    kraken._next_price = armed_close
     with engine.begin() as conn:
         capital_before = order_manager.get_available_capital(conn, model_id)
         total_qty = float(conn.execute(text("""
@@ -187,7 +181,18 @@ def test_full_cycle_entry_add_trailing_stop_exit(sandbox):
         stops = position_monitor.check_all(
             conn, {stream["stream_id"]: stream}, candle_row, {"4h"}, kraken, dry_run=False
         )
-        assert stops == 1
+        # Armed exits are now a real resting limit order, not an immediate
+        # market sell -- this call only places/re-prices it at the floor.
+        assert stops == 0
+        pending_price = float(conn.execute(text("""
+            SELECT pending_exit_price FROM live.blended_positions WHERE stream_id = :sid
+        """), {"sid": stream["stream_id"]}).scalar())
+
+    # FakeKraken's default "full" mode fills a limit order at the submitted
+    # price, not the ticker -- confirm the resting order via check_pending_exit.
+    with engine.begin() as conn:
+        fills, _ = order_manager.check_pending_exit(conn, kraken, {stream["stream_id"]: stream}, dry_run=False)
+        assert fills == 1
         pos = conn.execute(text("""
             SELECT status, realized_pnl, exit_reason, exit_price, exit_fee_usd, fee_is_estimated
             FROM live.blended_positions WHERE stream_id = :sid
@@ -195,14 +200,15 @@ def test_full_cycle_entry_add_trailing_stop_exit(sandbox):
         assert pos.status == "CLOSED"
         assert pos.exit_reason == "trailing_stop"
         assert pos.fee_is_estimated is False   # FakeKraken confirms the fill on the first poll
-        # Real fill price/fee come from FakeKraken's ticker, not the computed
-        # stop-trigger price -- confirms place_exit is using the real poll result.
-        assert abs(float(pos.exit_price) - armed_close) < 0.01
-        expected_exit_fee = total_qty * armed_close * 0.004   # FakeKraken's fee model
+        # Real fill price/fee come from the resting limit order's own price
+        # (FakeKraken fills at price_usd when given), confirming the exit is
+        # a real limit order, not an estimate.
+        assert abs(float(pos.exit_price) - pending_price) < 0.01
+        expected_exit_fee = total_qty * pending_price * 0.004   # FakeKraken's fee model
         assert abs(float(pos.exit_fee_usd) - expected_exit_fee) < 1e-4
 
         total_entry_fees = 2 * (20.0 * 0.004)   # slot 1 + add #1, both $20 fills
-        expected_pnl = (total_qty * armed_close) - expected_exit_fee - 40.0 - total_entry_fees
+        expected_pnl = (total_qty * pending_price) - expected_exit_fee - 40.0 - total_entry_fees
         assert abs(float(pos.realized_pnl) - expected_pnl) < 0.01
         # never voluntarily realize a loss -- pnl must be >= 0 (allow a cent of rounding)
         assert float(pos.realized_pnl) >= -0.01
@@ -220,7 +226,14 @@ def test_exit_falls_back_to_estimate_when_fill_not_yet_confirmed(sandbox):
     market sell. If that single poll doesn't show a confirmed fill yet (API
     lag -- FakeKraken's "delayed" mode), the lot must still close using the
     estimated price/fee rather than hang, and must flag fee_is_estimated so
-    it's visible for a manual glance later."""
+    it's visible for a manual glance later.
+
+    Only capitulation still calls place_exit (an immediate, guaranteed market
+    sell) -- the armed/trailing-stop path uses a real resting limit order
+    instead (see test_full_cycle_entry_add_trailing_stop_exit), so this test
+    now exercises the fallback via a still-unarmed, fully-loaded position
+    that breaches the capitulation line, set up directly rather than driven
+    through five real cascade adds."""
     engine, stream, model_id = sandbox
     kraken = FakeKraken()
 
@@ -230,31 +243,47 @@ def test_exit_falls_back_to_estimate_when_fill_not_yet_confirmed(sandbox):
     with engine.begin() as conn:
         order_manager.check_pending_entry(conn, kraken, {stream["stream_id"]: stream}, dry_run=False)
 
-    # Rally past the 4% arm threshold, then pierce the trailing stop -- same
-    # shape as the full-cycle test, but slot 1 only (no cascade add).
-    armed_close = 50000.0 * 1.05
+    # Fast-forward directly to "all 5 slots filled, still unarmed" rather than
+    # driving 4 real cascade adds -- irrelevant to what this test is about.
     with engine.begin() as conn:
-        candle_row = {stream["stream_id"]: {"close": armed_close, "low": armed_close * 0.999}}
-        position_monitor.check_all(conn, {stream["stream_id"]: stream}, candle_row, {"4h"}, kraken, dry_run=False)
+        pos_id = conn.execute(text("""
+            SELECT position_id FROM live.blended_positions WHERE stream_id = :sid
+        """), {"sid": stream["stream_id"]}).scalar()
+        avg_cost = 48500.0  # keeps gain_pct (vs highest_close=50000) under the 4% arm threshold
+        total_qty = 100.0 / avg_cost
+        conn.execute(text("""
+            UPDATE live.blended_positions
+            SET avg_cost_basis = :avg, total_qty = :qty, total_deployed = 100.0,
+                highest_close = 50000.0, capitulation_armed = TRUE,
+                original_entry_price = 50000.0
+            WHERE position_id = :pid
+        """), {"avg": avg_cost, "qty": total_qty, "pid": pos_id})
+        for i in range(1, 5):
+            conn.execute(text("""
+                INSERT INTO live.blended_fills (position_id, fill_number, price, capital, qty, order_id, fee_usd, filled_at)
+                VALUES (:pid, :fnum, :price, 20.0, :qty, 'TEST', 0.08, now())
+            """), {"pid": pos_id, "fnum": i, "price": 50000.0 - i * 1000, "qty": 20.0 / (50000.0 - i * 1000)})
 
-    stop_trigger_low = armed_close * (1 - 0.05) - 1
-    kraken._next_price = armed_close
+    # last fill price = 46000, capitulation_stop_pct=15 -> capitulation line = 39100
+    capitulation_low = 46000.0 * (1 - 0.15) - 1
+    kraken._next_price = capitulation_low
     kraken.next_fill_mode = "delayed"   # first status poll after the market sell reports unconfirmed
     with engine.begin() as conn:
-        candle_row = {stream["stream_id"]: {"close": armed_close, "low": stop_trigger_low}}
+        candle_row = {stream["stream_id"]: {"close": capitulation_low, "low": capitulation_low}}
         stops = position_monitor.check_all(
             conn, {stream["stream_id"]: stream}, candle_row, {"4h"}, kraken, dry_run=False
         )
         assert stops == 1
         pos = conn.execute(text("""
-            SELECT status, realized_pnl, exit_price, exit_fee_usd, fee_is_estimated
+            SELECT status, realized_pnl, exit_price, exit_fee_usd, fee_is_estimated, exit_reason
             FROM live.blended_positions WHERE stream_id = :sid
         """), {"sid": stream["stream_id"]}).fetchone()
         assert pos.status == "CLOSED"   # never gets stuck even though the fill wasn't confirmed
+        assert pos.exit_reason == "capitulation_stop"
         assert pos.fee_is_estimated is True
-        # Fallback uses the computed stop-trigger price (effective_stop), not
-        # the real ticker price the (unconfirmed) fill would have used.
-        assert float(pos.exit_price) != armed_close
+        # Fallback uses the computed capitulation price, not the real ticker
+        # price the (unconfirmed) fill would have used.
+        assert float(pos.exit_price) != capitulation_low
 
 
 def test_exit_with_mixed_legacy_and_real_fee_fills(sandbox):
@@ -311,7 +340,15 @@ def test_exit_with_mixed_legacy_and_real_fee_fills(sandbox):
         stops = position_monitor.check_all(
             conn, {stream["stream_id"]: stream}, candle_row, {"4h"}, kraken, dry_run=False
         )
-        assert stops == 1
+        # Armed exits are now a real resting limit order -- this only places it.
+        assert stops == 0
+        pending_price = float(conn.execute(text("""
+            SELECT pending_exit_price FROM live.blended_positions WHERE stream_id = :sid
+        """), {"sid": stream["stream_id"]}).scalar())
+
+    with engine.begin() as conn:
+        fills, _ = order_manager.check_pending_exit(conn, kraken, {stream["stream_id"]: stream}, dry_run=False)
+        assert fills == 1
         pos = conn.execute(text("""
             SELECT realized_pnl, exit_fee_usd, fee_is_estimated FROM live.blended_positions WHERE stream_id = :sid
         """), {"sid": stream["stream_id"]}).fetchone()
@@ -321,8 +358,8 @@ def test_exit_with_mixed_legacy_and_real_fee_fills(sandbox):
 
         expected_slot1_fee_estimate = 20.0 * MAKER_FEE   # slot 1's legacy fallback
         expected_add1_fee_real = 20.0 * 0.004             # FakeKraken's real fee model
-        expected_exit_fee = total_qty * armed_close * 0.004
-        expected_pnl = ((total_qty * armed_close) - expected_exit_fee - 40.0
+        expected_exit_fee = total_qty * pending_price * 0.004
+        expected_pnl = ((total_qty * pending_price) - expected_exit_fee - 40.0
                         - expected_slot1_fee_estimate - expected_add1_fee_real)
         assert abs(float(pos.realized_pnl) - expected_pnl) < 0.01
 
@@ -510,8 +547,15 @@ def test_capitulation_stop_can_realize_a_loss_once_out_of_slots(sandbox):
     with engine.begin() as conn:
         order_manager.check_pending_entry(conn, kraken, {stream["stream_id"]: stream}, dry_run=False)
 
-    # walk price down through all 4 remaining cascade triggers so every slot fills
-    drop_prices = [49000.0, 48000.0, 47000.0, 44000.0]  # past 1%, 2%, 5%, 10% cumulative drops
+    # walk price down through all 4 remaining cascade triggers so every slot fills.
+    # Values sit just past each trigger (1/2/5/10% below the 50000 original entry)
+    # rather than deeply past it -- keeps the blended average high enough that
+    # gain_pct (measured against the still-50000 highest_close, since check_all
+    # never ran yet to update it) stays under the 4% arm threshold. This test is
+    # specifically about the UNARMED, out-of-ammo capitulation path -- if the
+    # average dropped further, the position would arm instead (correctly, per
+    # the new trail_armed gate) and capitulation would never fire.
+    drop_prices = [49450.0, 48950.0, 47450.0, 44950.0]
     for price in drop_prices:
         kraken._next_price = price
         with engine.begin() as conn:
@@ -570,7 +614,12 @@ def test_compounding_grows_next_position_capital_base(sandbox):
         stops = position_monitor.check_all(
             conn, {stream["stream_id"]: stream}, candle_row, {"4h"}, kraken, dry_run=False
         )
-        assert stops == 1
+        # Armed exit places/re-prices a real resting limit order here, doesn't
+        # finalize synchronously -- confirm the fill via check_pending_exit.
+        assert stops == 0
+    with engine.begin() as conn:
+        fills, _ = order_manager.check_pending_exit(conn, kraken, {stream["stream_id"]: stream}, dry_run=False)
+        assert fills == 1
         capital_after_win = order_manager.get_available_capital(conn, model_id)
         assert capital_after_win > 100.0
 

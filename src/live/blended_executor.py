@@ -196,12 +196,17 @@ def tick(conn, streams: dict, kraken: KrakenClient, last_tick: datetime,
 
     entry_fills, entry_expirations = order_manager.check_pending_entry(conn, kraken, streams, dry_run)
     add_fills, add_expirations = order_manager.check_pending_add(conn, kraken, streams, dry_run)
+    exit_fills, _ = order_manager.check_pending_exit(conn, kraken, streams, dry_run)
     fills = entry_fills + add_fills
     expirations = entry_expirations + add_expirations
 
-    stops_triggered = 0
+    # exit_fills counted here too -- a trailing-stop exit now completes when
+    # check_pending_exit() confirms a real fill on a resting limit order, not
+    # synchronously inside check_all() (which only immediately closes
+    # capitulation exits -- see blended_position_monitor.py).
+    stops_triggered = exit_fills
     if closed_tfs and candle_row:
-        stops_triggered = position_monitor.check_all(
+        stops_triggered += position_monitor.check_all(
             conn, streams, candle_row, closed_tfs, kraken, dry_run
         )
 

@@ -35,7 +35,8 @@ class KrakenClient:
         """
         Place a BTC/USD order. Returns Kraken txid.
         side: 'buy' or 'sell'
-        order_type: 'limit' (entry, maker fee) or 'market' (exit, taker fee)
+        order_type: 'limit' (maker fee -- entries, and blended's armed/trailing-stop
+        exits) or 'market' (taker fee -- capitulation and Model 1's stop-loss exits)
         """
         params = {
             "pair": "XBTUSD",

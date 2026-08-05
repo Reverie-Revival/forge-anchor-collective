@@ -211,7 +211,18 @@ def _run_slot(df: pd.DataFrame, signals: pd.Series, params: dict, slot: int,
                     exit_price = take_profit_price
                     exit_reason = "take_profit"
                 elif row["low"] <= stop_price:
-                    exit_price = stop_price
+                    # Model 1's real live order_manager.py places an unconditional
+                    # MARKET sell once triggered (a deliberate choice -- see plan
+                    # notes -- a real stop-loss should guarantee execution, not rest
+                    # as an unfilled limit). A market sell doesn't get to choose its
+                    # price: if the whole candle kept falling past the trigger, real
+                    # execution lands closer to the close, not at the idealized
+                    # trigger level -- crediting stop_price outright regardless of
+                    # where the candle actually ended is the same "unreachable
+                    # price" optimism found (and fixed differently, via a real
+                    # limit order) in the blended engine. min() here never assumes
+                    # a fill better than the candle's own close.
+                    exit_price = min(stop_price, row["close"])
                     # distinguish which stop fired
                     if hard_stop and stop_price <= hard_stop:
                         exit_reason = "stop_loss"
@@ -821,6 +832,9 @@ def _run_blended_slots(
     marked_count = 0           # ladder only: how many (oldest-first) slots have been marked down
     marked_capitals = []       # ladder only: parallel to fills, real capital until marked
     promotions_used = 0        # slot_promotion_days only: promoted fills used by this position
+    ever_armed = False         # once true, stays true for the life of this position -- see armed
+                                # gate below: freezes composition (no more cascade adds) and makes
+                                # capitulation permanently unreachable (arming always wins)
 
     def total_qty():
         return sum(q for _, _, q, _ in fills)
@@ -890,7 +904,16 @@ def _run_blended_slots(
                 synthetic_avg = sum(marked_capitals) / total_qty()
 
             gain_pct = (highest_close - synthetic_avg) / synthetic_avg * 100
-            armed = (not trail_arm_gain_pct) or gain_pct >= trail_arm_gain_pct
+            armed_now = (not trail_arm_gain_pct) or gain_pct >= trail_arm_gain_pct
+            # Persisted once true, never reset (mathematically one-directional anyway --
+            # HWM never falls and every new fill only lowers avg cost, which only
+            # raises gain_pct). Arming does NOT stop cascade adds -- a resting buy
+            # (next add, lower) and a resting sell (exit, higher) aren't in conflict,
+            # and each new add only lowers the exit floor (more achievable), never
+            # raises it. The one thing arming permanently disables is capitulation --
+            # see the gate below.
+            ever_armed = ever_armed or armed_now
+            armed = ever_armed
 
             effective_trail_pct = trail_pct
             stop_price = None
@@ -909,12 +932,16 @@ def _run_blended_slots(
             # more room to average down), a further drop forces a full exit instead of
             # holding indefinitely into the unknown. Ladder mode reaches this one step
             # past the last slot being marked; legacy mode is a single fixed line.
+            # Permanently unreachable once armed -- a position that has proven it can
+            # arm (a real profit floor exists) never gets forced into this deliberate
+            # loss-taking backstop, which exists to protect positions that never did.
             capitulation_price = None
-            if ladder_enabled and len(fills) == slot_count and marked_count == slot_count:
-                capitulation_price = original_entry_price * (1 - ladder_final_cut_pct / 100.0)
-            elif capitulation_stop_pct and len(fills) == slot_count:
-                last_fill_price = fills[-1][0]
-                capitulation_price = last_fill_price * (1 - capitulation_stop_pct / 100.0)
+            if not armed:
+                if ladder_enabled and len(fills) == slot_count and marked_count == slot_count:
+                    capitulation_price = original_entry_price * (1 - ladder_final_cut_pct / 100.0)
+                elif capitulation_stop_pct and len(fills) == slot_count:
+                    last_fill_price = fills[-1][0]
+                    capitulation_price = last_fill_price * (1 - capitulation_stop_pct / 100.0)
 
             exit_reason_override = None
             effective_stop = stop_price
@@ -925,7 +952,21 @@ def _run_blended_slots(
                     effective_stop = capitulation_price
                     exit_reason_override = "capitulation_ladder_cut" if ladder_enabled else "capitulation_stop"
 
-            if effective_stop is not None and row["low"] <= effective_stop:
+            # Capitulation is a deliberate, forced cut -- modeled as a guaranteed
+            # (market-style) fill, same as it is live, so only a low-touch is needed.
+            # The armed/trailing-stop path is modeled as a real resting limit order
+            # (see place_exit's live counterpart), so it needs the SAME two-sided
+            # touch check every entry/add fill already uses below -- crediting a fill
+            # at a price the candle's high never actually reached is exactly the bug
+            # that let the backtest look far rosier than live replay ever could.
+            is_capitulation = exit_reason_override is not None
+            touched = (
+                (effective_stop is not None and row["low"] <= effective_stop)
+                if is_capitulation else
+                (effective_stop is not None and row["low"] <= effective_stop <= row["high"])
+            )
+
+            if touched:
                 exit_price = effective_stop
                 gross = total_qty() * exit_price
                 pnl   = gross * (1 - taker_fee) - total_deployed()
@@ -953,10 +994,14 @@ def _run_blended_slots(
                 marked_count = 0
                 marked_capitals = []
                 promotions_used = 0
+                ever_armed = False
                 if compound:
                     available_capital += pnl
             else:
-                # arm the next cascade add as a limit order (not an instant fill) --
+                # Cascade adds keep working the same whether armed or not -- a new,
+                # cheaper fill only lowers the exit floor (avg cost drops), it never
+                # raises it, so there's no conflict with an already-armed exit target.
+                # Arm the next cascade add as a limit order (not an instant fill) --
                 # it still has to actually get touched within `expiry` candles, same as slot 1
                 next_idx = len(fills)  # number filled so far == index of the next add
                 if next_idx < slot_count and (next_idx - 1) < len(cumulative_drops) and pending_add is None:

@@ -324,7 +324,12 @@ def test_shallow_breakeven_margin_converts_flat_exit_to_small_gain(sandbox):
     with engine.begin() as conn:
         candle_row = {stream["stream_id"]: {"close": breakeven_with_margin, "low": breakeven_with_margin - 1}}
         stops = position_monitor.check_all(conn, {stream["stream_id"]: stream}, candle_row, {"4h"}, kraken, dry_run=False)
-        assert stops == 1
+        # Armed exits are now a real resting limit order, not an immediate
+        # market sell -- check_all only places/re-prices it here.
+        assert stops == 0
+    with engine.begin() as conn:
+        fills, _ = order_manager.check_pending_exit(conn, kraken, {stream["stream_id"]: stream}, dry_run=False)
+        assert fills == 1
         pos = conn.execute(text("""
             SELECT realized_pnl FROM live.blended_positions WHERE stream_id = :sid
         """), {"sid": stream["stream_id"]}).fetchone()

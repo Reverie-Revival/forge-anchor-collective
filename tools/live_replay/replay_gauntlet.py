@@ -223,11 +223,16 @@ def run_replay(stream_config_id: int, version: str, start: str, end: str,
                     if not order_manager.has_active_position(conn, stream_id) and bool(signals.loc[ts]):
                         order_manager.place_entry(conn, stream, kraken, dry_run=False)
 
-                    # (C), (D) poll fills — may include orders placed above, same tick
+                    # (C), (D) poll fills — may include orders placed above, same tick.
+                    # Also polls any resting exit limit order from a PRIOR tick's
+                    # arming (see (E) below) -- matches blended_executor.tick()'s order.
                     order_manager.check_pending_entry(conn, kraken, streams, dry_run=False)
                     order_manager.check_pending_add(conn, kraken, streams, dry_run=False)
+                    order_manager.check_pending_exit(conn, kraken, streams, dry_run=False)
 
-                    # (E) stop / trailing / capitulation check, this tick's candle
+                    # (E) stop / trailing / capitulation check, this tick's candle --
+                    # places/re-prices a resting exit limit order once armed (see
+                    # ensure_pending_exit), rather than an immediate market sell.
                     position_monitor.check_all(conn, streams, candle_row, {tf}, kraken, dry_run=False)
 
                 if i % 20 == 0:
@@ -235,9 +240,10 @@ def run_replay(stream_config_id: int, version: str, start: str, end: str,
 
         with engine.begin() as conn:
             closed = conn.execute(text("""
-                SELECT position_id, original_entry_price, avg_cost_basis, exit_price, realized_pnl,
-                       exit_reason, opened_at, closed_at
-                FROM live.blended_positions WHERE model_id = :mid AND status = 'CLOSED' ORDER BY opened_at
+                SELECT p.position_id, p.original_entry_price, p.avg_cost_basis, p.exit_price, p.realized_pnl,
+                       p.exit_reason, p.opened_at, p.closed_at,
+                       (SELECT COUNT(*) FROM live.blended_fills f WHERE f.position_id = p.position_id) AS num_slots
+                FROM live.blended_positions p WHERE p.model_id = :mid AND p.status = 'CLOSED' ORDER BY p.opened_at
             """), {"mid": model_id}).fetchall()
             open_pos = conn.execute(text("""
                 SELECT position_id, status FROM live.blended_positions
@@ -246,7 +252,7 @@ def run_replay(stream_config_id: int, version: str, start: str, end: str,
 
         print(f"\nLIVE REPLAY: {len(closed)} closed, {len(open_pos)} still open/pending", flush=True)
         for c in closed:
-            print(f"  entry_avg={c.avg_cost_basis} exit={c.exit_price} pnl={c.realized_pnl} "
+            print(f"  slots={c.num_slots} entry_avg={c.avg_cost_basis} exit={c.exit_price} pnl={c.realized_pnl} "
                   f"reason={c.exit_reason} opened={c.opened_at} closed={c.closed_at}", flush=True)
         for o in open_pos:
             print(f"  still {o.status}: position_id={o.position_id}", flush=True)

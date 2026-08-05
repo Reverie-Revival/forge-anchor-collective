@@ -133,7 +133,12 @@ def test_blended_flow_never_touches_model1_lots_or_heartbeat(dual_model_sandbox)
         stops = position_monitor.check_all(
             conn, {m3_stream["stream_id"]: m3_stream}, candle_row, {"4h"}, kraken, dry_run=False
         )
-        assert stops == 1
+        # Armed exit places/re-prices a real resting limit order, doesn't
+        # finalize synchronously -- confirm the fill via check_pending_exit.
+        assert stops == 0
+    with engine.begin() as conn:
+        fills, _ = order_manager.check_pending_exit(conn, kraken, {m3_stream["stream_id"]: m3_stream}, dry_run=False)
+        assert fills == 1
 
     # --- write Model 3's own heartbeat too, exercising _write_last_run ---
     with engine.begin() as conn:

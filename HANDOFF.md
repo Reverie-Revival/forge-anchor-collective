@@ -1,30 +1,68 @@
 # Handoff — 2026-08-05
 
-## 🔴 RESOLVED (this session): tick-ordering fix did NOT make the discrepancy go away — it's a real design risk, not a harness artifact
+## ✅ FIXED (this session): live exits were real market sells that could sell below the "never lose" floor — root-caused, fixed, re-validated. Also: this bug quietly inflated EVERY model's backtest, not just Model 3/4's
 
-**New branch: `live-replay-testing`**, branched off `live-model-4` (not `main` — the replay harness depends on Model 4's four mechanisms — `slot_math.py`, capitulation ladder, frozen slot capitals, promotion trigger — which only exist as committed code on `live-model-4`; branching off `main` would have meant hand re-porting those files, riskier than just taking them via the branch). Model 4's paused deployment work and this new initiative now share the branch's history but are tracked as separate concerns.
+**Branch: `live-replay-testing`**, off `live-model-4` (the replay harness needs Model 4's mechanics — `slot_math.py`, capitulation ladder, frozen slot capitals, promotion trigger — which only exist there). This branch now carries both the paused Model 4 cutover work and this session's much bigger finding.
 
-**What was done:** rebuilt the replay harness (`tools/live_replay/replay_gauntlet.py`, supersedes the old `tools/live_replay_wip/live_replay_gauntlet.py`) so its tick loop matches `blended_executor.tick()`'s real order exactly — verified line-by-line against `src/live/blended_executor.py:144-208`:
-1. **(A)** cascade-add trigger check (if position active)
-2. **(B)** entry signal check + placement (if no active position)
-3. **(C)** poll pending-entry fills
-4. **(D)** poll pending-add fills
-5. **(E)** stop/trailing/capitulation check (`check_all`), using this tick's candle
+### How this started
 
-The old harness ran **C, D, A, E, B** — placing a new cascade-add *after* polling fills, which delayed a same-tick fill from ever reaching the stop-check until the *next* tick. Production does **A, B, C, D, E** — an order placed this tick can fill and be evaluated by the stop-check in the *same* tick. Also fixed along the way: the old script passed `lot_size_usd=100.0` (hardcoded) to the backtest reference while sizing the live side off `20/slot × 5 slots` — coincidentally equal in that one case since `run_backtest`'s `lot_size_usd` kwarg is actually **total capital** for blended mode despite the name, not per-slot; the new script derives it explicitly (`total_capital = lot_size_usd * slot_count`) so it can't silently drift for a different slot count.
+Built a live-replay harness (`tools/live_replay/replay_gauntlet.py`) that drives the real production order-management code tick-by-tick against historical data, instead of only trusting the backtest. First pass found a single-trade discrepancy (backtest small gain, live real loss). Fixed the harness's tick ordering to exactly match `blended_executor.tick()`'s real order (`A` cascade-add → `B` entry → `C`/`D` poll fills → `E` stop-check, not the harness's original `C,D,A,E,B`) — **the discrepancy persisted**, proving it wasn't a harness artifact.
 
-**Result: re-ran the identical Jan 2026 window with the corrected ordering — the discrepancy persists, matching the original finding closely.** Backtest's second trade (entry ~2026-01-19/20, exit ~2026-01-30/31) shows a small **+$1.01 gain**; the live replay's corresponding position shows a real **-$7.50 loss**, same root cause as originally traced: the position sat unarmed for over a week while price crashed (gain measured against a stale high-water-mark), the final slot filled right at the crash bottom, which itself dragged the average cost down enough to arm the trailing stop for the first time — and the instant it armed, that same candle's low was already below the newly-computed breakeven stop, forcing an immediate market-sell at the crashed price instead of the stop level.
+### The real bug, once traced to a specific trade
 
-**Conclusion: this is not a harness ordering artifact. It's a real, previously-unknown risk in the blended-slot design** — a last-slot fill during a crash can arm and immediately force-exit at a bad price in the same instant, for real money, not just in an edge case of a flawed test. **Needs a design decision with the user next session**: whether/how to guard against arm-and-instant-force-exit (e.g., a minimum delay between arming and the stop becoming live, or requiring confirmation across ticks) before this branch's work is considered done, and before Model 4 goes live carrying this risk.
+Ran the full **Primary v2** window (2022→present) through both backtest and live replay for GS: Reflex (Model 4's config). Backtest: 182 trades, 2.2% loss rate, $100→$871. Live replay (identical signal/data/capital): 51 trades, **49% loss rate**, capital **permanently frozen at $49.42 by Aug 2022** (below the $10-per-slot minimum, never recovers since no trades = no P&L to climb back over the floor) — the remaining ~4 years of the window never traded at all. Loss rate scaled almost perfectly with slot count: 0% at 1 slot, **100% at 5 slots**.
 
-**The harness is now reusable for any stream, not just GS: Reflex** — parametrized via CLI (`--stream-config-id`, `--version`, `--start`, `--end`, `--lot-size`, `--slot-count`, `--slot-mode`), so it can (and per the user's ask, should) be run against any stream under active design/testing going forward, alongside the backtester, not only as a pre-deployment gate. `tools/live_replay/gauntlet_gs_reflex.py` (backtest-only 4-part Gauntlet) and `tools/live_replay/trade2_diagnose.py` (the original per-tick root-cause tool, now flagged as using the old pre-fix ordering) both carried over for reference.
+Root cause, confirmed via a full tick-by-tick trace of a real 5-slot trade (Jan 2022): **two stacked bugs**, not one —
+1. `place_exit()` placed an **unconditional market sell** the instant the trailing-stop/breakeven floor was computed — takes whatever price the market offers right then, which can be far below the floor during an active crash (exactly when a position tends to arm for the first time — a crash-bottom cascade fill drags the average down enough to cross the arm threshold while price is still falling).
+2. The **backtest's own exit-fill check was one-sided** (`row["low"] <= effective_stop`, no upper-bound check) — unlike every entry/add fill in the same file (`low <= price <= high`). It could credit a sale at a price the candle's `high` never actually reached that period — more optimistic than even a real limit order could achieve.
 
-**⚠️ Safety pattern preserved, unchanged — read before touching any of this:**
-Blanking `ALERT_*` env vars via `os.environ.pop()` is **fragile and already failed once for real** (a real email/SMS fired during testing) — any `load_dotenv()` call in an imported `src/live/*` module silently refills a var that's merely *missing* (dotenv's `override=False` only protects vars still *present*). The fix that's actually proven to work: `mock.patch("src.live.blended_notifier._dispatch")` and `mock.patch("src.live.notifier._dispatch")` — the two real chokepoints every alert funnels through, wrapping the *entire* script execution, with a printed+asserted call-through check *before* anything else runs. `replay_gauntlet.py`'s `_verify_alerts_mocked()` does this and is called first thing in `run_replay()`. Do not run anything that drives real (non-dry-run) `blended_order_manager`/`blended_position_monitor` code without this pattern, verified working, first.
+**This second bug exists in ALL FOUR backtest slot modes** (`_run_slot`, `_run_staggered_slots`, `_run_cascade_slots`, `_run_blended_slots`), not just blended — meaning every model's backtest, not only Model 3/4's, has been running with this optimism the whole project has existed.
 
-**Not yet decided:** whether to formalize this as a named, repeatable process (parallel to "The Gauntlet") that every model must pass before deployment; whether `compute_metrics()`'s drawdown calculation (already flagged as realized-P&L-only, not mark-to-market) needs fixing as a result; whether the backtest's zero-slippage exit assumption needs a realistic slippage model given this confirmed real divergence.
+### Model 1/2 audit — the good news half
 
-**`tests/live/` still 38/38 passing** (pre-existing unrelated `test_signal_parity.py` collection error excluded, as always) — no production code was touched this session, only `tools/`.
+Re-ran Model 1's and Model 2's real deployed/selected compositions (all `slot_mode='single'`, no staggered/cascade in actual use) old vs. new, with a *different* realism fix appropriate to their design (Model 1/2 stay real **market** sells by deliberate choice — a stop-loss should guarantee execution, not rest unfilled during a crash — so the honest fix there is "never assume a fill better than the candle's close," not a touch check):
+
+| | Full History (old → new) |
+|---|---|
+| Model 1 | 17.6% → 15.7% ann |
+| Model 2 | 16.6% → 12.9% ann |
+| Model 3 (blended) | 59.0% → 2.5% ann (before the live-code fix; see below) |
+| Model 4 (blended) | ~4.5-7x M1/2 claimed → 3.1% ann |
+
+Model 1/2 were modestly optimistic (10-25% overstatement) — normal backtest slop, not broken. Blended mode's arm/breakeven/ladder design is what turned a modest bias into 10-20x fictional inflation. **This means the documented reason for retiring Model 1/2 ("Model 3/4 beat them 3-7x") no longer holds** — with honest numbers on both sides, Model 1/2 are comparable to or better than Model 3/4. That retirement decision needs revisiting with the user directly (flagged, not yet resolved — separate from the engineering fix below).
+
+### The fix (Model 3/4 only — shared `blended_order_manager.py`/`blended_position_monitor.py`)
+
+Scoped to blended mode via explicit user decision (Model 1 stays market-sell). Design, worked out with the user across several corrections:
+
+- **Once armed, a real resting LIMIT sell is placed at the floor** (`ensure_pending_exit`/`check_pending_exit` in `blended_order_manager.py`), not an immediate market sell. Re-prices (cancel + replace) whenever the computed floor moves. Confirmed via a real fill on Kraken's own order book, polled by `check_pending_exit()` — mirrors the existing `check_pending_entry`/`check_pending_add` pattern exactly.
+- **Cascade adds keep working after arming** (an earlier, more restrictive draft froze composition on arm — wrong; a new, cheaper fill only ever *lowers* the exit floor, never raises it, so there's no real conflict between a resting buy below and a resting sell above).
+- **`trail_armed`/`trail_armed_at` persisted** (new columns, migration v8) — once true, permanently disables **capitulation** for that position (a position that's proven it can arm should never be forced into the deliberate loss-taking backstop meant for positions that never did). Capitulation itself is unchanged — still an immediate, guaranteed market sell, same reasoning as Model 1's hard stop-loss.
+- Backtest (`_run_blended_slots` only) got the matching two-sided touch check plus the same armed/capitulation mutual-exclusion logic, so backtest and live share the same rules.
+- Real bug caught mid-build: `armed_now` could come out as `numpy.bool_` (from a pandas-derived close value) which psycopg2 can't bind — fixed with an explicit `bool()` cast.
+
+**Re-validated with the replay harness after the fix:**
+
+| | GS: Reflex (Model 4) | Grid Stacker Blended (Model 3) |
+|---|---|---|
+| Loss rate before fix | 49% | (not re-tested pre-fix, same bug) |
+| **Loss rate after fix** | **9%** (matches backtest's ~9%) | **0%** |
+| Capital trajectory | Never freezes, compounds the whole window | Never freezes |
+| Total P&L | -$50.58 (frozen) → **+$94.51** | **+$95.94** |
+
+GS: Reflex still has 4 small residual losses (-$0.45 to -$1.85, all tagged `trailing_stop`) — real but tiny, likely a fee-rate/ladder-interaction rounding effect, not the structural failure. Flagged honestly, not chased further this session.
+
+**Tests:** `tests/live/test_blended_state_machine.py`, `test_blended_isolation.py`, `test_model4_mechanics.py` updated for the new async (place-then-poll) exit flow; new `tests/live/test_trail_armed_pending_exit.py` covers the three behaviors specific to this fix (cascade-adds-continue-after-arming, capitulation-never-fires-once-armed, pending-exit-reprices-when-floor-moves). **41/41 passing** (`test_signal_parity.py` excluded, pre-existing unrelated issue).
+
+### Not yet done / decided
+
+- **Not yet ported to `main`/`live-model-3`/`live-model-4`.** Model 3 is live right now with real money and hasn't had a real trailing-stop exit fire yet — this fix should land there before it does. This is now the single most urgent item, ahead of finishing the Model 4 cutover.
+- Whether to formalize this replay harness as a named, repeatable process (parallel to "The Gauntlet") every model must pass before deployment.
+- **The Model 1/2 retirement decision needs revisiting** — see the audit above.
+- The 4 small residual losses in GS: Reflex — worth a closer look eventually, not urgent (magnitude is now rounding-level, not structural).
+
+**⚠️ Safety pattern, unchanged, still required for any future replay work:**
+`mock.patch("src.live.blended_notifier._dispatch")` and `mock.patch("src.live.notifier._dispatch")` wrapping the entire script, with a printed+asserted call-through check *before* anything else runs. `replay_gauntlet.py`'s `_verify_alerts_mocked()` does this first thing in `run_replay()`. Two real alerts fired before this pattern was adopted — do not simplify it away.
 
 ---
 

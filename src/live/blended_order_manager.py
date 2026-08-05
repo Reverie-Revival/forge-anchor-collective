@@ -565,38 +565,83 @@ def _apply_add_fill(conn, pos, order: dict, vol_exec: float, now, stream: dict) 
                                     add_capital, fill_price, new_avg)
 
 
+def _sum_entry_fees(conn, position_id: int) -> tuple[float, bool]:
+    """Real entry-side fees for a position, per-fill (not SUM(fee_usd) -- see
+    place_exit's original docstring: a mix of legacy NULL and real fee_usd
+    rows would silently undercount via SQL SUM). Returns (total, is_estimated)."""
+    fills = conn.execute(
+        text("SELECT capital, fee_usd FROM live.blended_fills WHERE position_id = :pid"),
+        {"pid": position_id},
+    ).fetchall()
+    total = 0.0
+    estimated = False
+    for fill in fills:
+        if fill.fee_usd is not None:
+            total += float(fill.fee_usd)
+        else:
+            total += float(fill.capital) * MAKER_FEE  # legacy fill, opened before the fee-capture fix
+            estimated = True
+    return total, estimated
+
+
+def _close_position(conn, position, real_exit_price: float, exit_fee_usd: float,
+                    fee_is_estimated: bool, exit_reason: str, txid: str,
+                    kraken_order_txid: str, stream_name: str, model_id: int, dry_run: bool) -> float:
+    """Shared finalize step: record the real fill, update capital ledger, alert.
+    Used by both the immediate market-sell (capitulation) path and the
+    confirmed-fill callback from check_pending_exit() (armed/trailing-stop path)."""
+    total_qty = float(position.total_qty)
+    total_deployed = float(position.total_deployed)
+    total_entry_fees_usd, entry_fees_estimated = _sum_entry_fees(conn, position.position_id)
+    fee_is_estimated = fee_is_estimated or entry_fees_estimated
+
+    pnl = (total_qty * real_exit_price) - exit_fee_usd - total_deployed - total_entry_fees_usd
+    closing_capital = total_deployed + pnl
+
+    conn.execute(
+        text("""
+            UPDATE live.blended_positions
+            SET status = 'CLOSED', exit_price = :price, exit_order_id = :txid,
+                exit_fee_usd = :exit_fee, fee_is_estimated = :estimated,
+                closing_capital = :closing, realized_pnl = :pnl,
+                exit_reason = :reason, closed_at = :now,
+                pending_exit_order_id = NULL, pending_exit_price = NULL, pending_exit_placed_at = NULL
+            WHERE position_id = :pid
+        """),
+        {"price": real_exit_price, "txid": kraken_order_txid, "exit_fee": round(exit_fee_usd, 4),
+         "estimated": fee_is_estimated, "closing": round(closing_capital, 2),
+         "pnl": round(pnl, 2), "reason": exit_reason, "now": datetime.now(timezone.utc),
+         "pid": position.position_id},
+    )
+
+    available_capital = get_available_capital(conn, model_id)
+    _update_available_capital(conn, model_id, available_capital + pnl)
+
+    if not dry_run:
+        notifier.alert_blend_closed(stream_name, model_id, total_deployed,
+                                    round(closing_capital, 2), round(pnl, 2), exit_reason)
+    return pnl
+
+
 def place_exit(conn, position, exit_price: float, exit_reason: str,
               kraken: KrakenClient, dry_run: bool = False,
               stream_name: str = "", model_id: int = 0) -> None:
     """
-    Market-sell the whole blended stack and close the position.
+    Market-sell the whole blended stack and close the position IMMEDIATELY.
 
-    exit_price: the computed stop-trigger price -- used as-is in dry run, and
-    as the fallback if Kraken's post-placement status poll doesn't confirm a
+    Only used for capitulation (a deliberate, guaranteed forced cut -- real
+    urgency to get out, same reasoning as Model 1's hard stop-loss staying a
+    market order). The armed/trailing-stop path no longer calls this -- see
+    ensure_pending_exit()/check_pending_exit(), which place a real resting
+    limit order at the floor instead, since a market sell here could (and
+    did, during a live-replay audit) fill far below the intended "never
+    voluntarily realize a loss" floor during an active crash.
+
+    exit_price: the computed trigger price -- used as-is in dry run, and as
+    the fallback if Kraken's post-placement status poll doesn't confirm a
     real fill yet (market sells fill essentially instantly, so this is rare).
-    Real fee is summed from live.blended_fills.fee_usd (every entry + cascade
-    add) plus the real exit fee, replacing the old TAKER_FEE-only estimate.
     """
     total_qty = float(position.total_qty)
-    total_deployed = float(position.total_deployed)
-    fee_is_estimated = False
-
-    # Per-fill, not a single SUM(fee_usd) -- a position can have a MIX of
-    # legacy fills (NULL fee_usd, opened before this fix) and real ones (e.g.
-    # slot 1 filled pre-migration, a later cascade add filled after). SQL SUM
-    # silently ignores NULLs, which would undercount the legacy fill's fee
-    # entirely and leave fee_is_estimated False -- wrong on both counts.
-    fills = conn.execute(
-        text("SELECT capital, fee_usd FROM live.blended_fills WHERE position_id = :pid"),
-        {"pid": position.position_id},
-    ).fetchall()
-    total_entry_fees_usd = 0.0
-    for fill in fills:
-        if fill.fee_usd is not None:
-            total_entry_fees_usd += float(fill.fee_usd)
-        else:
-            total_entry_fees_usd += float(fill.capital) * MAKER_FEE  # legacy fill, opened before this fix
-            fee_is_estimated = True
 
     if dry_run:
         log.info(f"[DRY RUN] Would market sell position {position.position_id}: "
@@ -604,6 +649,7 @@ def place_exit(conn, position, exit_price: float, exit_reason: str,
         txid = f"DRY-EXIT-{position.position_id}"
         real_exit_price = exit_price
         exit_fee_usd = total_qty * exit_price * TAKER_FEE
+        fee_is_estimated = False
     else:
         try:
             txid = kraken.place_order("sell", total_qty, order_type="market")
@@ -622,6 +668,7 @@ def place_exit(conn, position, exit_price: float, exit_reason: str,
         if order.get("status") == "closed" and float(order.get("vol_exec", 0) or 0) > 0:
             real_exit_price = float(order.get("price", 0) or 0)
             exit_fee_usd = float(order.get("fee", 0) or 0)
+            fee_is_estimated = False
         else:
             log.warning(f"Exit order {txid} (position {position.position_id}) not confirmed filled on "
                         "first poll -- using estimated price/fee, flagging for manual reconciliation")
@@ -629,27 +676,106 @@ def place_exit(conn, position, exit_price: float, exit_reason: str,
             exit_fee_usd = total_qty * exit_price * TAKER_FEE
             fee_is_estimated = True
 
-    pnl = (total_qty * real_exit_price) - exit_fee_usd - total_deployed - total_entry_fees_usd
-    closing_capital = total_deployed + pnl
+    _close_position(conn, position, real_exit_price, exit_fee_usd, fee_is_estimated,
+                    exit_reason, txid, txid, stream_name, model_id, dry_run)
+
+
+def ensure_pending_exit(conn, position, target_price: float, kraken: KrakenClient,
+                        dry_run: bool = False) -> None:
+    """
+    Place (or re-price) a real resting LIMIT sell for an armed position at
+    target_price. Kraken's own order book decides if/when it actually
+    fills -- check_pending_exit() polls for that separately. Never finalizes
+    the position itself.
+
+    Idempotent: no-op if a pending exit already rests at (essentially) this
+    same price; cancels and replaces if the floor has moved (it only ever
+    moves up while armed, since HWM never falls and cascade adds only lower
+    avg cost, per the ladder/breakeven math in blended_position_monitor.py).
+    """
+    total_qty = float(position.total_qty)
+    current_order_id = position.pending_exit_order_id
+    current_price = float(position.pending_exit_price) if position.pending_exit_price is not None else None
+
+    if current_order_id is not None and current_price is not None and abs(current_price - target_price) < 0.01:
+        return  # already correctly resting
+
+    if dry_run:
+        if current_order_id is not None:
+            log.info(f"[DRY RUN] Would re-price pending exit for position {position.position_id}: "
+                     f"${current_price:.2f} -> ${target_price:.2f}")
+        else:
+            log.info(f"[DRY RUN] Would place pending exit limit sell for position {position.position_id} "
+                     f"@ ${target_price:.2f}")
+        txid = f"DRY-PENDING-EXIT-{position.position_id}"
+    else:
+        if current_order_id is not None:
+            try:
+                kraken.cancel_order(current_order_id)
+            except Exception as e:
+                log.warning(f"Cancel attempt for stale pending exit {current_order_id} "
+                            f"(position {position.position_id}) raised: {e}")
+        try:
+            txid = kraken.place_order("sell", total_qty, price_usd=target_price, order_type="limit")
+            log.info(f"Pending exit limit sell {'re-priced' if current_order_id else 'placed'} for "
+                     f"position {position.position_id}: {total_qty:.8f} BTC @ ${target_price:.2f} txid={txid}")
+        except Exception as e:
+            log.error(f"Failed to place pending exit order for position {position.position_id}: {e}")
+            return
 
     conn.execute(
         text("""
             UPDATE live.blended_positions
-            SET status = 'CLOSED', exit_price = :price, exit_order_id = :txid,
-                exit_fee_usd = :exit_fee, fee_is_estimated = :estimated,
-                closing_capital = :closing, realized_pnl = :pnl,
-                exit_reason = :reason, closed_at = :now
+            SET pending_exit_order_id = :txid, pending_exit_price = :price, pending_exit_placed_at = :now
             WHERE position_id = :pid
         """),
-        {"price": real_exit_price, "txid": txid, "exit_fee": round(exit_fee_usd, 4),
-         "estimated": fee_is_estimated, "closing": round(closing_capital, 2),
-         "pnl": round(pnl, 2), "reason": exit_reason, "now": datetime.now(timezone.utc),
-         "pid": position.position_id},
+        {"txid": txid, "price": target_price, "now": datetime.now(timezone.utc), "pid": position.position_id},
     )
 
-    available_capital = get_available_capital(conn, model_id)
-    _update_available_capital(conn, model_id, available_capital + pnl)
 
-    if not dry_run:
-        notifier.alert_blend_closed(stream_name, model_id, total_deployed,
-                                    round(closing_capital, 2), round(pnl, 2), exit_reason)
+def check_pending_exit(conn, kraken: KrakenClient, streams: dict, dry_run: bool = False) -> tuple[int, int]:
+    """
+    Poll Kraken for resting exit limit orders. Finalize the position on a
+    real confirmed fill. No expiry/abandon -- unlike entries and adds, an
+    armed position's exit can't just be given up on; if unfilled, it keeps
+    resting (and gets re-priced by ensure_pending_exit as the floor moves)
+    until the market genuinely reaches it.
+    """
+    now = datetime.now(timezone.utc)
+    pending = conn.execute(
+        text("""
+            SELECT bp.position_id, bp.stream_id, bp.model_id, ls.stream_name,
+                   bp.pending_exit_order_id, bp.total_qty, bp.total_deployed
+            FROM live.blended_positions bp
+            JOIN live.streams ls ON ls.stream_id = bp.stream_id
+            WHERE bp.status = 'OPEN' AND bp.pending_exit_order_id IS NOT NULL
+        """)
+    ).fetchall()
+
+    fills = 0
+    still_pending = 0
+
+    for pos in pending:
+        if dry_run:
+            log.debug(f"[DRY RUN] Skipping exit-fill check for position_id={pos.position_id}")
+            continue
+
+        order, _ = _resolve_order(kraken, pos.pending_exit_order_id, None, now,
+                                  f"position {pos.position_id} pending exit")
+        if order is None:
+            still_pending += 1
+            continue
+
+        vol_exec = float(order.get("vol_exec", 0) or 0)
+        if vol_exec > 0:
+            real_exit_price = float(order.get("price", 0) or 0)
+            exit_fee_usd = float(order.get("fee", 0) or 0)
+            _close_position(conn, pos, real_exit_price, exit_fee_usd, False, "trailing_stop",
+                            pos.pending_exit_order_id, pos.pending_exit_order_id,
+                            pos.stream_name, pos.model_id, dry_run)
+            fills += 1
+        else:
+            # Still resting -- this is the normal, expected case most ticks.
+            still_pending += 1
+
+    return fills, still_pending
