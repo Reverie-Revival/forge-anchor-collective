@@ -1,17 +1,17 @@
-name: Live Executor
+name: Executor Healthcheck — Model 4
 
 on:
   workflow_dispatch:
 
 jobs:
-  tick:
+  check:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 3
 
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: live-model-1
+          ref: live-model-4
 
       - uses: actions/setup-python@v5
         with:
@@ -21,19 +21,11 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run executor tick
+      - name: Check Model 4 executor heartbeat
         env:
-          DATABASE_URL: ${{ secrets.SUPABASE_DATABASE_URL }}
-          KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
-          KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
-          DRY_RUN: ${{ secrets.DRY_RUN }}
+          SUPABASE_DATABASE_URL: ${{ secrets.SUPABASE_DATABASE_URL }}
           ALERT_FROM_EMAIL: ${{ secrets.ALERT_FROM_EMAIL }}
           ALERT_APP_PASSWORD: ${{ secrets.ALERT_APP_PASSWORD }}
           ALERT_TO_EMAIL: ${{ secrets.ALERT_TO_EMAIL }}
           ALERT_TO_SMS: ${{ secrets.ALERT_TO_SMS }}
-        run: |
-          if [ "$DRY_RUN" = "true" ]; then
-            python -m src.live.executor --dry-run
-          else
-            python -m src.live.executor
-          fi
+        run: python -m src.live.blended_healthcheck

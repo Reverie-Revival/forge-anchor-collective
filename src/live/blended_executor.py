@@ -1,15 +1,17 @@
 """
-Live trading executor for Model 3 (Grid Stacker Blended) -- single-invocation
-tick for GitHub Actions, structurally parallel to executor.py (Model 1) but
-fully independent: separate DB tables (live.blended_positions/_fills/_capital),
-separate live.executor_state row (keyed by model_id instead of the shared
-singleton), separate GitHub Actions workflow + cron-job.org schedule, and
-(once cut) a separate live-model-3 branch. Never writes to live.lots and never
-reads Kraken's account balance for position sizing -- see
-blended_order_manager.py's capital-ledger design for why.
+Live trading executor for Model 4 (GS: Reflex) -- single-invocation tick for
+GitHub Actions, using the exact same blended mechanics as Model 3 (shares
+this file's structure and blended_order_manager.py/blended_position_monitor.py
+outright) but fully independent: separate DB rows (own live.models/
+live.streams/live.blended_capital, keyed by its own model_id, never Model 3's
+or Model 1's), separate live.executor_state row, separate GitHub Actions
+workflow + cron-job.org schedule, and its own live-model-4 branch (Model 1's
+former slot, repurposed once Model 1 was retired and sold out). Never writes
+to live.lots and never reads Kraken's account balance for position sizing --
+see blended_order_manager.py's capital-ledger design for why.
 
 On each run:
-  1. Read last_run_at from live.executor_state (model_id=3's row)
+  1. Read last_run_at from live.executor_state (this model's row)
   2. Detect which candle timeframes closed since last run
   3. For the stream's timeframe closing: check cascade-add trigger on any
      OPEN position, then (if no position building/open) check for a fresh
@@ -52,7 +54,7 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-LIVE_MODEL_VERSION = 3
+LIVE_MODEL_VERSION = 4
 
 
 def _get_engine():
@@ -212,7 +214,7 @@ def tick(conn, streams: dict, kraken: KrakenClient, last_tick: datetime,
 
 def run(dry_run: bool = False) -> None:
     mode = "DRY RUN" if dry_run else "LIVE"
-    log.info(f"=== Forge Anchor Executor — Model {LIVE_MODEL_VERSION} (Grid Stacker Blended) [{mode}] ===")
+    log.info(f"=== Forge Anchor Executor — Model {LIVE_MODEL_VERSION} (GS: Reflex) [{mode}] ===")
 
     engine = _get_engine()
     kraken = KrakenClient()
@@ -233,7 +235,7 @@ def run(dry_run: bool = False) -> None:
         conn.execute(text("SET statement_timeout = '15s'"))
         streams = _load_streams(conn)
         if not streams:
-            log.error(f"No active streams found for Model {LIVE_MODEL_VERSION}. Run deploy_model3.py first.")
+            log.error(f"No active streams found for Model {LIVE_MODEL_VERSION}. Run deploy_model4.py first.")
             sys.exit(1)
         log.info(f"Loaded {len(streams)} stream(s): {[s['stream_name'] for s in streams.values()]}")
 
@@ -252,7 +254,7 @@ def run(dry_run: bool = False) -> None:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Forge Anchor Model 3 (blended) live executor")
+    parser = argparse.ArgumentParser(description="Forge Anchor Model 4 (blended) live executor")
     parser.add_argument("--dry-run", action="store_true",
                         help="Run without placing real Kraken orders (DB writes are real)")
     args = parser.parse_args()

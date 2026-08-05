@@ -1,4 +1,4 @@
-name: Live Executor — Model 3
+name: Live Executor — Model 4
 
 on:
   workflow_dispatch:
@@ -11,7 +11,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: live-model-3
+          ref: live-model-4
 
       - uses: actions/setup-python@v5
         with:
@@ -21,23 +21,23 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run Model 3 executor tick
+      - name: Run Model 4 executor tick
         env:
           SUPABASE_DATABASE_URL: ${{ secrets.SUPABASE_DATABASE_URL }}
           # signal_engine.check() internally calls engine.py's load_market_data(),
           # which reads DATABASE_URL specifically (falls back to a nonexistent
-          # local Postgres in CI otherwise) -- same reason live-model-1's
+          # local Postgres in CI otherwise) -- same reason live-model-3's
           # workflows map this secret to both names. See HANDOFF.md 2026-08-02.
           DATABASE_URL: ${{ secrets.SUPABASE_DATABASE_URL }}
           KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
           KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
-          DRY_RUN_M3: ${{ secrets.DRY_RUN_M3 }}
+          DRY_RUN_M4: ${{ secrets.DRY_RUN_M4 }}
           ALERT_FROM_EMAIL: ${{ secrets.ALERT_FROM_EMAIL }}
           ALERT_APP_PASSWORD: ${{ secrets.ALERT_APP_PASSWORD }}
           ALERT_TO_EMAIL: ${{ secrets.ALERT_TO_EMAIL }}
           ALERT_TO_SMS: ${{ secrets.ALERT_TO_SMS }}
         run: |
-          if [ "$DRY_RUN_M3" = "true" ]; then
+          if [ "$DRY_RUN_M4" = "true" ]; then
             python -m src.live.blended_executor --dry-run
           else
             python -m src.live.blended_executor
