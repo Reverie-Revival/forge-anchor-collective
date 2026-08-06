@@ -162,7 +162,11 @@ def test_capitulation_never_fires_once_armed(sandbox):
     with engine.begin() as conn:
         order_manager.check_pending_entry(conn, kraken, {stream["stream_id"]: stream}, dry_run=False)
 
-    # Rally 6% -- arms.
+    # Rally 6% -- arms. next_fill_mode="none" so the resting exit limit stays
+    # unfilled (FakeKraken's default "full" mode fills instantly, which would
+    # let the subsequent ensure_pending_exit fill-check discover it "filled"
+    # immediately and finalize the position -- not what this test is about).
+    kraken.next_fill_mode = "none"
     with engine.begin() as conn:
         candle_row = {stream["stream_id"]: {"close": 53000.0, "low": 52900.0}}
         position_monitor.check_all(conn, {stream["stream_id"]: stream}, candle_row, {"4h"}, kraken, dry_run=False)
@@ -214,7 +218,11 @@ def test_pending_exit_reprices_when_floor_moves(sandbox):
     with engine.begin() as conn:
         order_manager.check_pending_entry(conn, kraken, {stream["stream_id"]: stream}, dry_run=False)
 
-    # Rally 6% -- arms, places the first resting exit.
+    # Rally 6% -- arms, places the first resting exit. next_fill_mode="none" so
+    # it stays resting/unfilled (FakeKraken's default "full" mode fills
+    # instantly, which would let ensure_pending_exit's fill-check discover it
+    # "filled" on the very next call instead of re-pricing it).
+    kraken.next_fill_mode = "none"
     with engine.begin() as conn:
         candle_row = {stream["stream_id"]: {"close": 53000.0, "low": 52900.0}}
         position_monitor.check_all(conn, {stream["stream_id"]: stream}, candle_row, {"4h"}, kraken, dry_run=False)
@@ -226,6 +234,8 @@ def test_pending_exit_reprices_when_floor_moves(sandbox):
         assert first_order_id is not None
 
     # Rally further -- new HWM pushes the 5%-trail floor above the old one.
+    # Still "none" so the re-priced order also stays resting for inspection.
+    kraken.next_fill_mode = "none"
     with engine.begin() as conn:
         candle_row = {stream["stream_id"]: {"close": 58000.0, "low": 57900.0}}
         position_monitor.check_all(conn, {stream["stream_id"]: stream}, candle_row, {"4h"}, kraken, dry_run=False)

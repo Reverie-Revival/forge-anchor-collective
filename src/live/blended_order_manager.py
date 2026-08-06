@@ -681,24 +681,52 @@ def place_exit(conn, position, exit_price: float, exit_reason: str,
 
 
 def ensure_pending_exit(conn, position, target_price: float, kraken: KrakenClient,
-                        dry_run: bool = False) -> None:
+                        dry_run: bool = False, stream_name: str = "", model_id: int = 0) -> bool:
     """
     Place (or re-price) a real resting LIMIT sell for an armed position at
     target_price. Kraken's own order book decides if/when it actually
-    fills -- check_pending_exit() polls for that separately. Never finalizes
-    the position itself.
+    fills -- check_pending_exit() polls for that separately, on ticks where
+    this function doesn't itself discover the fill (see below).
 
     Idempotent: no-op if a pending exit already rests at (essentially) this
     same price; cancels and replaces if the floor has moved (it only ever
     moves up while armed, since HWM never falls and cascade adds only lower
     avg cost, per the ladder/breakeven math in blended_position_monitor.py).
+
+    Returns True if the position was closed by this call (a real fill was
+    discovered), False otherwise -- callers must stop treating the position
+    as OPEN if this returns True.
+
+    SAFETY: real time passes continuously between ticks in production (unlike
+    backtest/replay's discrete steps) -- an existing resting order can
+    genuinely fill on Kraken between the last time we looked and now. Before
+    ever cancelling/replacing an existing pending exit, this checks its REAL
+    status first. Blindly cancelling+replacing an already-filled order would
+    place a second, invalid sell for BTC we no longer hold.
     """
     total_qty = float(position.total_qty)
     current_order_id = position.pending_exit_order_id
     current_price = float(position.pending_exit_price) if position.pending_exit_price is not None else None
 
+    if current_order_id is not None and not dry_run:
+        try:
+            order = kraken.get_order_status(current_order_id)
+        except Exception as e:
+            log.warning(f"Could not check pending exit {current_order_id} (position {position.position_id}) "
+                        f"before re-pricing: {e} -- skipping this tick's re-price, will retry next tick")
+            return False
+        vol_exec = float(order.get("vol_exec", 0) or 0)
+        if order.get("status") == "closed" and vol_exec > 0:
+            log.info(f"Pending exit {current_order_id} (position {position.position_id}) already filled for "
+                     "real since the last check -- finalizing instead of re-pricing")
+            real_exit_price = float(order.get("price", 0) or 0)
+            exit_fee_usd = float(order.get("fee", 0) or 0)
+            _close_position(conn, position, real_exit_price, exit_fee_usd, False, "trailing_stop",
+                            current_order_id, current_order_id, stream_name, model_id, dry_run)
+            return True
+
     if current_order_id is not None and current_price is not None and abs(current_price - target_price) < 0.01:
-        return  # already correctly resting
+        return False  # already correctly resting
 
     if dry_run:
         if current_order_id is not None:
@@ -721,7 +749,7 @@ def ensure_pending_exit(conn, position, target_price: float, kraken: KrakenClien
                      f"position {position.position_id}: {total_qty:.8f} BTC @ ${target_price:.2f} txid={txid}")
         except Exception as e:
             log.error(f"Failed to place pending exit order for position {position.position_id}: {e}")
-            return
+            return False
 
     conn.execute(
         text("""
@@ -731,6 +759,7 @@ def ensure_pending_exit(conn, position, target_price: float, kraken: KrakenClien
         """),
         {"txid": txid, "price": target_price, "now": datetime.now(timezone.utc), "pid": position.position_id},
     )
+    return False
 
 
 def check_pending_exit(conn, kraken: KrakenClient, streams: dict, dry_run: bool = False) -> tuple[int, int]:

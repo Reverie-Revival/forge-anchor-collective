@@ -196,19 +196,26 @@ def tick(conn, streams: dict, kraken: KrakenClient, last_tick: datetime,
 
     entry_fills, entry_expirations = order_manager.check_pending_entry(conn, kraken, streams, dry_run)
     add_fills, add_expirations = order_manager.check_pending_add(conn, kraken, streams, dry_run)
-    exit_fills, _ = order_manager.check_pending_exit(conn, kraken, streams, dry_run)
     fills = entry_fills + add_fills
     expirations = entry_expirations + add_expirations
 
-    # exit_fills counted here too -- a trailing-stop exit now completes when
-    # check_pending_exit() confirms a real fill on a resting limit order, not
-    # synchronously inside check_all() (which only immediately closes
-    # capitulation exits -- see blended_position_monitor.py).
-    stops_triggered = exit_fills
+    # check_all() BEFORE check_pending_exit() -- deliberately, not the same
+    # order as the entry/add polls above. check_all() re-prices any resting
+    # exit to this tick's freshest floor (and ensure_pending_exit itself now
+    # checks for a real fill before touching an existing order -- see its
+    # docstring). Running check_pending_exit() second means its poll always
+    # sees this tick's current price, not last tick's stale one -- a one-tick
+    # lag here previously let live positions exit early (and fragment what
+    # should've been one continuous winning ride) on a small pullback that
+    # only touched an outdated, lower floor. Confirmed via a real live-replay
+    # divergence (see HANDOFF.md) before making this change.
+    stops_triggered = 0
     if closed_tfs and candle_row:
         stops_triggered += position_monitor.check_all(
             conn, streams, candle_row, closed_tfs, kraken, dry_run
         )
+    exit_fills, _ = order_manager.check_pending_exit(conn, kraken, streams, dry_run)
+    stops_triggered += exit_fills
 
     model_id = next(iter(streams.values()))["model_id"] if streams else None
     _log_tick(conn, model_id, last_tick, closed_tfs, open_count, pending_count,

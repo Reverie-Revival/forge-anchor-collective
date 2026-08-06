@@ -171,6 +171,18 @@ def test_full_cycle_entry_add_trailing_stop_exit(sandbox):
         )
         assert stops == 0   # armed but not yet triggered
 
+    # FakeKraken's default "full" mode fills a limit order the instant it's
+    # placed (at the price passed in, not the ticker) -- so the FIRST check_all
+    # call above already "filled" its resting order internally the moment it
+    # was placed; ensure_pending_exit's fill-check-before-re-price logic
+    # discovers that on THIS call (since a pending_exit_order_id now exists
+    # from the first call) and finalizes directly, rather than needing a
+    # separate check_pending_exit() poll.
+    with engine.begin() as conn:
+        pending_price = float(conn.execute(text("""
+            SELECT pending_exit_price FROM live.blended_positions WHERE stream_id = :sid
+        """), {"sid": stream["stream_id"]}).scalar())
+
     stop_trigger_low = armed_close * (1 - 0.05) - 1   # pierce the 5% trailing stop from this new high
     with engine.begin() as conn:
         capital_before = order_manager.get_available_capital(conn, model_id)
@@ -181,18 +193,7 @@ def test_full_cycle_entry_add_trailing_stop_exit(sandbox):
         stops = position_monitor.check_all(
             conn, {stream["stream_id"]: stream}, candle_row, {"4h"}, kraken, dry_run=False
         )
-        # Armed exits are now a real resting limit order, not an immediate
-        # market sell -- this call only places/re-prices it at the floor.
-        assert stops == 0
-        pending_price = float(conn.execute(text("""
-            SELECT pending_exit_price FROM live.blended_positions WHERE stream_id = :sid
-        """), {"sid": stream["stream_id"]}).scalar())
-
-    # FakeKraken's default "full" mode fills a limit order at the submitted
-    # price, not the ticker -- confirm the resting order via check_pending_exit.
-    with engine.begin() as conn:
-        fills, _ = order_manager.check_pending_exit(conn, kraken, {stream["stream_id"]: stream}, dry_run=False)
-        assert fills == 1
+        assert stops == 1
         pos = conn.execute(text("""
             SELECT status, realized_pnl, exit_reason, exit_price, exit_fee_usd, fee_is_estimated
             FROM live.blended_positions WHERE stream_id = :sid
@@ -331,6 +332,14 @@ def test_exit_with_mixed_legacy_and_real_fee_fills(sandbox):
         candle_row = {stream["stream_id"]: {"close": armed_close, "low": armed_close * 0.999}}
         position_monitor.check_all(conn, {stream["stream_id"]: stream}, candle_row, {"4h"}, kraken, dry_run=False)
 
+    # FakeKraken's default "full" mode already "filled" the first call's
+    # resting order internally the instant it was placed -- capture that price
+    # now, before the next check_all call discovers and finalizes it.
+    with engine.begin() as conn:
+        pending_price = float(conn.execute(text("""
+            SELECT pending_exit_price FROM live.blended_positions WHERE stream_id = :sid
+        """), {"sid": stream["stream_id"]}).scalar())
+
     stop_trigger_low = armed_close * (1 - 0.05) - 1
     with engine.begin() as conn:
         total_qty = float(conn.execute(text("""
@@ -340,15 +349,9 @@ def test_exit_with_mixed_legacy_and_real_fee_fills(sandbox):
         stops = position_monitor.check_all(
             conn, {stream["stream_id"]: stream}, candle_row, {"4h"}, kraken, dry_run=False
         )
-        # Armed exits are now a real resting limit order -- this only places it.
-        assert stops == 0
-        pending_price = float(conn.execute(text("""
-            SELECT pending_exit_price FROM live.blended_positions WHERE stream_id = :sid
-        """), {"sid": stream["stream_id"]}).scalar())
-
-    with engine.begin() as conn:
-        fills, _ = order_manager.check_pending_exit(conn, kraken, {stream["stream_id"]: stream}, dry_run=False)
-        assert fills == 1
+        # ensure_pending_exit's fill-check-before-re-price discovers the
+        # already-filled resting order and finalizes directly this call.
+        assert stops == 1
         pos = conn.execute(text("""
             SELECT realized_pnl, exit_fee_usd, fee_is_estimated FROM live.blended_positions WHERE stream_id = :sid
         """), {"sid": stream["stream_id"]}).fetchone()

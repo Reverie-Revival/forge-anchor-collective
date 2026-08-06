@@ -217,8 +217,13 @@ def check_all(
             # No "low <= stop_price" gate here: that was a backtest-only
             # simulation concept (approximating whether a resting order
             # would have been touched) -- live doesn't need to guess, the
-            # real exchange handles it.
-            order_manager.ensure_pending_exit(conn, full_pos, stop_price, kraken, dry_run)
+            # real exchange handles it. ensure_pending_exit itself checks for
+            # a real fill before touching an existing order, and may close
+            # the position directly (returns True) rather than just re-price.
+            closed = order_manager.ensure_pending_exit(conn, full_pos, stop_price, kraken, dry_run,
+                                                        stream_name=stream["stream_name"], model_id=stream["model_id"])
+            if closed:
+                stops_triggered += 1
         else:
             log.debug(
                 f"Position {pos.position_id} ({stream['stream_name']}): "

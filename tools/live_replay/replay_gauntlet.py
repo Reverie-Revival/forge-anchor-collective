@@ -223,17 +223,23 @@ def run_replay(stream_config_id: int, version: str, start: str, end: str,
                     if not order_manager.has_active_position(conn, stream_id) and bool(signals.loc[ts]):
                         order_manager.place_entry(conn, stream, kraken, dry_run=False)
 
-                    # (C), (D) poll fills — may include orders placed above, same tick.
-                    # Also polls any resting exit limit order from a PRIOR tick's
-                    # arming (see (E) below) -- matches blended_executor.tick()'s order.
+                    # (C), (D) poll entry/add fills — may include orders placed above, same tick.
                     order_manager.check_pending_entry(conn, kraken, streams, dry_run=False)
                     order_manager.check_pending_add(conn, kraken, streams, dry_run=False)
-                    order_manager.check_pending_exit(conn, kraken, streams, dry_run=False)
 
                     # (E) stop / trailing / capitulation check, this tick's candle --
                     # places/re-prices a resting exit limit order once armed (see
                     # ensure_pending_exit), rather than an immediate market sell.
                     position_monitor.check_all(conn, streams, candle_row, {tf}, kraken, dry_run=False)
+
+                    # Exit fill poll runs LAST, deliberately, AFTER check_all -- so it
+                    # always sees this tick's freshly re-priced floor, not last tick's
+                    # stale one. A one-tick lag here (poll-before-reprice) previously
+                    # let live positions exit early on a small pullback that only
+                    # touched an outdated, lower floor, fragmenting what should've
+                    # been one continuous winning ride -- confirmed via a real
+                    # divergence against the backtest (see HANDOFF.md).
+                    order_manager.check_pending_exit(conn, kraken, streams, dry_run=False)
 
                 if i % 20 == 0:
                     print(f"  ...tick {i}/{len(df)} ({ts})", flush=True)
