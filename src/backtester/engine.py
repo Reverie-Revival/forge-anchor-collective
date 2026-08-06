@@ -124,21 +124,19 @@ def _run_slot(df: pd.DataFrame, signals: pd.Series, params: dict, slot: int,
     pending_entry = None  # (limit_price, candles_remaining, capital)
     slot_capital = initial_capital
 
+    def _open(ts, price, capital):
+        return {
+            "entry_ts": ts, "entry_price": price, "highest_close": price,
+            "lowest_low": price, "highest_high": price, "candles_held": 0,
+            "partial_done": False, "capital": capital,
+        }
+
     for i, (ts, row) in enumerate(df.iterrows()):
         # --- attempt pending limit fill ---
         if pending_entry and open_trade is None:
             limit_price, ttl, entry_capital = pending_entry
             if row["low"] <= limit_price <= row["high"]:
-                open_trade = {
-                    "entry_ts": ts,
-                    "entry_price": limit_price,
-                    "highest_close": limit_price,
-                    "lowest_low": limit_price,
-                    "highest_high": limit_price,
-                    "candles_held": 0,
-                    "partial_done": False,
-                    "capital": entry_capital,
-                }
+                open_trade = _open(ts, limit_price, entry_capital)
                 pending_entry = None
             else:
                 ttl -= 1
@@ -253,7 +251,18 @@ def _run_slot(df: pd.DataFrame, signals: pd.Series, params: dict, slot: int,
         # --- check for new signal ---
         if open_trade is None and pending_entry is None and signals.iloc[i] and slot_capital > 0.01:
             limit_price = row["close"]
-            pending_entry = (limit_price, expiry, slot_capital)
+            # Real production checks a freshly placed order for a fill in the
+            # SAME tick it's placed (see blended_executor.tick()) -- a limit
+            # buy AT the current price trivially sits inside this candle's own
+            # [low, high] range, so it fills immediately in reality, not a
+            # full candle later. Deferring this check to the NEXT iteration
+            # (the old behavior) imposed an artificial one-tick delay on every
+            # entry -- confirmed as a real cause of backtest/live divergence
+            # via live-replay (see HANDOFF.md).
+            if row["low"] <= limit_price <= row["high"]:
+                open_trade = _open(ts, limit_price, slot_capital)
+            else:
+                pending_entry = (limit_price, expiry, slot_capital)
 
     # close any open trade at end of data
     if open_trade:
@@ -375,17 +384,18 @@ def _run_staggered_slots(
     partial_conf = position.get("partial_exit")
     last_global_entry = -1
 
+    def _open(ts, price, capital):
+        return {"entry_ts": ts, "entry_price": price, "highest_close": price,
+                "lowest_low": price, "highest_high": price, "candles_held": 0,
+                "partial_done": False, "capital": capital}
+
     for i, (ts, row) in enumerate(df.iterrows()):
         for slot in slots:
             # attempt pending fill
             if slot["pending_entry"] and slot["open_trade"] is None:
                 lp, ttl, cap = slot["pending_entry"]
                 if row["low"] <= lp <= row["high"]:
-                    slot["open_trade"] = {
-                        "entry_ts": ts, "entry_price": lp,
-                        "highest_close": lp, "lowest_low": lp, "highest_high": lp,
-                        "candles_held": 0, "partial_done": False, "capital": cap,
-                    }
+                    slot["open_trade"] = _open(ts, lp, cap)
                     slot["pending_entry"] = None
                 else:
                     ttl -= 1
@@ -473,7 +483,14 @@ def _run_staggered_slots(
             )
             if free_slots:
                 chosen = free_slots[0]
-                chosen["pending_entry"] = (row["close"], expiry, chosen["capital"])
+                # Same-tick fill check -- see _run_slot's identical comment:
+                # a limit buy AT the current close trivially sits inside this
+                # candle's own range, so it fills immediately in reality, not
+                # a full candle later (the old, backtest-only behavior).
+                if row["low"] <= row["close"] <= row["high"]:
+                    chosen["open_trade"] = _open(ts, row["close"], chosen["capital"])
+                else:
+                    chosen["pending_entry"] = (row["close"], expiry, chosen["capital"])
                 chosen["last_entry_candle"] = i
                 last_global_entry = i
 
@@ -561,6 +578,28 @@ def _run_cascade_slots(
 
     all_trades = []
 
+    def _fill(slot, ts, price, capital):
+        """Open a slot's trade and apply the same side effects a fill always
+        triggers (arm the next slot's cascade trigger, arm the previous
+        slot's ladder stop) -- shared so a same-tick fill (see sections 2/3
+        below) behaves identically to one discovered on a later tick."""
+        slot["open_trade"] = {
+            "entry_ts": ts, "entry_price": price, "highest_close": price,
+            "lowest_low": price, "highest_high": price,
+            "candles_held": 0, "capital": capital,
+        }
+        slot["pending_entry"] = None
+        nxt = slot["idx"] + 1
+        if nxt < slot_count:
+            slots[nxt]["cascade_trigger"] = price * (1 - cascade_drop)
+        if ladder_buffer_pct:
+            prev_idx = slot["idx"] - 1
+            if prev_idx >= 0 and slots[prev_idx]["open_trade"] is not None:
+                pt = slots[prev_idx]["open_trade"]
+                if not pt.get("ladder_armed"):
+                    pt["ladder_armed"] = True
+                    pt["ladder_peak"]  = price
+
     for i, (ts, row) in enumerate(df.iterrows()):
 
         # ── 1. Fill pending entries + manage open trades ─────────────────────
@@ -569,28 +608,7 @@ def _run_cascade_slots(
             if slot["pending_entry"] and slot["open_trade"] is None:
                 lp, ttl, cap = slot["pending_entry"]
                 if row["low"] <= lp <= row["high"]:
-                    slot["open_trade"] = {
-                        "entry_ts":     ts,
-                        "entry_price":  lp,
-                        "highest_close": lp,
-                        "lowest_low":   lp,
-                        "highest_high": lp,
-                        "candles_held": 0,
-                        "capital":      cap,
-                    }
-                    slot["pending_entry"] = None
-                    # arm the cascade trigger for the next slot
-                    nxt = slot["idx"] + 1
-                    if nxt < slot_count:
-                        slots[nxt]["cascade_trigger"] = lp * (1 - cascade_drop)
-                    # arm the ladder stop on the previous (shallower) slot, if still open
-                    if ladder_buffer_pct:
-                        prev_idx = slot["idx"] - 1
-                        if prev_idx >= 0 and slots[prev_idx]["open_trade"] is not None:
-                            pt = slots[prev_idx]["open_trade"]
-                            if not pt.get("ladder_armed"):
-                                pt["ladder_armed"] = True
-                                pt["ladder_peak"]  = lp
+                    _fill(slot, ts, lp, cap)
                 else:
                     ttl -= 1
                     slot["pending_entry"] = (lp, ttl, cap) if ttl > 0 else None
@@ -675,12 +693,18 @@ def _run_cascade_slots(
                             slots[nxt]["cascade_trigger"] = None
 
         # ── 2. Slot 0: base signal entry ─────────────────────────────────────
+        # Same-tick fill check -- see _run_slot's identical comment: a limit
+        # buy AT the current close trivially sits inside this candle's own
+        # range, so it fills immediately in reality, not a full candle later.
         s0 = slots[0]
         if (signals.iloc[i]
                 and s0["open_trade"] is None
                 and s0["pending_entry"] is None
                 and s0["capital"] > 0.01):
-            s0["pending_entry"] = (row["close"], expiry, s0["capital"])
+            if row["low"] <= row["close"] <= row["high"]:
+                _fill(s0, ts, row["close"], s0["capital"])
+            else:
+                s0["pending_entry"] = (row["close"], expiry, s0["capital"])
 
         # ── 3. Slots 1+: cascade trigger check ───────────────────────────────
         for idx in range(1, slot_count):
@@ -692,8 +716,11 @@ def _run_cascade_slots(
                     and slot["pending_entry"] is None
                     and slot["capital"] > 0.01
                     and row["close"] <= slot["cascade_trigger"]):
-                slot["pending_entry"]   = (row["close"], expiry, slot["capital"])
                 slot["cascade_trigger"] = None  # consumed; will re-arm on fill
+                if row["low"] <= row["close"] <= row["high"]:
+                    _fill(slot, ts, row["close"], slot["capital"])
+                else:
+                    slot["pending_entry"] = (row["close"], expiry, slot["capital"])
 
     # ── Close any open trades at end of data ─────────────────────────────────
     for slot in slots:
@@ -1015,7 +1042,16 @@ def _run_blended_slots(
                             promotions_used += 1
                     trigger_price = original_entry_price * (1 - trigger_pct / 100.0)
                     if row["close"] <= trigger_price and slot_capitals[next_idx] > 0.01:
-                        pending_add = (row["close"], expiry, next_idx)
+                        lp = row["close"]
+                        # Same-tick fill check -- see _run_slot's identical
+                        # comment: a limit buy AT the current close trivially
+                        # sits inside this candle's own range, so it fills
+                        # immediately in reality, not a full candle later.
+                        if row["low"] <= lp <= row["high"]:
+                            qty = (slot_capitals[next_idx] * (1 - maker_fee)) / lp
+                            fills.append((lp, slot_capitals[next_idx], qty, ts))
+                        else:
+                            pending_add = (lp, expiry, next_idx)
 
         # --- slot 1: base signal entry ---
         if not position_open and pending_entry is None and signals.iloc[i]:
@@ -1037,7 +1073,18 @@ def _run_blended_slots(
                     effective_weights = weights
                 slot_capitals = slot_capitals_for(capital_base, effective_weights, slot_count)
             if slot_capitals[0] > 0.01:
-                pending_entry = (row["close"], expiry)
+                lp = row["close"]
+                # Same-tick fill check -- see _run_slot's identical comment.
+                if row["low"] <= lp <= row["high"]:
+                    qty = (slot_capitals[0] * (1 - maker_fee)) / lp
+                    fills = [(lp, slot_capitals[0], qty, ts)]
+                    position_open = True
+                    original_entry_price = lp
+                    highest_close = lp
+                    entry_ts = ts
+                    candles_held = 0
+                else:
+                    pending_entry = (lp, expiry)
 
     # close an open position at end of data
     if position_open:
