@@ -1,4 +1,128 @@
-# Handoff — 2026-08-02
+# Handoff — 2026-08-05
+
+## ✅ FIXED (this session): live exits were real market sells that could sell below the "never lose" floor — root-caused, fixed, re-validated. Also: this bug quietly inflated EVERY model's backtest, not just Model 3/4's
+
+**Branch: `live-replay-testing`**, off `live-model-4` (the replay harness needs Model 4's mechanics — `slot_math.py`, capitulation ladder, frozen slot capitals, promotion trigger — which only exist there). This branch now carries both the paused Model 4 cutover work and this session's much bigger finding.
+
+### How this started
+
+Built a live-replay harness (`tools/live_replay/replay_gauntlet.py`) that drives the real production order-management code tick-by-tick against historical data, instead of only trusting the backtest. First pass found a single-trade discrepancy (backtest small gain, live real loss). Fixed the harness's tick ordering to exactly match `blended_executor.tick()`'s real order (`A` cascade-add → `B` entry → `C`/`D` poll fills → `E` stop-check, not the harness's original `C,D,A,E,B`) — **the discrepancy persisted**, proving it wasn't a harness artifact.
+
+### The real bug, once traced to a specific trade
+
+Ran the full **Primary v2** window (2022→present) through both backtest and live replay for GS: Reflex (Model 4's config). Backtest: 182 trades, 2.2% loss rate, $100→$871. Live replay (identical signal/data/capital): 51 trades, **49% loss rate**, capital **permanently frozen at $49.42 by Aug 2022** (below the $10-per-slot minimum, never recovers since no trades = no P&L to climb back over the floor) — the remaining ~4 years of the window never traded at all. Loss rate scaled almost perfectly with slot count: 0% at 1 slot, **100% at 5 slots**.
+
+Root cause, confirmed via a full tick-by-tick trace of a real 5-slot trade (Jan 2022): **two stacked bugs**, not one —
+1. `place_exit()` placed an **unconditional market sell** the instant the trailing-stop/breakeven floor was computed — takes whatever price the market offers right then, which can be far below the floor during an active crash (exactly when a position tends to arm for the first time — a crash-bottom cascade fill drags the average down enough to cross the arm threshold while price is still falling).
+2. The **backtest's own exit-fill check was one-sided** (`row["low"] <= effective_stop`, no upper-bound check) — unlike every entry/add fill in the same file (`low <= price <= high`). It could credit a sale at a price the candle's `high` never actually reached that period — more optimistic than even a real limit order could achieve.
+
+**This second bug exists in ALL FOUR backtest slot modes** (`_run_slot`, `_run_staggered_slots`, `_run_cascade_slots`, `_run_blended_slots`), not just blended — meaning every model's backtest, not only Model 3/4's, has been running with this optimism the whole project has existed.
+
+### Model 1/2 audit — the good news half
+
+Re-ran Model 1's and Model 2's real deployed/selected compositions (all `slot_mode='single'`, no staggered/cascade in actual use) old vs. new, with a *different* realism fix appropriate to their design (Model 1/2 stay real **market** sells by deliberate choice — a stop-loss should guarantee execution, not rest unfilled during a crash — so the honest fix there is "never assume a fill better than the candle's close," not a touch check):
+
+| | Full History (old → new) |
+|---|---|
+| Model 1 | 17.6% → 15.7% ann |
+| Model 2 | 16.6% → 12.9% ann |
+| Model 3 (blended) | 59.0% → 2.5% ann (before the live-code fix; see below) |
+| Model 4 (blended) | ~4.5-7x M1/2 claimed → 3.1% ann |
+
+Model 1/2 were modestly optimistic (10-25% overstatement) — normal backtest slop, not broken. Blended mode's arm/breakeven/ladder design is what turned a modest bias into 10-20x fictional inflation. **This means the documented reason for retiring Model 1/2 ("Model 3/4 beat them 3-7x") no longer holds** — with honest numbers on both sides, Model 1/2 are comparable to or better than Model 3/4. That retirement decision needs revisiting with the user directly (flagged, not yet resolved — separate from the engineering fix below).
+
+### The fix (Model 3/4 only — shared `blended_order_manager.py`/`blended_position_monitor.py`)
+
+Scoped to blended mode via explicit user decision (Model 1 stays market-sell). Design, worked out with the user across several corrections:
+
+- **Once armed, a real resting LIMIT sell is placed at the floor** (`ensure_pending_exit`/`check_pending_exit` in `blended_order_manager.py`), not an immediate market sell. Re-prices (cancel + replace) whenever the computed floor moves. Confirmed via a real fill on Kraken's own order book, polled by `check_pending_exit()` — mirrors the existing `check_pending_entry`/`check_pending_add` pattern exactly.
+- **Cascade adds keep working after arming** (an earlier, more restrictive draft froze composition on arm — wrong; a new, cheaper fill only ever *lowers* the exit floor, never raises it, so there's no real conflict between a resting buy below and a resting sell above).
+- **`trail_armed`/`trail_armed_at` persisted** (new columns, migration v8) — once true, permanently disables **capitulation** for that position (a position that's proven it can arm should never be forced into the deliberate loss-taking backstop meant for positions that never did). Capitulation itself is unchanged — still an immediate, guaranteed market sell, same reasoning as Model 1's hard stop-loss.
+- Backtest (`_run_blended_slots` only) got the matching two-sided touch check plus the same armed/capitulation mutual-exclusion logic, so backtest and live share the same rules.
+- Real bug caught mid-build: `armed_now` could come out as `numpy.bool_` (from a pandas-derived close value) which psycopg2 can't bind — fixed with an explicit `bool()` cast.
+
+**Re-validated with the replay harness after the fix:**
+
+| | GS: Reflex (Model 4) | Grid Stacker Blended (Model 3) |
+|---|---|---|
+| Loss rate before fix | 49% | (not re-tested pre-fix, same bug) |
+| **Loss rate after fix** | **9%** (matches backtest's ~9%) | **0%** |
+| Capital trajectory | Never freezes, compounds the whole window | Never freezes |
+| Total P&L | -$50.58 (frozen) → **+$94.51** | **+$95.94** |
+
+GS: Reflex still has 4 small residual losses (-$0.45 to -$1.85, all tagged `trailing_stop`) — real but tiny, likely a fee-rate/ladder-interaction rounding effect, not the structural failure. Flagged honestly, not chased further this session.
+
+**Tests:** `tests/live/test_blended_state_machine.py`, `test_blended_isolation.py`, `test_model4_mechanics.py` updated for the new async (place-then-poll) exit flow; new `tests/live/test_trail_armed_pending_exit.py` covers the three behaviors specific to this fix (cascade-adds-continue-after-arming, capitulation-never-fires-once-armed, pending-exit-reprices-when-floor-moves). **41/41 passing** (`test_signal_parity.py` excluded, pre-existing unrelated issue).
+
+### Not yet done / decided
+
+- **Not yet ported to `main`/`live-model-3`/`live-model-4`.** Model 3 is live right now with real money and hasn't had a real trailing-stop exit fire yet — this fix should land there before it does. This is now the single most urgent item, ahead of finishing the Model 4 cutover.
+- Whether to formalize this replay harness as a named, repeatable process (parallel to "The Gauntlet") every model must pass before deployment.
+- **The Model 1/2 retirement decision needs revisiting** — see the audit above.
+- The 4 small residual losses in GS: Reflex — worth a closer look eventually, not urgent (magnitude is now rounding-level, not structural).
+
+**⚠️ Safety pattern, unchanged, still required for any future replay work:**
+`mock.patch("src.live.blended_notifier._dispatch")` and `mock.patch("src.live.notifier._dispatch")` wrapping the entire script, with a printed+asserted call-through check *before* anything else runs. `replay_gauntlet.py`'s `_verify_alerts_mocked()` does this first thing in `run_replay()`. Two real alerts fired before this pattern was adopted — do not simplify it away.
+
+---
+
+## ⏸️ PAUSED: Model 4 (GS: Reflex) replacing Model 1 on the same infra — resume after the above
+
+**Decision (user's, explicit, documented):** Models 1 and 2 are being retired ahead of schedule — not for underperformance in the sense the Model Commitment Rule was written to guard against, but because Models 3 and 4 are so far ahead (Model 3 ~3x, Model 4 ~4.5-7x Model 1/2's annualized returns, verified against real numbers, holds up after realistic tax treatment too) that continuing to run 1/2 isn't worth it. This is a one-time, conscious exception to the Commitment Rule — CLAUDE.md's Model Tournament section and the Commitment Rule subsection currently contradict each other slightly (one says "manually stopped" is a valid end condition, the other doesn't) — **CLAUDE.md still needs updating to reflect this decision and resolve that contradiction. Not done yet.**
+
+**The plan:** repurpose `live-model-1`'s branch/GitHub Actions/cron-job.org slot for Model 4, reusing the existing $100 capital (once Model 1's Breakout Scout position is manually sold) rather than deploying new money. Model 3 stays running unchanged.
+
+**Where things stand right now:** the code side of this is substantially built (see below) but **nothing has gone live yet** — no cron-job.org changes, no Supabase changes, no real position closed. Everything so far is safe, local/GitHub-only work.
+
+## Done This Session
+
+**1. Clean Model 4 cutover to `main` (separate from the live-infra work, landed first):**
+- PR #6 merged: `src/backtester/engine.py`'s `_run_blended_slots` now carries only what's actually used — Model 3 (v8, live)'s `capitulation_stop_pct`, plus Model 4 (GS: Reflex v2)'s capitulation ladder, sentiment tilt, slot promotion, shallow breakeven margin. Every rejected/unexercised experiment from the design session (concurrent stacks, skim bucket, wide-trail, vol-adaptive, `prior_slot` promotion anchor, ladder start/step shorthand) removed.
+- `docs/decisions/007-model4-gs-reflex-design.md` — renamed from `model4-design-notes.md` to follow the existing ADR numbering convention; now documents what shipped vs. what stayed archived.
+- Verified via independent hand-traced math (matched real engine to full float precision) and full preset re-runs (byte-identical to pre-cutover numbers) before and after.
+- Also on `main` this session (separate, earlier work, already shipped): Stream Tester performance fix (PR #5) — payload bloat (raw OHLCV dataframe in every saved pkl) and `st.tabs` eagerly rendering every tab on every rerun, both fixed.
+
+**2. `market_data.yml` moved to its own `live-market-data` branch.** It was hardcoded to check out `ref: live-model-1` — an accident of history, and exactly the kind of fragility that caused a real incident already (documented 2026-08-02 entry below). Now insulated from main's churn the same way live-model-1/3 already are. **cron-job.org's market_data job still needs to be retargeted to `ref:live-market-data` — not done yet, this is a required step before touching live-model-1/4.**
+
+**3. `live-model-1` → `live-model-4`.** Old `live-model-1` branch left untouched on GitHub as a rollback point (not deleted). New `live-model-4` branched fresh from `main` (not from old `live-model-1` — tried that first, caught by the user as messier than necessary; also confirmed `main` already had every blended file live-model-3 does, with equal-or-better comments, so `main` was the right base, not `live-model-3` either). On this branch:
+- **Caught and fixed my own mistake before pushing:** a broken grep filter hid the fact that `blended_executor.py`/`blended_order_manager.py`/`blended_position_monitor.py` genuinely import shared helper functions and fee constants from the plain `executor.py`/`notifier.py`/`order_manager.py`/`position_monitor.py`. I initially deleted all of these as "dead Model-1-only files," then restored all four after actually trying to import the modules in Python (not just grepping) and hitting `ImportError`. Only `deploy.py`, `healthcheck.py`, `setup_supabase.py`, `market_data_updater.py` are genuinely Model-1-only dead code — confirmed removed safely.
+- Added `executor_m4.yml`/`healthcheck_m4.yml` (renamed from `_m3` versions — `ref: live-model-4`, `DRY_RUN_M4`). Old `executor.yml`/`healthcheck.yml`/`executor_m3.yml`/`healthcheck_m3.yml` removed from this branch.
+- Bumped `LIVE_MODEL_VERSION` to 4 in `blended_executor.py`/`blended_healthcheck.py`, updated all Model-3-specific log/error text. Diffed line-by-line against `live-model-3`'s originals to confirm every change was exactly the intended one, nothing accidental.
+
+**4. Critical gap found and fixed: none of Model 4's four mechanisms existed in the live code.** They were built into the backtest engine only. Deployed as-is, Model 4 would have silently traded as plain Model 3 forever — the new config keys would just go unread. Fixed:
+- `_tilted_slot_weights` extracted from `engine.py` into `src/backtester/slot_math.py` (`tilted_slot_weights`, pandas-free) alongside `slot_capitals_for`, so backtest and live share the literal same formula. Confirmed behavior-preserving.
+- `blended_order_manager.py`: `place_entry()` now reads today's real Fear & Greed value (new `_get_fng_value`, queries `sentiment_data` directly) and freezes the tilted split into a new `frozen_slot_capitals` column so cascade adds don't re-tilt against a later reading. `check_cascade_add_trigger()` gained the `slot_promotion_days` "impatience" trigger, reproduced with its exact real quirk (promotion allowance spent whether or not it fires that candle) rather than an idealized version.
+- `blended_position_monitor.py`: `check_all()` gained the capitulation ladder (new `marked_count`/`marked_capitals` columns) and the shallow breakeven margin.
+- `src/data/migration_v7_model4_mechanics.sql` — adds `frozen_slot_capitals`, `promotions_used`, `marked_count`, `marked_capitals` to `live.blended_positions`. **Applied to local Postgres only. Supabase still needs this migration run before any real deploy — not done yet.**
+- New `tests/live/test_model4_mechanics.py` (5 tests, all passing) — real integration coverage against a mocked Kraken client + local Postgres for all four mechanisms, where there had been zero. Two of the five initial test scenarios failed on first write — not because the code was wrong, but because of a test arithmetic error and a wrong assumption about ladder timing (confirmed the second one was correct, Gauntlet-validated behavior by reproducing it directly in the backtest engine before adjusting the test).
+- New `tests/live/test_blended_executor_model4_lookup.py` — the one thing actually changed (`LIVE_MODEL_VERSION`) had zero test coverage until this was added.
+- Full suite: **38/38 passing** (pre-existing unrelated `test_signal_parity.py` collection error excluded, as always).
+- Backtest/Gauntlet re-confirmed byte-identical on `live-model-4` multiple times throughout, most recently just before this handoff was written.
+
+**5. ⚠️ Two real safety incidents this session, both from ad-hoc verification scripts (not from anything in the committed codebase) — read before running anything like this again:**
+- A standalone Python replay script (not a pytest test) drove real (non-dry-run) order-placement code without blocking alerts, and a real email/SMS fired. Root cause: blanking `ALERT_*` env vars via `os.environ.pop()` is **fragile** — any later `load_dotenv()` call (several `src/live/*` modules call it) silently refills a var that's merely *missing* (dotenv's `override=False` default only protects vars that are still *present*). `tests/live/conftest.py`'s fixture works because pytest controls timing relative to imports; a standalone script does not have that guarantee.
+- **The fix that actually works, verified in isolation before trusting it:** `mock.patch("src.live.blended_notifier._dispatch")` and `mock.patch("src.live.notifier._dispatch")` — both real chokepoints every alert call funnels through, immune to `load_dotenv()`. Any future script that drives real (non-dry-run) `blended_order_manager`/`blended_position_monitor` code **must** wrap the entire execution in both patches, and should print+assert a quick call-through check before doing anything else, exactly like `tools/live_replay_wip/live_replay_gauntlet.py` and `trade2_diagnose.py` now do (safely preserved on disk, untracked — see the "START HERE" section at the top of this document).
+
+## Critical Open Item — live-code replay surfaced a real, not-yet-resolved question
+
+Built a harness that drives the actual production functions (not the backtest) tick-by-tick against real historical `market_data`/`sentiment_data` in a local Postgres sandbox, with a fake Kraken client. This is fundamentally different from the backtest — it exercises the real DB-backed state machine and, critically, simulates real market-order slippage on exits (the backtest always assumes a perfect fill at the exact stop price; a real market sell fills at whatever the market offers).
+
+Replaying Jan 2026: entry/exit **dates** matched the backtest exactly, but Trade 2's **P&L flipped from a small backtest gain (+$1.01) to a real loss (-$7.18)**. Root-caused with real per-tick instrumentation, not guessed: the position sat at 4 filled slots with `armed=False` for over a week while price crashed, because `gain_pct` (measured against a stale high-water-mark) stayed just under the 4% arm threshold. The **5th and final slot filled right at the bottom of the crash**, which *itself* dragged the average cost down enough to clear the arm threshold *for the first time* — and the instant it armed, that same candle's low was already below the newly-computed breakeven stop, triggering an immediate market-sell exit that filled at the crashed price, not the stop level.
+
+**Not yet resolved:** whether this is a real, previously-unknown risk in the design (a last-slot fill during a crash can arm and immediately force-exit at a bad price in the same instant) or partly an artifact of the replay harness's tick ordering, which was built to match the *backtest's* loop order rather than production's *real* `tick()` order (production checks for a new cascade-add trigger and places that order *before* polling for fills in the same tick — the harness does it in the reverse order). This needs the harness rebuilt to match production's real ordering exactly, then re-run, before drawing a final conclusion. User wants this "tested hard" — likely its own dedicated session given the safety incidents above.
+
+## Remaining Steps To Go Live (in rough order)
+
+1. **Resolve the live-replay timing question** — see the "START HERE" section at the very top of this document; this is now its own initiative on its own branch, paused separately from the rest of this list (or explicitly decide to proceed without full resolution, if that's the call once it's investigated).
+2. Update CLAUDE.md's Model Tournament/Commitment Rule contradiction + document the Model 1/2 retirement decision.
+3. Write `deploy_model4.py` (adapted from `deploy_model3.py`) — **capital must be seeded from whatever real dollar amount Model 1's sellout actually returns, not a hardcoded $100** (this is a capital carry-forward, not new money).
+4. Adapt the Model-1-vs-Model-4 isolation test (mirror `tests/live/test_blended_isolation.py`, which currently only proves Model-1-vs-Model-3 isolation).
+5. Port the pure `slot_math.py`/`engine.py` refactor (item 4 above) back to `main` via its own small PR — it's currently only on `live-model-4`, and `main` should have it too since it's a verified no-op refactor.
+6. **User's turn:** pause Model 1's cron-job.org jobs, then manually sell Breakout Scout on Kraken. Tell Claude the real settlement amount for `deploy_model4.py`.
+7. **User's turn:** on cron-job.org — retarget the executor/healthcheck jobs to `executor_m4.yml`/`healthcheck_m4.yml` + `ref:live-model-4`; retarget the market_data job to `ref:live-market-data`. Apply `migration_v7_model4_mechanics.sql` to Supabase. Add a `DRY_RUN_M4` GitHub secret (start `true`).
+8. Manually trigger one dry-run dispatch, confirm clean, then flip `DRY_RUN_M4` to `false`.
+
+
 
 ## ✅ Real fees were wrong for every model — now corrected everywhere, including the live branches
 
