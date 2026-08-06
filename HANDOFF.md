@@ -1,10 +1,18 @@
 # Handoff — 2026-08-05
 
-## 🔴 START HERE (new session): backtest + live-replay both fixed and merged to `main`. Next: get Model 3 into a usable state on `live-model-3` — real money is exposed there right now
+## 🔴 START HERE (new session): backtest + live-replay both fixed and merged to `main`. Next: a NEW branch (off `main`) to redesign Model 3/4 and see if either can actually be made good. `live-model-3` deployment is deliberately deferred until after that.
 
 ### The one-sentence version
 
-This session found that the backtest had been crediting phantom fills (sales at prices the market never touched) for the entire life of the project — catastrophically for blended mode (Model 3/4, 10-20x inflation), modestly for Model 1/2 (10-25%, normal slop) — and that live code's exits used a market sell that could genuinely sell below the "never lose" floor. Both are now fixed, cross-validated against each other with a new live-replay harness, and merged to `main`. **None of this has been deployed to `live-model-3` yet, where real money sits right now with an open position that hasn't had a real trailing-stop exit fire.** That's the next session's first job.
+This session found that the backtest had been crediting phantom fills (sales at prices the market never touched) for the entire life of the project — catastrophically for blended mode (Model 3/4, 10-20x inflation), modestly for Model 1/2 (10-25%, normal slop) — and that live code's exits used a market sell that could genuinely sell below the "never lose" floor. Both are now fixed, cross-validated against each other with a new live-replay harness, and merged to `main`. With the fabrication gone, Model 3/4's *honest* backtested performance is weak (Grade 2-3, not the Grade 4-5 story everyone believed) — **so the next session's job is a redesign attempt, on a fresh branch, before touching real money again.** Porting the fix to `live-model-3` (where real money sits right now, unprotected) is explicitly deferred until after that — see "Deferred, not forgotten" below.
+
+### What to actually do this session
+
+1. **Branch off `main`** (not off `live-model-4` — that branch is now stale, see below) for the Model 3/4 redesign work.
+2. Use the backtest for fast iteration on stream parameters (arm threshold, ladder spacing/depth, capital weighting, maybe a different core signal entirely) — it's honest now, no longer fabricating fills, so real signal will show up in it.
+3. **Before trusting any promising candidate, run it through `tools/live_replay/replay_gauntlet.py` too** (exact commands below) — backtest alone is not sufficient evidence, per the trust discussion below. A large backtest-vs-live-replay disagreement on a candidate is a stop sign.
+4. Goal: find a configuration for Model 3 and/or Model 4 that clears something like Grade 4 (beats S&P by a real margin) *honestly*, not just clears break-even.
+5. `live-model-3`'s real deployment gap (it's still running the old market-sell exit code, unprotected) is a separate, still-urgent item — but the user has explicitly chosen to defer it until after this redesign attempt. Don't start that work unprompted this session.
 
 ### What actually happened, in order
 
@@ -20,21 +28,71 @@ This session found that the backtest had been crediting phantom fills (sales at 
 
 ### What this means for decisions already in motion
 
-**The documented reason for retiring Model 1/2 ("Model 3/4 beat them 3-7x") no longer holds.** With honest numbers on both sides: Model 1 ~9-24% annualized depending on preset, Model 2 ~11-17%, Model 3 ~1-13%, Model 4 ~1-16%. Model 1/2 are comparable to or better than Model 3/4 now. **This retirement decision needs revisiting directly with the user — not yet resolved, flagged repeatedly this session, still open.**
+**The documented reason for retiring Model 1/2 ("Model 3/4 beat them 3-7x") no longer holds.** With honest numbers on both sides: Model 1 ~9-24% annualized depending on preset, Model 2 ~11-17%, Model 3 ~-2-13%, Model 4 ~1-16%. Model 1/2 are comparable to or better than Model 3/4 now. **This retirement decision needs revisiting directly with the user — not yet resolved, flagged repeatedly this session, still open. Separate from the redesign work below — don't conflate the two.**
 
-### Immediate next steps (in order)
+### Current honest numbers, all four models, all five presets (all saved permanently in `backtest.model_tests` — query by these IDs if you need the full row)
 
-1. **Port the blended live-code fix to `live-model-3`.** This is the most urgent item in the whole project right now — real money, real open position, no protection until this ships. Needs: migration v8 applied to Supabase (not just local Postgres), the `blended_order_manager.py`/`blended_position_monitor.py`/`blended_executor.py` changes cherry-picked or merged in, full `tests/live/` green on that branch, then a careful, deliberate deploy (not a `--force`, review the diff against live-model-3's current state first — it diverged from `main` before this session started).
-2. **Then: is Model 3, honestly, worth continuing to run as currently configured?** The honest backtest (Grid Stacker Blended v8) shows ~1-13% annualized depending on preset — a Grade 2-3 (Weak-to-Passing) result, not the Grade 4-5 story it was believed to be. User's framing: "get it in a usable state" — this may mean redesigning stream parameters (arm threshold, ladder spacing, capital weighting) now that the backtest can't be gamed, re-validating any candidate change through *both* backtest and live-replay before trusting it, not just backtest alone (see the trust discussion below).
-3. **Then Model 4**, same treatment, once Model 3's real-money exposure is addressed.
-4. **Revisit the Model 1/2 retirement decision** with the user, using the corrected numbers above — separate from the engineering work.
-5. Consider whether to formalize the live-replay harness as a named, mandatory process (parallel to "The Gauntlet") every model must pass before deployment — raised, not decided.
+| Model | Preset | Trades | Ann. Return | Max DD | Total P&L | `model_test_id` |
+|---|---|---|---|---|---|---|
+| **1** (Momentum Rider + Dip Hunter + Breakout Scout, $33.33 each) | Full History | 143 | 15.2% | -19.0% | $236.48 | 128 |
+| 1 | Primary v2 | 67 | 9.1% | -16.1% | $48.87 | 131 |
+| 1 | Primary Window | 80 | 23.5% | -17.7% | $186.60 | 127 |
+| 1 | Recent | 41 | 8.9% | -16.2% | $24.52 | 129 |
+| 1 | 2026 YTD | 8 | 13.6% | -3.0% | $7.75 | 130 |
+| **2** (Breakout Scout + Dip Hunter + Momentum Rider + Volume Raider, $25 each) | Full History | 219 | 12.6% | -23.1% | $177.16 | 133 |
+| 2 | Primary v2 | 108 | 11.5% | -16.3% | $64.71 | 136 |
+| 2 | Primary Window | 120 | 17.5% | -19.5% | $123.71 | 132 |
+| 2 | Recent | 66 | 12.9% | -15.8% | $36.92 | 134 |
+| 2 | 2026 YTD | 13 | 11.6% | -3.3% | $6.62 | 135 |
+| **3** (Grid Stacker Blended v8, $100 solo) | Full History | 96 | 2.5% | -43.5% | $23.71 | 143 |
+| 3 | Primary v2 | 68 | 1.5% | -43.5% | $7.00 | 146 |
+| 3 | Primary Window | 72 | 12.6% | -32.7% | $80.90 | 142 |
+| 3 | Recent | 60 | **-1.8%** | -43.5% | -$4.56 | 144 |
+| 3 | 2026 YTD | 2 | -43.9% | -28.8% | -$28.72 | 145 |
+| **4** (GS: Reflex v2, $100 solo) | Full History | 70 | 1.3% | -47.2% | $11.56 | *(not saved — see note)* |
+| 4 | Primary v2 | 45 | 3.5% | -47.2% | $17.23 | *(not saved)* |
+| 4 | Primary Window | 70 | 11.9% | -33.1% | $75.04 | *(not saved)* |
+| 4 | Recent | 37 | 0.5% | -47.2% | $1.36 | *(not saved)* |
+| 4 | 2026 YTD | 2 | -43.3% | -28.7% | -$28.30 | *(not saved)* |
+
+**Model 4's numbers are NOT saved to `backtest.model_tests`** — `backtest.model_streams` currently has **two conflicting rows** for model_version=4 (GS: Reflex `v1` and `v2` both attached), explicitly marked in its own description as "not finalized/deployed; placeholder." Running the official `run_model()`/`save_model_test()` path against it right now would double-count both stream configs into one result. **Fix this (delete the stale `v1` row, keep only `v2`) before trying to save Model 4 results the official way** — the numbers above came from a direct `run_backtest()` call bypassing that layer, which is fine for reference but shouldn't be treated as saved/permanent. The 2026 YTD numbers for both models 3 and 4 (~-43%) are a 2-trade sample in a single bad stretch — noise, not signal, don't over-read it.
+
+### What to do with the `live-model-4` branch
+
+**Keep it, but treat it as stale — do not build the redesign work on top of it.** It's still at commit `e6124e3`, unchanged since before this session, meaning it still has the market-sell exit bug, the phantom-fill backtest bug, and none of this session's fixes. It has real, still-valid infra prep on it (the `executor_m3.yml`→`executor_m4.yml` workflow rename, `LIVE_MODEL_VERSION=4`, deletion of genuinely Model-1-only dead code) for the eventual plan of repurposing Model 1's infra slot for Model 4 — that plan itself is still fine, just premature until a redesigned Model 4 config is actually validated. When that day comes: either rebase `live-model-4` onto current `main` (bringing in all of this session's fixes) or re-apply just its infra-specific diff (workflow renames, dead-code deletion) onto a fresh branch cut from `main` at that time — don't just pick up where `live-model-4` left off assuming it's current, it isn't.
+
+### How to use the two live-replay tools (both under `tools/live_replay/`)
+
+**Blended mode (Model 3/Grid Stacker Blended, Model 4/GS: Reflex, or any future blended-mode stream)** — `replay_gauntlet.py`:
+```
+python -m tools.live_replay.replay_gauntlet --stream-config-id <id> --version <v> \
+    --start 2022-01-01 --end 2026-08-05 --lot-size <per-slot $> --slot-count <n> \
+    --slot-mode blended --stream-name "<name>"
+```
+e.g. Model 3: `--stream-config-id 11 --version v8 --lot-size 20 --slot-count 5`. Model 4: `--stream-config-id 12 --version v2` (same lot/slot). Takes ~40-90s for a 2022→present run. Prints a `BACKTEST reference` block, then ticks through, then `LIVE REPLAY:` with every closed position (slots used, entry avg, exit, pnl, reason).
+
+**Plain single-slot mode (Model 1/2 streams)** — `replay_model1.py`, same idea, no `--slot-count`/`--slot-mode`:
+```
+python -m tools.live_replay.replay_model1 --stream-id <id> --version <v> \
+    --start 2022-01-01 --end 2026-08-05 --lot-size <$> --stream-name "<name>"
+```
+Stream IDs: Momentum Rider=1, Dip Hunter=2, Breakout Scout=3, Volume Raider=4.
+
+**Both scripts print a notifier-mock safety check first** (`Notifier mock check ... must print True for both`) — if you ever see `False` there, or the script doesn't print that block at all before doing anything else, stop and do not let it continue; that check existing and passing is what makes it safe to run against real (non-dry-run) order-placement code. Two real alerts fired before this pattern existed — don't simplify it away, don't skip it "just this once."
+
+**Do not run these in parallel against the same local Postgres** — they share a reserved sentinel `model_version` (991 for blended, 992 for Model 1) for their sandbox rows; running two at once causes a real collision (confirmed this session — corrupted both runs). Run them sequentially.
 
 ### How much to trust backtest vs. live-replay going forward (asked directly this session, worth restating)
 
 Backtest: fast, no longer catastrophically wrong, good for first-pass iteration and comparing variants quickly. Not precise enough to trust for an exact number — still diverges from live-replay by a wide margin on blended mode's cumulative P&L (though loss *rate* now matches well).
 Live-replay: exercises the *real* production code, which is why it caught every bug above that a backtest reimplementation structurally never could. But it's still a simulation on the same historical OHLC data with the same touch-based fill assumptions (no order-book depth, no real slippage beyond candle-close for market orders) — it is **not** independently verified against actual Kraken execution, and its absolute numbers shouldn't be treated as ground truth either.
 **Practical rule:** backtest for fast iteration; anything before a real deploy decision needs to also clear live-replay, and a large disagreement between the two is a stop sign, not a detail to shrug off. Neither one alone is sufficient for a go/no-go call. The only real ground truth is actual executed trades on Kraken, which barely exist yet (Model 3 has fills but no completed real trailing-stop exit cycle).
+
+### Deferred, not forgotten (do not start unprompted — user's explicit call)
+
+1. **Port the blended live-code fix to `live-model-3`.** Real money, real open position, no protection (still on the old market-sell exit) until this ships — genuinely the single most urgent item in the project, but explicitly deferred until after the Model 3/4 redesign attempt above. Needs: migration v8 applied to Supabase (not just local Postgres), the `blended_order_manager.py`/`blended_position_monitor.py`/`blended_executor.py` changes merged in, full `tests/live/` green on that branch, then a careful, deliberate deploy (review the diff against `live-model-3`'s current state first — it diverged from `main` before this session started).
+2. **Revisit the Model 1/2 retirement decision** with the user, using the corrected numbers above.
+3. Consider whether to formalize the live-replay harness as a named, mandatory process (parallel to "The Gauntlet") every model must pass before deployment.
 
 **⚠️ Safety pattern, still required for any future replay work, unchanged:**
 `mock.patch("src.live.blended_notifier._dispatch")` and `mock.patch("src.live.notifier._dispatch")` wrapping the entire script, with a printed+asserted call-through check *before* anything else runs. `replay_gauntlet.py`'s `_verify_alerts_mocked()` does this first thing in `run_replay()`. Two real alerts fired before this pattern was adopted — do not simplify it away.
