@@ -445,7 +445,11 @@ def _run_staggered_slots(
                     if max_hold and t["candles_held"] >= max_hold:
                         exit_price, exit_reason = row["close"], "max_hold"
                     elif row["low"] <= stop_price:
-                        exit_price = stop_price
+                        # Same "never assume a fill better than the candle's own
+                        # close" fix as _run_slot (engine.py) — a real market sell
+                        # can't land at the idealized trigger if the candle blew
+                        # through it.
+                        exit_price = min(stop_price, row["close"])
                         if hard_stop and stop_price <= hard_stop:
                             exit_reason = "stop_loss"
                         else:
@@ -659,7 +663,11 @@ def _run_cascade_slots(
                     if max_hold and t["candles_held"] >= max_hold:
                         exit_price, exit_reason = row["close"], "max_hold"
                     elif stop_price is not None and row["low"] <= stop_price:
-                        exit_price = stop_price
+                        # Same "never assume a fill better than the candle's own
+                        # close" fix as _run_slot (engine.py) — a real market sell
+                        # can't land at the idealized trigger if the candle blew
+                        # through it.
+                        exit_price = min(stop_price, row["close"])
                         if hard_stop is not None and stop_price == hard_stop:
                             exit_reason = "stop_loss"
                         elif ladder_stop is not None and stop_price == ladder_stop:
