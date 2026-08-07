@@ -119,10 +119,19 @@ def _run_slot(df: pd.DataFrame, signals: pd.Series, params: dict, slot: int,
     max_hold = position.get("max_hold_candles")
     partial = position.get("partial_exit")
 
+    # compound=False (default) matches live -- src/live/order_manager.py sizes
+    # every entry from the stream's fixed lot_size_usd, never adjusted by past
+    # P&L. Silently reinvesting realized pnl into the next entry's size here
+    # (the old, unconditional behavior) made backtest quietly diverge from
+    # live for every model using this mode -- undetected because no
+    # live-replay harness covers this slot mode (only blended does). See
+    # HANDOFF.md for the discovery.
+    compound = position.get("compound", False)
+    available_capital = initial_capital  # only grows/shrinks if compound=True
+
     trades = []
     open_trade = None
     pending_entry = None  # (limit_price, candles_remaining, capital)
-    slot_capital = initial_capital
 
     def _open(ts, price, capital):
         return {
@@ -246,10 +255,12 @@ def _run_slot(df: pd.DataFrame, signals: pd.Series, params: dict, slot: int,
                         "mfe_pct":       (open_trade["highest_high"] - ep) / ep * 100,
                     })
                     open_trade = None
-                    slot_capital += pnl
+                    if compound:
+                        available_capital += pnl
 
         # --- check for new signal ---
-        if open_trade is None and pending_entry is None and signals.iloc[i] and slot_capital > 0.01:
+        entry_capital = available_capital if compound else initial_capital
+        if open_trade is None and pending_entry is None and signals.iloc[i] and entry_capital > 0.01:
             limit_price = row["close"]
             # Real production checks a freshly placed order for a fill in the
             # SAME tick it's placed (see blended_executor.tick()) -- a limit
@@ -260,9 +271,9 @@ def _run_slot(df: pd.DataFrame, signals: pd.Series, params: dict, slot: int,
             # entry -- confirmed as a real cause of backtest/live divergence
             # via live-replay (see HANDOFF.md).
             if row["low"] <= limit_price <= row["high"]:
-                open_trade = _open(ts, limit_price, slot_capital)
+                open_trade = _open(ts, limit_price, entry_capital)
             else:
-                pending_entry = (limit_price, expiry, slot_capital)
+                pending_entry = (limit_price, expiry, entry_capital)
 
     # close any open trade at end of data
     if open_trade:
@@ -355,18 +366,24 @@ def _run_staggered_slots(
     gap = int(slots_conf.get("slot_entry_gap_candles", 0))
     weights = slots_conf.get("slot_capital_weight")
 
-    if weights and len(weights) >= slot_count:
-        total_w = sum(weights[:slot_count])
-        slot_capitals = [total_capital * w / total_w for w in weights[:slot_count]]
-    else:
-        slot_capitals = [total_capital / slot_count] * slot_count
+    fixed_slot_capitals = slot_capitals_for(total_capital, weights, slot_count)
+
+    # compound=False (default) matches live -- src/live/order_manager.py sizes
+    # every entry from the stream's fixed lot_size_usd, never adjusted by past
+    # P&L. See the matching comment in _run_slot for why this must default
+    # off. compound=True shares one pool across all slots (same mechanism
+    # _run_blended_slots already uses), recomputed fresh at every new entry --
+    # not each slot silently reinvesting only its own history.
+    compound = (params.get("position") or {}).get("compound", False)
+    available_capital = total_capital
 
     slots = [
         {
+            "idx":              i,
             "slot_number":      i + 1,
             "open_trade":       None,
             "pending_entry":    None,
-            "capital":          slot_capitals[i],
+            "capital":          fixed_slot_capitals[i],
             "last_freed_candle": -1,   # -1 = never occupied; sorts to front (longest free)
             "last_entry_candle": -1,
         }
@@ -473,20 +490,26 @@ def _run_staggered_slots(
                             "mae_pct":       (ep - t["lowest_low"])  / ep * 100,
                             "mfe_pct":       (t["highest_high"] - ep) / ep * 100,
                         })
-                        slot["capital"] += pnl
+                        if compound:
+                            available_capital += pnl
                         slot["open_trade"] = None
                         slot["last_freed_candle"] = i
 
         # dispatch signal to longest-free slot (gap enforced globally)
         if signals.iloc[i] and (gap == 0 or (i - last_global_entry) >= gap):
+            # compound=True recomputes every slot's share fresh off the current
+            # shared pool at dispatch time (matches _run_blended_slots); False
+            # keeps each slot pinned to its original fixed split forever.
+            entry_capitals = slot_capitals_for(available_capital, weights, slot_count) if compound else fixed_slot_capitals
             free_slots = sorted(
                 [s for s in slots
                  if s["open_trade"] is None and s["pending_entry"] is None
-                 and s["capital"] > 0.01],
+                 and entry_capitals[s["idx"]] > 0.01],
                 key=lambda s: s["last_freed_candle"],
             )
             if free_slots:
                 chosen = free_slots[0]
+                chosen["capital"] = entry_capitals[chosen["idx"]]
                 # Same-tick fill check -- see _run_slot's identical comment:
                 # a limit buy AT the current close trivially sits inside this
                 # candle's own range, so it fills immediately in reality, not
@@ -562,11 +585,14 @@ def _run_cascade_slots(
     max_hold        = position.get("max_hold_candles")
 
     weights = (params.get("slots") or {}).get("slot_capital_weight")
-    if weights and len(weights) >= slot_count:
-        total_w = sum(weights[:slot_count])
-        slot_capitals = [total_capital * w / total_w for w in weights[:slot_count]]
-    else:
-        slot_capitals = [total_capital / slot_count] * slot_count
+    fixed_slot_capitals = slot_capitals_for(total_capital, weights, slot_count)
+
+    # compound=False (default) matches live -- see the matching comment in
+    # _run_slot for why this must default off. compound=True shares one pool
+    # across all slots, recomputed fresh at every fill (same mechanism
+    # _run_blended_slots and _run_staggered_slots use).
+    compound = position.get("compound", False)
+    available_capital = total_capital
 
     slots = [
         {
@@ -574,13 +600,18 @@ def _run_cascade_slots(
             "slot_number":      i + 1,
             "open_trade":       None,
             "pending_entry":    None,
-            "capital":          slot_capitals[i],
+            "capital":          fixed_slot_capitals[i],
             "cascade_trigger":  None,   # price level that auto-fires this slot
         }
         for i in range(slot_count)
     ]
 
     all_trades = []
+
+    def _entry_capital(idx):
+        if compound:
+            return slot_capitals_for(available_capital, weights, slot_count)[idx]
+        return fixed_slot_capitals[idx]
 
     def _fill(slot, ts, price, capital):
         """Open a slot's trade and apply the same side effects a fill always
@@ -693,7 +724,8 @@ def _run_cascade_slots(
                             "mae_pct":       (ep - t["lowest_low"])  / ep * 100,
                             "mfe_pct":       (t["highest_high"] - ep) / ep * 100,
                         })
-                        slot["capital"]    += pnl
+                        if compound:
+                            available_capital += pnl
                         slot["open_trade"]  = None
                         # disarm cascade trigger for the next slot
                         nxt = slot["idx"] + 1
@@ -705,10 +737,12 @@ def _run_cascade_slots(
         # buy AT the current close trivially sits inside this candle's own
         # range, so it fills immediately in reality, not a full candle later.
         s0 = slots[0]
+        s0_capital = _entry_capital(0)
         if (signals.iloc[i]
                 and s0["open_trade"] is None
                 and s0["pending_entry"] is None
-                and s0["capital"] > 0.01):
+                and s0_capital > 0.01):
+            s0["capital"] = s0_capital
             if row["low"] <= row["close"] <= row["high"]:
                 _fill(s0, ts, row["close"], s0["capital"])
             else:
@@ -718,13 +752,15 @@ def _run_cascade_slots(
         for idx in range(1, slot_count):
             slot      = slots[idx]
             prev_slot = slots[idx - 1]
+            slot_capital = _entry_capital(idx)
             if (slot["cascade_trigger"] is not None
                     and prev_slot["open_trade"] is not None   # anchor must still be open
                     and slot["open_trade"] is None
                     and slot["pending_entry"] is None
-                    and slot["capital"] > 0.01
+                    and slot_capital > 0.01
                     and row["close"] <= slot["cascade_trigger"]):
                 slot["cascade_trigger"] = None  # consumed; will re-arm on fill
+                slot["capital"] = slot_capital
                 if row["low"] <= row["close"] <= row["high"]:
                     _fill(slot, ts, row["close"], slot["capital"])
                 else:
