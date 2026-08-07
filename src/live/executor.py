@@ -278,7 +278,7 @@ def tick(conn, streams: dict, kraken: KrakenClient, last_tick: datetime,
     stops_triggered = 0
     if closed_tfs and candle_row:
         stops_triggered = position_monitor.check_all(
-            conn, streams, candle_row, closed_tfs, kraken, dry_run
+            conn, streams, candle_row, closed_tfs, kraken, now=now, dry_run=dry_run
         )
 
     _log_tick(conn, last_tick, closed_tfs, open_count, pending_count,
