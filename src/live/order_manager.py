@@ -183,13 +183,15 @@ def check_pending(conn, kraken: KrakenClient, dry_run: bool = False) -> tuple[in
     return fills, expirations
 
 
-def place_exit(conn, lot, current_price: float, kraken: KrakenClient, dry_run: bool = False, stream_name: str = "", model_id: int = 0) -> None:
+def place_exit(conn, lot, current_price: float, kraken: KrakenClient, dry_run: bool = False,
+                stream_name: str = "", model_id: int = 0, exit_reason: str = "trailing_stop") -> None:
     """
     Place a market sell order to exit an OPEN lot and mark it CLOSED.
     lot: Row with lot_id, btc_quantity, entry_price, opening_capital, entry_fee_usd
     current_price: the candle close price (used for P&L estimate in dry run,
         and as the exit-price fallback if Kraken's post-placement status poll
         doesn't confirm a real fill yet)
+    exit_reason: 'trailing_stop' (default) or 'max_hold' -- see position_monitor.check_all.
 
     Market sells fill essentially instantly on Kraken, so right after placing
     the order we poll get_order_status once for the real fill price and real
@@ -250,19 +252,20 @@ def place_exit(conn, lot, current_price: float, kraken: KrakenClient, dry_run: b
                 fee_is_estimated = :estimated,
                 closing_capital = :closing,
                 realized_pnl = :pnl,
-                exit_reason = 'trailing_stop',
+                exit_reason = :exit_reason,
                 closed_at = :now
             WHERE lot_id = :lid
         """),
         {
-            "price":     exit_price,
-            "txid":      txid,
-            "exit_fee":  round(exit_fee_usd, 4),
-            "estimated": fee_is_estimated,
-            "closing":   capital + pnl,
-            "pnl":       round(pnl, 4),
-            "now":       datetime.now(timezone.utc),
-            "lid":       lot.lot_id,
+            "price":       exit_price,
+            "txid":        txid,
+            "exit_fee":    round(exit_fee_usd, 4),
+            "estimated":   fee_is_estimated,
+            "closing":     capital + pnl,
+            "pnl":         round(pnl, 4),
+            "exit_reason": exit_reason,
+            "now":         datetime.now(timezone.utc),
+            "lid":         lot.lot_id,
         },
     )
     if not dry_run:

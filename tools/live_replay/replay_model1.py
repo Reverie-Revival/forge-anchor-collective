@@ -126,7 +126,8 @@ def run_replay(stream_id: int, version: str, start: str, end: str, lot_size_usd:
 
                     order_manager.check_pending(conn, kraken, dry_run=False)
 
-                    position_monitor.check_all(conn, streams, candle_row, {tf}, kraken, dry_run=False)
+                    position_monitor.check_all(conn, streams, candle_row, {tf}, kraken,
+                                               now=_FakeDT._now, dry_run=False)
 
                 if i % 100 == 0:
                     print(f"  ...tick {i}/{len(df)} ({ts})", flush=True)
