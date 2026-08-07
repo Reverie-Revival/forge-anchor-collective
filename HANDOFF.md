@@ -1,3 +1,38 @@
+# Handoff — 2026-08-07
+
+## 🔴 START HERE (new session): compounding support built for single/staggered/cascade (opt-in `compound` flag, default off, matches live). While validating it via live-replay, found and fixed TWO separate real bugs where live silently never enforced backtested exit rules (`max_hold_candles`, `min_hold_candles`, `stop_loss_pct`) — affecting Dip Hunter (live now, Model 1) and Breakout Scout/Dip Hunter's Model 2 configs. All 7 real Model 1/2 stream configs now verified via live-replay. Model 2 deployment (queued from 2026-08-06) still not started — do that next, using the corrected numbers below, not the stale ones from yesterday.
+
+### What actually happened, in order
+
+1. **Compounding, as asked**: `position.compound` (bool, default `False`) added to `_run_slot`/`_run_staggered_slots`/`_run_cascade_slots` in `engine.py`, matching the flag `_run_blended_slots` already had. `False` sizes every entry from the fixed `lot_size_usd` (matches live). `True` shares one pool across all slots, recomputed fresh at every entry (same `slot_capitals_for()` mechanism blended already used).
+2. **Found a real pre-existing bug while building it**: before this fix, all three single/staggered/cascade functions unconditionally reinvested each slot's own realized P&L into its next entry's size — silent compounding, no flag, the whole life of the project. Live (`order_manager.place_entry`) always used the fixed `lot_size_usd`. Backtest and live were quietly running different position sizing this whole time.
+3. **Re-ran Model 1/2 under the corrected default (`compound=False`)** — every stream moved *up*: Model 1 9.06%→**10.59%** ann. ($148.86→$158.66), Model 2 11.50%→**12.72%** ann. ($164.71→$173.17, max DD -16.25%→-13.39%). Confirmed `compound=True` on Model 2 reproduces the OLD saved numbers exactly (since slot_count=1 everywhere, shared-pool math collapses to the old per-slot bug) — i.e. the distrusted post-hoc "compounding is worse" estimate from 2026-08-06 was right, now backed by a real implementation, not a reconstruction.
+4. **Live-replay used to validate the fix** (`tools/live_replay/replay_model1.py` — existed already, built earlier, never actually run against real data until today) surfaced a much bigger problem: Dip Hunter v2 showed a real trade-count mismatch (20 backtest vs 16 live), not just small price noise. Root cause: **`position_monitor.py` never implemented `max_hold_candles` at all, and explicitly skipped `min_hold_candles`** ("deferred for v1" comment). Dip Hunter has `max_hold_candles=240` — 40% of its trades close via that rule in backtest. Live just never force-closed them; real positions ran weeks longer than backtested. **This was live, real money, right now (Model 1), the whole time.**
+5. Fixed: `position_monitor.check_all()` now takes a `now` param (threaded from `executor.py`'s tick and from the replay harnesses) and computes `candles_held` from `lot.opened_at`, enforcing `min_hold` (holds regardless of price) and `max_hold` (forced close, `exit_reason='max_hold'`) exactly like `engine.py`. `order_manager.place_exit()` now takes an `exit_reason` param instead of hardcoding `'trailing_stop'`.
+6. **Checked all 7 real Model 1/2 stream configs for every position param in use** (not just the one that broke) — found a THIRD missing rule: `stop_loss_pct` (hard stop from entry, distinct from the trailing stop) is set on Breakout Scout v3 and Dip Hunter v3, and was also completely unimplemented live. Fixed the same way: `stop_price = max(trail_stop, hard_stop)`, matching `engine.py` exactly, including which one wins the `exit_reason` label on a tie.
+7. **All 7 configs now verified clean via live-replay** (trade count matches backtest to within the expected 1-trade end-of-window artifact — backtest force-closes any still-open position at the window's last candle via `end_of_data`, live correctly leaves it open):
+
+| Stream | Backtest trades | Live-replay trades | Notes |
+|---|---|---|---|
+| Momentum Rider v2 | 31 | 31 | — |
+| Momentum Rider v4 | 29 | 29 | — |
+| Dip Hunter v2 | 20 | 19 (+1 still open, expected) | max_hold fix confirmed: 14 max_hold exits now match to the day |
+| Dip Hunter v3 | 20 | 19 (+1 still open, expected) | same |
+| Breakout Scout v2 | 16 | 16 | — |
+| Breakout Scout v3 | 20 | 20 | stop_loss_pct fix confirmed |
+| Volume Raider v1 | 39 | 38 (+1 still open, expected) | — |
+
+   Cumulative $ P&L still drifts modestly between backtest and live-replay even on a clean run (always live slightly ahead, ~16-38% relative seen) — same class of small mechanical exit-price timing differences already known/accepted for blended mode, just never measured for single-slot mode before now. Trust trade count / exit reason, not the exact dollar figure from either side alone.
+8. **New architecture memory written**: [[project_architecture_backtest_live_parity]] and [[project_live_replay_harness]] (in the auto-memory system, not this repo) — backtest and live are hand-ported twins with nothing that fails loudly when a rule is added to one side and not the other. Found 3 instances of this exact bug class in one session. Going forward: any new position rule needs either a matching live implementation or a live-replay run proving it, before trusting backtested numbers for a real deployment decision.
+
+### What to actually do next session
+
+1. **Model 2 deployment** (queued since 2026-08-06, not yet started): repurpose the empty infra slot (workflow rename, `LIVE_MODEL_VERSION` update, fresh `live.models`/`live.streams` rows, capital ledger entry) — same plan as before, just use the corrected numbers from step 3 above (12.72% ann., $173.17 ending, not the stale 11.50%/$164.71). Also: Model 2 includes a 2-slot stream (Volume Raider gets weighted differently per the $12.50×2×1 allocation, or check current intended composition) — **`executor.py`/`order_manager.py` currently hardcode `slot_number=1`, single-slot only.** Confirm whether Model 2's actual composition needs more than 1 slot on any stream before deploying; if so, that's live code that doesn't exist yet, not just a config change.
+2. Compounding itself (`compound=True`) is now available but the validated conclusion (twice now) is it hurts Model 2 — not recommended for deployment. Available for future streams/models to test on their own terms.
+3. The "gains bucket" idea from 2026-08-06 is still queued, still not built, lower priority now that compounding has a real (negative) answer.
+
+---
+
 # Handoff — 2026-08-06 (late evening)
 
 ## 🔴 START HERE (new session): Model 3 is sold out and purged from the live DB; `live-model-3` branch renamed to `archive/live-model-3`. Tomorrow's real work: (1) finalize + deploy Model 2 into that now-empty infra slot, (2) build and test REAL compounding for Model 2 (currently doesn't exist for its slot modes -- a post-hoc estimate suggests it would hurt, but that needs verifying with a real implementation, not just an estimate), (3) if compounding doesn't help, test the "gains bucket" alternative instead. Model 3/4 redesign continues separately on `experiment/model3-4-redesign`, user frustrated with the lack of a working result there tonight.
