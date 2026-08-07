@@ -150,15 +150,59 @@ session -- true compounding support added to the single/staggered/
 scale_up engine paths (not just a post-hoc reconstruction), then re-run
 against Model 2's real composition.
 
-**Also queued as an alternative, if compounding turns out not to help**:
-a previously-tested idea (referenced by the user, not detailed in this
-file -- ask for specifics next session if not otherwise documented) --
-route realized gains into a separate accumulating "bucket" instead of
-either compounding or letting them sit idle, held in something like a
-buy-and-hold pattern, only sold/redeployed once that bucket grows by some
-threshold (user mentioned 50% as the number tried before). Real
-alternative to compounding for the "gains aren't doing anything right now"
-problem -- worth a real test alongside the compounding build.
+**Found the prior "gains bucket" design in full, 2026-08-06 late night** --
+it's real, it's `docs/decisions/007-model4-gs-reflex-design.md` section 4
+("Profit-skim satellite BTC bucket"), built during the original Model 4
+design session. Full mechanics, already tuned via extensive backtesting:
+
+- Skim a % of every winning trade's *realized gain* (not total capital)
+  into a separate bucket.
+- Once the bucket has ≥$10, buy BTC on a real dip -- stricter than the
+  main stream's own entry signal (`drawdown_from_high`, price N% below its
+  M-day high, can't fire right after a fresh ATH). **Tuned best: 15% below
+  a 60-day high** (8/10/12/15/20% all tested, 15% was the standout).
+- No market-based sell trigger. Tracks a real cost basis for whatever's
+  currently at risk. The moment unrealized value clears that cost basis by
+  a premium, sell *exactly* enough to recover the original principal as
+  cash (back into the bucket, waiting for the next dip) -- the remainder
+  becomes permanent "house money," never sold again. Principal can never
+  be lost twice; only realized profit stays permanently exposed to BTC.
+  **Tuned best: 50% sell premium** (10/20/25/50/100% tested, 50% most
+  robust across time horizons -- this is the number the user remembered).
+- `dynamic_skim` variant: solves per-trade for the skim rate that would
+  take `target_trades` wins to accumulate `min_buy_capital` at the
+  *current* pool size (naturally decays as the pool grows). Tuned best:
+  target 22 trades, floored 10%, capped 25%.
+
+**Real, working code exists** -- `simulate_skim_bucket()` and the
+`dynamic_skim` logic, implemented in `engine.py` at commit `bb18d45`
+("Add profit-skim satellite BTC bucket experiment; document as rejected"),
+then deliberately **stripped back out** at commit `63d95f8` ("Clean
+cutover: strip rejected Model 4 experiments from engine.py") after being
+rejected for Model 4's use case (see below). `git show bb18d45:src/backtester/engine.py`
+to pull the exact function back -- it's a self-contained post-process over
+an already-computed `main_trades` DataFrame, not wired into `run_backtest()`
+itself, so it's cheap to re-add without touching anything else.
+
+**Why it was rejected for Model 4, and why that reason may NOT apply to
+Model 2:** tested honestly (accounting for the real feedback loop --
+skimming shrinks the pool that compounds forward, which shrinks future
+wins, which shrinks future skims), skimming from Model 4's own
+*compounding* capital was a severe net negative in every preset (Full
+History -30.4%, Primary v2 -7.7%, Recent -7.6%, vs. main-stream-only) --
+because the main stream already beats plain BTC buy-and-hold (the whole
+point of running it as a strategy), so skimming moves money from a
+higher-yielding strategy into a lower-yielding one (buy-and-hold, which is
+structurally what the bucket is). Doc 007 explicitly flags the escape
+hatch: **"kept... in case a version funded from something *other* than
+the main stream's own compounding capital is ever worth revisiting."**
+**Model 2 not compounding (see above) may be exactly that scenario** --
+if Model 2's gains aren't being reinvested into Model 2's own future
+position sizing anyway, skimming them into this bucket isn't cannibalizing
+a compounding pool the way it did for Model 4. Worth testing on its own
+honest terms next session, not assumed to work just because the original
+objection doesn't apply -- but the original objection is a real reason it
+might actually work here where it didn't there.
 
 ---
 
