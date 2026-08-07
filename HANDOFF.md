@@ -1,6 +1,133 @@
+# Handoff — 2026-08-06 (evening)
+
+## 🔴 START HERE (new session): real decision made — deploy Model 2 over `live-model-3`, leave `live-model-1` alone, keep rebuilding Model 3/4 separately for later deployment. Tomorrow's work: execute the Model 2 deployment.
+
+### The decision, plainly
+
+Tonight's session did two things: (1) a deep redesign/debug pass on Model 3/4
+(GS: Phoenix) on `experiment/model3-4-redesign` -- real bugs found and
+fixed, still not deployment-ready, see below; (2) discovered Model 1/2's
+individual stream + model-level backtest numbers were stale (predated the
+2026-08-05 engine fixes), re-ran and re-validated all of them on `main`.
+With honest, current numbers on both models, **the user's call: Model 2
+(9.06%→11.50% ann. beats Model 1 on Primary v2, similar drawdown, and
+carries Volume Raider -- the single best stream in the whole lineup, which
+Model 1 doesn't have) is worth deploying for real, replacing `live-model-3`
+(sell out of Model 3's current position, deploy Model 2 with its own
+capital/infra in its place).** `live-model-1` stays running as-is,
+untouched. Model 3/4 redesign work continues separately on
+`experiment/model3-4-redesign`, aimed at a later, independent deployment --
+not blocking or blocked by the Model 2 swap.
+
+### What to actually do next session (the Model 2 deployment)
+
+This is real money / real infra work, not yet started:
+1. **Sell out of `live-model-3`'s current open position(s)** -- check
+   `live.blended_positions` for what's actually open on that model first,
+   decide how to close it out cleanly (manual market sell via Kraken, or
+   let the existing exit logic run its course -- probably the former,
+   given the intent is a clean swap, not waiting on an uncertain exit).
+2. **Repurpose `live-model-3`'s infra slot for Model 2** -- same idea
+   already scoped for the (currently paused) Model 4-onto-Model-1 plan
+   documented further down this file: workflow rename
+   (`executor_m3.yml`→ something Model-2-appropriate), `LIVE_MODEL_VERSION`
+   update, `live.models`/`live.streams` rows for Model 2's real
+   composition (Momentum Rider v4 $25 + Dip Hunter v3 $25 + Breakout Scout
+   v3 $25 + Volume Raider v1 $25 = $100), fresh capital ledger entry.
+3. Model 2 is **single/staggered/scale_up mode only** (no blended-mode
+   streams) -- none of tonight's blended-specific bracket fixes apply to
+   it. It should already be running on whatever `live-model-1`-equivalent
+   single-slot live code path Model 1 uses today (untouched, unaffected by
+   any of tonight's blended-only work) -- confirm that code path is
+   current/correct before deploying, same diligence as any live change.
+4. Full validated Model 1 vs Model 2 comparison (Primary v2, current/
+   honest numbers, for reference when doing this):
+
+| | Model 1 | Model 2 |
+|---|---|---|
+| Annualized Return | 9.06% | **11.50%** |
+| Max Drawdown | -16.05% | -16.25% |
+| Total Trades | 67 | 108 |
+| Win Rate | 40.3% | 41.7% |
+| Ending Balance ($100 start) | $148.86 | **$164.71** |
+
+   Streams inside each (all re-validated tonight, current on `main`):
+
+| Stream | Model | Ann. Return | Max DD | Win Rate |
+|---|---|---|---|---|
+| Volume Raider v1 | 2 | **18.68%** | -27.80% | 46.2% |
+| Momentum Rider v2 | 1 | 11.52% | -20.85% | 32.3% |
+| Breakout Scout v3 | 2 | 11.26% | -25.45% | 30.0% |
+| Momentum Rider v4 | 2 | 9.03% | -21.20% | 34.5% |
+| Breakout Scout v2 | 1 | 8.27% | -28.14% | 31.3% |
+| Dip Hunter v2 | 1 | 7.24% | -30.23% | 60.0% |
+| Dip Hunter v3 | 2 | 5.48% | -28.51% | 55.0% |
+
+   Volume Raider v1 is clearly carrying Model 2. Also found (not yet
+   pursued): a NOT-yet-deployed version, Volume Raider v4, backtests even
+   stronger (22.80% ann., Primary v2) -- a real candidate to swap in later,
+   but not validated for this deployment; ship the already-proven v1
+   composition first, revisit v4 as a future stream-config upgrade once
+   locked and properly tested standalone.
+
+### Why the numbers changed (don't re-litigate this, it's resolved)
+
+Model 1/2's `backtest.stream_tests` rows were last saved 2026-08-03,
+predating the 2026-08-05 engine fixes (`e1cea7a` one-tick entry-fill delay,
+`6730ec3` staggered/cascade exit-fill optimism) -- both apply to
+single/staggered/scale_up mode (what Model 1/2 actually use). Re-ran all 16
+stream configs × 5 presets = 80 rows on current `main` this session; nearly
+every number moved, mostly down (e.g. Volume Raider v3 looked like a clear
+standout at 31.03% ann., corrected to 17.13% -- no longer better than
+what's already deployed). `backtest.model_tests` for Models 1/2/3 were
+ALREADY current (saved same fix-session, 2026-08-06 early morning,
+model_test_id 127-136, 142-146) -- did not need re-running. **Model 4 has
+NO saved model_test at all** -- `backtest.model_streams` has two
+conflicting rows for model_version=4 (v1 and v2 both attached), blocking
+the official save path. Real, still-open, unrelated to tonight's other
+work.
+
+### GS: Phoenix (Model 3/4 redesign) status -- separate track, still in progress
+
+Full technical detail in `docs/decisions/008-gs-phoenix-redesign.md` on
+`experiment/model3-4-redesign` (NOT on `main`, not merged, that branch is
+2 commits ahead as of this session). Short version: found and fixed a real
+stop-anchor bug in the slot-5 bracket mechanism (was anchored to average
+cost, not current price -- meant the stop was already breached before the
+bracket even went live, target could never fire). Built and tested: real
+30-minute sub-candle exit resolution (matches live's actual poll cadence),
+a last-fill-anchored arm/trail alternative to the bracket (captures a
+cheaper loss on a partial bounce instead of demanding full recovery), and
+a re-entry cooldown (a position was re-entering at the exact same tick a
+losing predecessor closed). All real, tested (49/49 passing), all opt-in/
+additive. **Still not deployment-ready** -- every variant tested on the
+one specific 12-month window used for testing (2025-08 to 2026-08, which
+contains a genuine ~50% BTC decline) stayed net negative. Also flagged,
+not yet started: the SMA200 trend filter blocks re-entry into a real dip
+opportunity, not just a falling knife -- a better re-entry filter than a
+blanket SMA200 gate is the next real lever to try, queued in the decision
+doc. Also: Stream Tester is still stale for Grid Stacker Blended and GS:
+Reflex (Model 3/4's actual current streams) -- deliberately left alone
+again this session, same call as last time, revisit if it starts mattering
+for a real decision.
+
+### `live-model-3` real-money status, unchanged, explicitly still deferred
+
+Still running the old (pre-2026-08-05-fix) exit logic -- the fix exists
+(`blended_position_monitor.py`/`blended_order_manager.py` on `main`,
+migration v8) but was never ported to the `live-model-3` branch. **User's
+explicit call this session: hold off on patching this in place -- the
+Model 2 swap above replaces it entirely, and the Model 3/4 redesign is
+already the effort to eventually redeploy something in this slot properly.**
+Not a live safety fix to rush; it's about to be sold out of anyway.
+
+---
+
+## Superseded by the above — kept for history
+
 # Handoff — 2026-08-05
 
-## 🔴 START HERE (new session): backtest + live-replay both fixed and merged to `main`. Next: a NEW branch (off `main`) to redesign Model 3/4 and see if either can actually be made good. `live-model-3` deployment is deliberately deferred until after that.
+## 🔴 (superseded) backtest + live-replay both fixed and merged to `main`. Next: a NEW branch (off `main`) to redesign Model 3/4 and see if either can actually be made good. `live-model-3` deployment is deliberately deferred until after that.
 
 ### The one-sentence version
 
