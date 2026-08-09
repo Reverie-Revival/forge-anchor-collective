@@ -137,6 +137,35 @@ def alert_capital_halted(model_id: int, pool_balance: float, hard_floor: float) 
     )
 
 
+def alert_bucket_buy(model_id: int, usd_in: float, price: float, qty: float) -> None:
+    _dispatch(
+        email_subject=f"Forge: BTC Bucket Buy - Model {model_id}",
+        email_body=(
+            f"Forge | Model {model_id} | BTC accumulation bucket\n"
+            f"Bought the dip @ ${price:,.2f}\n"
+            f"BTC: {qty:.8f}\n"
+            f"Capital: ${usd_in:.2f}"
+        ),
+        sms_body=f"Model {model_id} bucket BUY ${price:,.0f} | {qty:.8f} BTC | ${usd_in:.2f} in",
+    )
+
+
+def alert_bucket_recovery(model_id: int, cash_recovered: float, house_money_added: float, price: float) -> None:
+    _dispatch(
+        email_subject=f"Forge: BTC Bucket Principal Recovered - Model {model_id}",
+        email_body=(
+            f"Forge | Model {model_id} | BTC accumulation bucket\n"
+            f"Cleared its sell premium @ ${price:,.2f} -- sold enough to recover principal.\n"
+            f"Cash recovered: ${cash_recovered:.2f} (back into the bucket, waiting for the next dip)\n"
+            f"House money added: {house_money_added:.8f} BTC (never sold again)"
+        ),
+        sms_body=(
+            f"Model {model_id} bucket RECOVERED ${cash_recovered:.2f} principal @ ${price:,.0f}, "
+            f"+{house_money_added:.8f} BTC house money"
+        ),
+    )
+
+
 def alert_opened(stream_name: str, model_id: int, usd_in: float, fill_price: float, qty: float) -> None:
     _dispatch(
         email_subject=f"Forge: Opened - Model {model_id} | {stream_name}",

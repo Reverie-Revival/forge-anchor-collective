@@ -13,6 +13,7 @@ from sqlalchemy import text
 from src.fees import MAKER_FEE, TAKER_FEE
 from src.live.kraken_client import KrakenClient
 from src.live import notifier
+from src.live import bucket_manager
 
 log = logging.getLogger(__name__)
 
@@ -79,19 +80,48 @@ def _reserve_entry_capital(conn, stream: dict) -> float:
     return capital if capital >= 10.0 else 0.0
 
 
+# Same tuned dynamic_skim values as docs/decisions/007's original design and
+# src/backtester/model_engine.py's run_pooled_model_backtest -- kept as
+# constants here rather than DB config, same pattern as MAKER_FEE/TAKER_FEE.
+_SKIM_TARGET_TRADES = 22
+_SKIM_AVG_WIN_PCT = 1.8
+_SKIM_MIN_PCT = 10.0
+_SKIM_MAX_PCT = 25.0
+
+
 def _update_reserve(conn, model_id: int, pnl: float) -> None:
     """Apply a realized pnl to this model's pooled reserve, if it has one
-    (opt-in, no-op otherwise). Detects and alerts the FIRST time the pool
-    crosses its hard floor -- this does not self-recover (see
-    docs/decisions/008: once every stream's share is below $10, nothing is
-    left trading to produce the win that would lift the pool back up), so
-    it needs a real page, not a silent log line."""
+    (opt-in, no-op otherwise). If this pnl pushes the pool above baseline,
+    skims the surplus portion (docs/decisions/008: never the part that's
+    still rebuilding the pool toward baseline) into this model's BTC bucket,
+    if it has one (bucket_manager.add_skim is itself opt-in -- no-ops if
+    there's a reserve but no bucket, surplus just stays as pool cash then).
+    Detects and alerts the FIRST time the pool crosses its hard floor --
+    this does not self-recover (see docs/decisions/008: once every stream's
+    share is below $10, nothing is left trading to produce the win that
+    would lift the pool back up), so it needs a real page, not a silent log
+    line."""
     reserve = get_reserve_state(conn, model_id)
     if reserve is None:
         return
-    _, pool_balance, hard_floor, halted_at = reserve
-    new_balance = float(pool_balance) + pnl
-    newly_halted = halted_at is None and new_balance < float(hard_floor)
+    baseline_total, pool_balance, hard_floor, halted_at = reserve
+    baseline_total = float(baseline_total)
+    pool_balance = float(pool_balance)
+    hard_floor = float(hard_floor)
+    new_balance = pool_balance + pnl
+
+    if pnl > 0 and bucket_manager.get_bucket_state(conn, model_id) is not None:
+        surplus_before = max(0.0, pool_balance - baseline_total)
+        surplus_after = max(0.0, new_balance - baseline_total)
+        new_surplus = surplus_after - surplus_before
+        if new_surplus > 0:
+            raw_pct = 10.0 / ((_SKIM_AVG_WIN_PCT / 100.0) * new_balance * _SKIM_TARGET_TRADES) * 100.0
+            skim_pct = max(_SKIM_MIN_PCT, min(_SKIM_MAX_PCT, raw_pct))
+            skim_amount = new_surplus * skim_pct / 100.0
+            new_balance -= skim_amount
+            bucket_manager.add_skim(conn, model_id, skim_amount)
+
+    newly_halted = halted_at is None and new_balance < hard_floor
     now = datetime.now(timezone.utc)
 
     conn.execute(
@@ -105,8 +135,8 @@ def _update_reserve(conn, model_id: int, pnl: float) -> None:
         {"bal": new_balance, "newly_halted": newly_halted, "now": now, "mid": model_id},
     )
     if newly_halted:
-        log.error(f"Model {model_id} capital reserve HALTED at ${new_balance:.2f} (floor ${float(hard_floor):.2f})")
-        notifier.alert_capital_halted(model_id, new_balance, float(hard_floor))
+        log.error(f"Model {model_id} capital reserve HALTED at ${new_balance:.2f} (floor ${hard_floor:.2f})")
+        notifier.alert_capital_halted(model_id, new_balance, hard_floor)
 
 
 def place_entry(

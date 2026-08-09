@@ -58,6 +58,8 @@ def sandbox():
 
     with engine.begin() as conn:
         conn.execute(text("DELETE FROM live.lots WHERE model_id = :mid"), {"mid": model_id})
+        conn.execute(text("DELETE FROM live.btc_bucket_events WHERE model_id = :mid"), {"mid": model_id})
+        conn.execute(text("DELETE FROM live.btc_bucket WHERE model_id = :mid"), {"mid": model_id})
         conn.execute(text("DELETE FROM live.capital_reserve WHERE model_id = :mid"), {"mid": model_id})
         conn.execute(text("DELETE FROM live.streams WHERE model_id = :mid"), {"mid": model_id})
         conn.execute(text("DELETE FROM live.models WHERE model_id = :mid"), {"mid": model_id})
@@ -137,7 +139,10 @@ def test_pool_share_below_ten_skips_entry_entirely(sandbox):
 
 def test_exit_updates_pool_balance_by_realized_pnl(sandbox):
     engine, stream, model_id = sandbox
-    _provision_reserve(engine, model_id, baseline_total=100.0, pool_balance=100.0)
+    # pool below baseline (entry still sized fine -- weight 0.25 * 90 = 22.5
+    # >= $10) and the resulting small gain stays well under baseline, so no
+    # surplus/skim triggers here -- that has its own dedicated test below.
+    _provision_reserve(engine, model_id, baseline_total=100.0, pool_balance=90.0)
     kraken = FakeKraken()
     kraken._next_price = 50000.0
 
@@ -159,7 +164,53 @@ def test_exit_updates_pool_balance_by_realized_pnl(sandbox):
                            {"sid": stream["stream_id"]}).fetchone()
         reserve = conn.execute(text("SELECT pool_balance FROM live.capital_reserve WHERE model_id = :mid"),
                                {"mid": model_id}).fetchone()
-    assert abs(float(reserve.pool_balance) - (100.0 + float(lot.realized_pnl))) < 1e-6
+    assert abs(float(reserve.pool_balance) - (90.0 + float(lot.realized_pnl))) < 1e-6
+
+
+def test_surplus_pushes_skim_into_bucket_when_provisioned(sandbox):
+    """pool starts exactly at baseline -- the ENTIRE gain from a win is
+    surplus, so the entire (rate-limited) skim should land in the bucket,
+    matching the same dynamic_skim formula as the backtest side."""
+    engine, stream, model_id = sandbox
+    _provision_reserve(engine, model_id, baseline_total=100.0, pool_balance=100.0)
+    with engine.begin() as conn:
+        conn.execute(text("INSERT INTO live.btc_bucket (model_id) VALUES (:mid)"), {"mid": model_id})
+
+    with engine.begin() as conn:
+        order_manager._update_reserve(conn, model_id, pnl=50.0)
+
+    raw_pct = 10.0 / ((1.8 / 100.0) * 150.0 * 22) * 100.0
+    expected_skim_pct = max(10.0, min(25.0, raw_pct))
+    expected_skim = 50.0 * expected_skim_pct / 100.0
+
+    with engine.begin() as conn:
+        reserve = conn.execute(text("SELECT pool_balance FROM live.capital_reserve WHERE model_id = :mid"),
+                               {"mid": model_id}).fetchone()
+        bucket = conn.execute(text("SELECT bucket_cash FROM live.btc_bucket WHERE model_id = :mid"),
+                              {"mid": model_id}).fetchone()
+        event = conn.execute(text("SELECT event_type, amount_usd FROM live.btc_bucket_events WHERE model_id = :mid"),
+                             {"mid": model_id}).fetchone()
+
+    # 1 cent tolerance -- these columns are NUMERIC(12,2), rounded in the DB
+    assert abs(float(bucket.bucket_cash) - expected_skim) < 0.01
+    assert abs(float(reserve.pool_balance) - (150.0 - expected_skim)) < 0.01
+    assert event.event_type == "skim"
+    assert abs(float(event.amount_usd) - expected_skim) < 0.01
+
+
+def test_surplus_stays_in_pool_when_no_bucket_provisioned(sandbox):
+    """Reserve exists, bucket doesn't -- surplus must just stay as pool cash,
+    not silently vanish or error."""
+    engine, stream, model_id = sandbox
+    _provision_reserve(engine, model_id, baseline_total=100.0, pool_balance=100.0)
+
+    with engine.begin() as conn:
+        order_manager._update_reserve(conn, model_id, pnl=50.0)
+
+    with engine.begin() as conn:
+        reserve = conn.execute(text("SELECT pool_balance FROM live.capital_reserve WHERE model_id = :mid"),
+                               {"mid": model_id}).fetchone()
+    assert abs(float(reserve.pool_balance) - 150.0) < 1e-6
 
 
 def test_pool_crossing_hard_floor_sets_halted_at_once_and_stays_set(sandbox):

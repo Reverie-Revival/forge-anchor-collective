@@ -1,15 +1,87 @@
 # ADR 008 — Model 1/2 Pooled Capital Reserve + Profit-Skim BTC Bucket
 
-**Date:** 2026-08-07
-**Status:** Implemented as a backtest (`run_pooled_model_backtest()` in
-`src/backtester/model_engine.py`) — not yet Gauntlet-tested, not wired for
-live. First run against Model 2's real composition (2022-01-01→2026-08-05):
-plain `compound=False` ends $173.17; pooled reserve + bucket ends **$175.81**
-(final pool $143.65 cash + bucket $32.16 — 3 dip-buys, 2 principal
-recoveries, still holding real BTC). `skipped_entries: 0` — the floor/shrink
-logic never actually bound on this real history, so this first result says
-nothing about how it behaves under real stress; that's what the Gauntlet's
-bear-market pass is for, still queued (see Next steps).
+**Date:** 2026-08-07, decided 2026-08-09
+**Status: ACCEPTED — this is now Model 2's official design.** Backtest-only
+still (see "What's actually live" below); this document is the accepted
+target, not yet the deployed reality.
+
+## Decision record (2026-08-09)
+
+Pooled reserve + BTC bucket is no longer an optional overlay under
+consideration — **it's the definition of Model 2 going forward.** Decided
+after reviewing the full preset comparison (plain vs. pooled+bucket, all 5
+timeframe presets) directly with the user:
+
+| Preset | Plain (no bucket) | Pooled + bucket | Bucket holdings | Skimmed |
+|---|---|---|---|---|
+| Full History (2018–) | $231.74 | **$301.75** | $126.06 | $51.71 |
+| Primary Window (2019–2023) | $205.24 | **$277.02** | $112.94 | $40.67 |
+| Primary v2 (2022–) | $173.17 | $175.81 | $32.16 | $24.83 |
+| Recent (2024–) | $143.70 | $143.37 | $19.02 | $18.28 |
+| 2026 YTD | $106.40 | $106.31 | $1.84 | $1.84 |
+
+The bucket's benefit is heavily time-horizon-dependent — large over long
+windows (skimmed cash bought real BTC dips years ago that have since
+multiplied), flat-to-slightly-negative over short windows (no time for the
+held BTC to appreciate, minor fee/timing drag). **User's explicit framing:
+it starts small and has no real downside, worth doing even if it takes
+years to pay off** — accepted on that basis, not on a claim that it
+reliably beats plain in any given short window.
+
+**Full backtest validation this design has already been through** (the bar
+the user asked for before accepting it):
+- Full preset comparison, all 5 windows (table above).
+- Full 4-part Gauntlet (`tools/gauntlet_model2_pooled_bucket.py`):
+  walk-forward (6/9 years positive), bootstrap of the pool-only sequence
+  (real result at the 50th percentile of 10,000 resamples), 4 real
+  bear-market windows (bucket holdings tracked in each — e.g. full-year
+  2022 still held $2.42 in bucket value despite the pool itself being down
+  -6.34%), and code review.
+- A deliberate deadlock stress test (Part 5) that found and fixed a real
+  design flaw (see "Deadlock found and fixed" below) — not just a clean
+  pass, a real bug caught before it could matter.
+- Note: the bucket's own long-window upside is *not* bootstrap-verifiable
+  (tied to real BTC price history, not reorderable trade order) — its
+  robustness case rests on the bear-market/walk-forward real-data runs
+  above, not the bootstrap. This is a real, acknowledged limit on how much
+  the long-window numbers should be trusted going forward, not just a
+  methodology footnote.
+
+## Live BTC bucket execution — built (2026-08-09)
+
+Real order-placement code now exists, mirroring the backtest's mechanics
+exactly:
+
+- `live.btc_bucket` (state: `bucket_cash`/`tracked_qty`/`tracked_cost_basis`/
+  `house_money_qty`) + `live.btc_bucket_events` (audit log) — migration v10.
+- `src/live/bucket_manager.py` — `check_dip_buy()` and
+  `check_principal_recovery()`, model-agnostic (any executor script can call
+  them, not tied to Model 1's `executor.py` specifically). Same tuned
+  constants as the backtest: 15% dip off a real 60-day rolling high, 50%
+  sell premium, $10 minimum buy.
+- `order_manager._update_reserve()` now skims the surplus portion of a
+  winning trade into the bucket via `bucket_manager.add_skim()` — opt-in on
+  top of opt-in: only fires if both `live.capital_reserve` AND
+  `live.btc_bucket` rows exist for that model. A reserve with no bucket just
+  keeps 100% of surplus as pool cash (verified by test).
+- `executor.py`'s `tick()` calls a new `_bucket_tick()` every cycle — checks
+  every model with a bucket row (not scoped to `LIVE_MODEL_VERSION`),
+  computes real drawdown-from-high off daily-resampled `market_data`, calls
+  principal-recovery before dip-buy each tick (same order as the backtest).
+- New alerts: `notifier.alert_bucket_buy()`, `alert_bucket_recovery()`.
+- 15 new tests (9 `tests/live/test_capital_reserve.py` — expanded from 7 to
+  cover the skim-into-bucket path and the no-bucket-provisioned fallback;
+  6 new `tests/live/test_bucket_manager.py`), all passing alongside the
+  rest. A real end-to-end smoke test against live market data (dry-run)
+  confirmed `_bucket_tick()` runs cleanly through the full real
+  data-load → daily-resample → rolling-high → drawdown-calc path with no
+  crash.
+
+**Still not provisioned anywhere.** No model has a `live.btc_bucket` or
+`live.capital_reserve` row yet — every function above is opt-in and
+currently a no-op for every real model, Model 1 included. Provisioning
+Model 2 with both (the actual deployment step) is the next real action,
+not done in this session.
 
 ## Context
 
