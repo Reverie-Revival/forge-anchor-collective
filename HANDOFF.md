@@ -1,3 +1,27 @@
+# Handoff — 2026-08-09
+
+## 🔴 START HERE (new session): built and tested a full pooled-reserve + BTC skim-bucket design for Model 2 (docs/decisions/008) — Gauntlet-tested, a real deadlock bug found and fixed, and a live capital ledger built (opt-in, not provisioned anywhere). Model 2 deployment itself (queued since 2026-08-06) **still hasn't started** — three sessions in a row now have found real work before getting to it. Next session should seriously consider just deploying Model 2 first, before any more design work, unless there's a specific reason not to.
+
+### What actually happened, in order
+
+1. Walked through, with the user, a concrete real-trade example (Volume Raider v1) proving `compound=False` beats `compound=True` via sequence-of-returns drag — a losing streak right before the stream's single best trade (+57.6%) meant compounding had less capital behind it than fixed sizing did. This directly informed the design below.
+2. **Designed and implemented `run_pooled_model_backtest()`** (`src/backtester/model_engine.py`) — single-slot streams only (Model 1/2's real composition). Streams trade at their full configured `lot_size_usd` while a shared pool is at/above baseline (no compounding upside, preserving the `compound=False` result), shrink proportionally to their own weight below baseline, and pause individually below their $10 share. Skims only the portion of a winning trade's gain that pushes the pool *above* baseline into a BTC accumulation bucket, reusing the exact tuned dip-buy/recover-principal mechanics from `docs/decisions/007` (commit `bb18d45`). First real run, Model 2's composition: $173.17 (plain, no bucket) → **$175.81** (pooled + bucket).
+3. **Ran the full Gauntlet** (`tools/gauntlet_model2_pooled_bucket.py`) — walk-forward, bootstrap, real bear markets, code review all passed. But `skipped_entries: 0` in every single run, including all 4 real bear-market windows — the floor/shrink mechanic had never actually been exercised.
+4. **Built a deliberate stress test** (Part 5, `starting_pool` override) and found a real design flaw, not just an untested path: below the point where every one of Model 2's (equally-weighted) streams crosses its own $10 floor **at the same instant**, the pool freezes **permanently** — nothing is left trading to generate the win that would lift it back up. The original design's "winnings bring it back above the floor" assumption silently assumed something would still be trading.
+5. **User's call: treat this as a hard stop requiring a real alert + manual decision** (inject capital, or pull the stream/model), not automatic recovery. Implemented: `hard_floor`/`halted_at` now returned explicitly from `run_pooled_model_backtest()`, verified via the stress test (`None` while healthy, fires exactly at the true floor).
+6. **Built the live side**: new `live.capital_reserve` table (migration v9), fully **opt-in** — a model with no row trades exactly as it always has (verified with a dedicated test). `order_manager.place_entry` now reads it (`_reserve_entry_capital`) and shrinks/skips exactly like the backtest; `place_exit` updates the pool (`_update_reserve`) and fires a new `notifier.alert_capital_halted()` the first time (and only the first time) the pool crosses the hard floor. 7 new tests, `tests/live/test_capital_reserve.py`.
+7. **Added the first backtester-level test suite this project has ever had** (`tests/backtester/test_pooled_model_backtest.py`, 5 tests, flagged as a real gap by the Gauntlet's own Part 4) — deterministic canned fixtures, not real market data.
+8. **Nothing here is live yet.** No model — including the currently-live Model 1 — has an actual `live.capital_reserve` row. The BTC bucket itself has no live wiring at all (no real buy/sell order placement) — that's explicitly flagged as materially larger scope, not started.
+
+### What to actually do next session
+
+The design work here is done and tested. What's NOT decided, and needs a real conversation, not more building:
+1. **Deploy Model 2** — this has been queued since 2026-08-06 and keeps getting pushed by real work found along the way (today's work was legitimate, but the pattern is worth naming). Use the corrected numbers from 2026-08-07's session (12.72% ann., $173.17, not the stale 11.50%/$164.71).
+2. Decide whether to provision `live.capital_reserve` for Model 1 and/or Model 2 at all right now, or leave it opt-in/unused until the BTC bucket itself is ready to ship (the reserve check has value on its own — real solvency protection — independent of the bucket, worth considering deploying it alone first).
+3. If/when ready to build further: live BTC bucket execution (real buy/sell orders) is the one big remaining piece, not started, larger scope than everything above combined.
+
+---
+
 # Handoff — 2026-08-07
 
 ## 🔴 START HERE (new session): compounding support built for single/staggered/cascade (opt-in `compound` flag, default off, matches live). While validating it via live-replay, found and fixed TWO separate real bugs where live silently never enforced backtested exit rules (`max_hold_candles`, `min_hold_candles`, `stop_loss_pct`) — affecting Dip Hunter (live now, Model 1) and Breakout Scout/Dip Hunter's Model 2 configs. All 7 real Model 1/2 stream configs now verified via live-replay. Model 2 deployment (queued from 2026-08-06) still not started — do that next, using the corrected numbers below, not the stale ones from yesterday.
