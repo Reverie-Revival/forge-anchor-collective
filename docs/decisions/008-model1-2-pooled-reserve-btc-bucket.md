@@ -200,12 +200,14 @@ deliberate, separate deployment decision, not a side effect of this commit.
 2. ~~Build the live capital-availability check~~ — done, see above.
 3. ~~Wire `halted_at` to a real alert~~ — done, see above
    (`notifier.alert_capital_halted`).
-4. Add at least one deterministic unit test for `run_pooled_model_backtest()`
-   itself (the backtest-side function, distinct from the live tests added
-   above) — flagged in the Gauntlet's Part 4, no backtester-level test suite
-   exists in this project at all currently (pre-existing gap, not introduced
-   here). Should include a fixture covering the `halted_at` deadlock case
-   directly, not just via a manual stress-test script.
+4. ~~Add deterministic unit tests for `run_pooled_model_backtest()`~~ — done,
+   `tests/backtester/test_pooled_model_backtest.py` (5 tests, first
+   backtester-level test suite in this project). Deterministic canned
+   fixtures via monkeypatched `run_backtest`/`load_market_data`, not real
+   market data — covers proportional shrink, the floor skip, `halted_at`
+   (healthy / mid-run / already-halted-at-start), and the surplus-only skim
+   math checked against `dynamic_skim`'s own formula rather than a
+   hardcoded number.
 5. **Decide when/whether to actually provision `live.capital_reserve` rows**
    for Model 1 and/or Model 2 — a real deployment decision (what
    `baseline_total` for Model 1's existing 3-stream $100 composition?
