@@ -402,6 +402,24 @@ CREATE TABLE IF NOT EXISTS live.blended_capital (
     updated_at         TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 );
 
+-- Pooled solvency reserve for single/staggered/cascade models with multiple
+-- streams sharing one real cash balance (docs/decisions/008). Distinct from
+-- live.blended_capital: streams NEVER trade above their own configured
+-- lot_size_usd here (no compounding upside, deliberately -- see 2026-08-07
+-- HANDOFF), this only ever shrinks sizing (and eventually halts it) once
+-- real losses have actually depleted the pool below baseline. Opt-in: a
+-- model with no row here trades exactly as before (order_manager.place_entry
+-- always sizes off lot_size_usd, no reserve check at all) -- provisioning a
+-- row is a deliberate deployment step, not automatic.
+CREATE TABLE IF NOT EXISTS live.capital_reserve (
+    model_id        INTEGER PRIMARY KEY REFERENCES live.models(model_id),
+    baseline_total  NUMERIC(12,2) NOT NULL,  -- sum of all this model's streams' configured lot_size_usd
+    pool_balance    NUMERIC(12,2) NOT NULL,
+    hard_floor      NUMERIC(12,2) NOT NULL,  -- 10.0 / max(stream weight) -- below this, no stream can trade at all
+    halted_at       TIMESTAMPTZ,             -- NULL = healthy; set once, first time pool_balance < hard_floor
+    updated_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+
 CREATE TABLE IF NOT EXISTS live.market_data_runs (
     run_id          SERIAL       PRIMARY KEY,
     ran_at          TIMESTAMPTZ  NOT NULL DEFAULT NOW(),

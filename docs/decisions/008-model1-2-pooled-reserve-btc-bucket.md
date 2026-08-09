@@ -172,29 +172,44 @@ pool degrades gracefully (`$45` starting pool, 2022 bear year), fires
 correctly the instant the true floor is crossed (`$41` → halts
 2022-06-13; `$38` → halts immediately, `"start"`).
 
+## Live reserve ledger — built (2026-08-09)
+
+Steps 2/3 below are done. `live.capital_reserve` (migration v9) — opt-in,
+mirrors `live.blended_capital`'s pattern but never grows a stream's trade
+size above its configured `lot_size_usd` (no compounding upside, matching
+`compound=False`), only ever shrinks/halts it. `order_manager.place_entry`
+now reads it via `_reserve_entry_capital()` — full lot size if no row
+exists for the model (pure opt-in, verified with a dedicated test) or the
+pool is at/above baseline; shrinks proportionally to the stream's own
+weight below baseline; skips the entry entirely (no order, no DB row) if
+even the shrunk share can't clear $10. `place_exit` calls
+`_update_reserve()` on every close, which applies realized P&L to
+`pool_balance` and sets `halted_at` (once, permanently — a later win does
+not clear it) the first time the pool crosses `hard_floor`, firing a new
+`notifier.alert_capital_halted()`. 7 new tests in
+`tests/live/test_capital_reserve.py`, all passing alongside the existing 40.
+
+**Not provisioned anywhere yet** — no model (including the currently-live
+Model 1) has an actual `live.capital_reserve` row, so nothing about real
+live trading has changed. Provisioning a row for a real model is a
+deliberate, separate deployment decision, not a side effect of this commit.
+
 ## Next steps (not started)
 
-1. ~~Construct a deliberate synthetic stress test~~ — **done, see "Deadlock
-   found and fixed" above.**
-2. Live currently has **no capital-availability check at all** for
-   single/staggered/cascade streams — `order_manager.place_entry` always
-   sizes off the configured `lot_size_usd` regardless of real account
-   balance. Building a real pooled reserve ledger (`live.*` table, mirroring
-   `live.blended_capital`'s existing pattern) fixes this independently of
-   whether the BTC bucket ships at all — worth treating as its own
-   deliverable, and arguably higher priority than the bucket itself.
-3. **Wire `halted_at` to a real alert once live** — this needs to page a
-   human (same notifier pattern as `alert_system_down`/`alert_market_data_stale`
-   in `src/live/notifier.py`), not silently log. The alert should prompt a
-   real decision: inject capital, or pull the underperforming stream/model —
-   hitting this floor at all is itself a signal something in the model's
-   real performance has gone seriously wrong, not just a capital mechanics
-   footnote.
+1. ~~Construct a deliberate synthetic stress test~~ — done.
+2. ~~Build the live capital-availability check~~ — done, see above.
+3. ~~Wire `halted_at` to a real alert~~ — done, see above
+   (`notifier.alert_capital_halted`).
 4. Add at least one deterministic unit test for `run_pooled_model_backtest()`
-   itself — flagged in the Gauntlet's Part 4, no backtester-level test suite
+   itself (the backtest-side function, distinct from the live tests added
+   above) — flagged in the Gauntlet's Part 4, no backtester-level test suite
    exists in this project at all currently (pre-existing gap, not introduced
    here). Should include a fixture covering the `halted_at` deadlock case
    directly, not just via a manual stress-test script.
-5. If the above holds up: build live wiring (skim execution, real BTC
-   buy/sell orders for the bucket, the reserve ledger from step 2) — a
-   materially larger scope than anything else in this doc, not started.
+5. **Decide when/whether to actually provision `live.capital_reserve` rows**
+   for Model 1 and/or Model 2 — a real deployment decision (what
+   `baseline_total` for Model 1's existing 3-stream $100 composition?
+   Model 2 hasn't deployed yet at all), not something to do silently.
+6. If the above holds up: build live wiring (skim execution, real BTC
+   buy/sell orders for the bucket) — a materially larger scope than
+   anything else in this doc, not started.

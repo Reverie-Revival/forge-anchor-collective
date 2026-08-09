@@ -115,6 +115,28 @@ def alert_fee_drift(real_maker: float, real_taker: float, const_maker: float, co
     )
 
 
+def alert_capital_halted(model_id: int, pool_balance: float, hard_floor: float) -> None:
+    _dispatch(
+        email_subject=f"Forge: Capital Reserve HALTED - Model {model_id}",
+        email_body=(
+            f"Forge | Model {model_id}\n"
+            f"Pooled capital reserve has crossed the hard floor -- every stream's "
+            f"proportional share is now below the $10 minimum lot size, so NO stream "
+            f"in this model can place another entry.\n\n"
+            f"Pool balance: ${pool_balance:.2f}\n"
+            f"Hard floor:   ${hard_floor:.2f}\n\n"
+            f"This does not self-recover -- nothing is trading, so nothing can "
+            f"generate the winning trade needed to lift the pool back above the "
+            f"floor. Requires a manual decision: inject capital, or pull the "
+            f"underperforming stream/model (docs/decisions/008)."
+        ),
+        sms_body=(
+            f"Forge: Model {model_id} capital reserve HALTED at ${pool_balance:.2f} "
+            f"(floor ${hard_floor:.2f}). No stream can trade. Manual action needed."
+        ),
+    )
+
+
 def alert_opened(stream_name: str, model_id: int, usd_in: float, fill_price: float, qty: float) -> None:
     _dispatch(
         email_subject=f"Forge: Opened - Model {model_id} | {stream_name}",
