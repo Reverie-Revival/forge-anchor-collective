@@ -6,6 +6,7 @@ import json
 import re
 import streamlit as st
 import pandas as pd
+from sqlalchemy import text
 
 from src.app.utils import grade_info, label_window, _compact_config
 from src.app.db import (
@@ -13,7 +14,7 @@ from src.app.db import (
     load_models, load_model_history, load_locked_streams_full,
     load_pending_model_runs, load_last_model_run,
     next_model_run_number, load_model_run_payload,
-    _pending_model_for_hash, _alloc_hash,
+    _pending_model_for_hash, _alloc_hash, get_local_engine,
 )
 from src.app.model_dashboard import render_model_dashboard, render_overview_dashboard, STREAM_COLORS
 
@@ -106,9 +107,23 @@ with st.sidebar:
                 unsafe_allow_html=True)
 
     history = load_model_history(model_id=selected_model_id)
+
+    # Regime-robustness rows (56 per model from the 2026-07-07 pass) are a
+    # stress test of ONE already-locked composition across many random
+    # windows, not a distinct allocation candidate -- they used to clutter
+    # this dropdown with dozens of entries alongside real allocation-tuning
+    # runs (Model 2 alone had 79 total saved rows). Hidden by default;
+    # nothing is deleted, just not shown here unless asked for.
+    is_regime_row = history["notes"].fillna("").str.startswith("regime-robustness:") if not history.empty else None
+    n_regime = int(is_regime_row.sum()) if is_regime_row is not None else 0
+    show_regime = False
+    if n_regime:
+        show_regime = st.checkbox(f"Include {n_regime} regime-robustness test runs", value=False)
+    display_history = history if (show_regime or is_regime_row is None) else history[~is_regime_row]
+
     run_groups = {}
-    if not history.empty:
-        for _, row in history.iterrows():
+    if not display_history.empty:
+        for _, row in display_history.iterrows():
             rnum = int(row["run_number"]) if pd.notna(row.get("run_number")) else 0
             run_groups.setdefault(rnum, []).append(row)
 
@@ -181,7 +196,39 @@ with st.sidebar:
         if latest_matches_run is not None and latest_matches_run in run_options:
             default_idx = run_options.index(latest_matches_run)
         else:
-            default_idx = len(run_options) - 1
+            # Falling back to "last run_number in the list" picks whichever
+            # allocation was tried MOST RECENTLY, not whichever is actually
+            # locked as this model's real composition (backtest.model_streams)
+            # -- e.g. Model 2's Run 4 was a rejected alternative tested AFTER
+            # Run 3 was already selected, so "last" pointed at the wrong one.
+            # Prefer the run_number matching the real locked composition.
+            locked_run_num = None
+            try:
+                locked_rows = pd.read_sql(text("""
+                    SELECT ms.lot_size_usd, sc.slot_count, sc.slot_mode,
+                           s.stream_name || ' ' || sc.version AS full_name
+                    FROM backtest.model_streams ms
+                    JOIN backtest.stream_configs sc ON ms.stream_config_id = sc.stream_config_id
+                    JOIN backtest.streams s ON sc.stream_id = s.stream_id
+                    WHERE ms.model_id = :mid
+                """), get_local_engine().connect(), params={"mid": selected_model_id})
+                locked_alloc = {
+                    row["full_name"]: {"lot_size_usd": float(row["lot_size_usd"]),
+                                       "slot_count": int(row["slot_count"]), "slot_mode": row["slot_mode"]}
+                    for _, row in locked_rows.iterrows()
+                }
+                locked_hash = _alloc_hash(locked_alloc)
+                for rnum, rrows in run_groups.items():
+                    cfg = rrows[0]["configuration"]
+                    if isinstance(cfg, str):
+                        cfg = json.loads(cfg)
+                    if _alloc_hash(cfg.get("allocations", {})) == locked_hash:
+                        locked_run_num = rnum
+                        break
+            except Exception:
+                pass
+            default_idx = run_options.index(locked_run_num) if locked_run_num in run_options \
+                else len(run_options) - 1
         selected_run = st.selectbox(
             "", run_options,
             index=default_idx,
