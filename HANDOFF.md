@@ -1,6 +1,26 @@
 # Handoff — 2026-08-09
 
-## 🔴 START HERE (new session): built and tested a full pooled-reserve + BTC skim-bucket design for Model 2 (docs/decisions/008) — Gauntlet-tested, a real deadlock bug found and fixed, and a live capital ledger built (opt-in, not provisioned anywhere). Model 2 deployment itself (queued since 2026-08-06) **still hasn't started** — three sessions in a row now have found real work before getting to it. Next session should seriously consider just deploying Model 2 first, before any more design work, unless there's a specific reason not to.
+## 🔴🔴 START HERE — supersedes everything below this session. Read `docs/decisions/009-unify-testing-with-live-execution.md` FIRST, before anything else.
+
+User mandate, stated directly at the end of this session, not up for
+re-litigation: **there should not be a separate "backtester" that
+approximates live behavior for speed.** This week's bugs (silent
+compounding, missing exit rules) plus a worse historical incident (a
+backtested ~95% annualized candidate that was actually negative once
+checked against real execution — the 2026-08-05 phantom-fill bug) are the
+same root pattern: `engine.py` and live execution are two independently
+maintained implementations with nothing forcing them to agree, discovered
+only by manual side-by-side checks that don't happen every time. **Do not
+patch `engine.py` further. Do not deploy Model 2. Do not build new
+streams/models.** The next session's job is to turn ADR 009 into a real
+plan — what replaces `engine.py`, how iteration speed gets handled without
+quietly reintroducing a second diverging code path, and how everything
+currently "validated" gets re-validated under the new architecture.
+Everything below this point (Model 2 deployment queue, the pooled
+reserve/BTC bucket work, the Model Tester UI fixes) is real, committed work
+but now provisional pending that redesign.
+
+## 🔴 (superseded, kept for continuity) built and tested a full pooled-reserve + BTC skim-bucket design for Model 2 (docs/decisions/008) — Gauntlet-tested, a real deadlock bug found and fixed, and a live capital ledger built (opt-in, not provisioned anywhere). Model 2 deployment itself (queued since 2026-08-06) **still hasn't started** — three sessions in a row now have found real work before getting to it. Next session should seriously consider just deploying Model 2 first, before any more design work, unless there's a specific reason not to.
 
 ### What actually happened, in order
 
