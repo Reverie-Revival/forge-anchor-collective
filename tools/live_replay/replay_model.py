@@ -12,13 +12,25 @@ _detect_closed_timeframes.
 No compounding, no pooled reserve, no BTC bucket -- this replays exactly
 what the model would do if deployed today: order_manager.place_entry (opt-in
 reserve check finds no live.capital_reserve row for this sandbox model, so
-sizes at each stream's plain configured lot_size_usd) and
+sizes at each stream's plain configured lot_size_usd, split per-slot for
+staggered via the same slot_capitals_for the backtester uses) and
 position_monitor.check_all (max_hold/min_hold/stop_loss_pct all enforced,
-per the 2026-08-07 fixes). Single-slot streams only -- raises otherwise.
+per the 2026-08-07 fixes and the staggered live-parity work in
+docs/decisions/009 step 1). single/staggered slot_modes supported --
+blended has its own separate replay_gauntlet.py. cascade live parity was
+built and then removed 2026-08-10 after its trade count didn't match
+engine.py's and the mismatch wasn't run down -- see docs/decisions/009.
 
 SAFETY: identical pattern to replay_model1.py/replay_gauntlet.py -- both
 real notifier modules mocked for the ENTIRE script run, verified via an
 assert BEFORE anything else runs.
+
+DO NOT run two invocations of this script at once (or alongside
+replay_model1.py/replay_gauntlet.py) -- they all share hardcoded sandbox
+model_version sentinels (this one: 993), and one run's cleanup step deletes
+live.models rows the other run is still using mid-replay, corrupting both
+(confirmed 2026-08-10: a Model 1 + Model 2 run launched in parallel crashed
+with a foreign-key violation from exactly this race).
 
 Usage:
     python -m tools.live_replay.replay_model --model-version 1 --start 2022-01-01 --end 2026-08-09
@@ -33,7 +45,8 @@ import pandas as pd
 from sqlalchemy import text
 
 from src.app.db import get_local_engine
-from src.backtester.engine import load_market_data, _warmup_days, run_backtest
+from src.backtester.engine import run_backtest
+from src.backtester.market_data import load_market_data, _warmup_days
 from src.backtester.indicators import add_indicators, resample_ohlcv
 from src.backtester.signals import generate_signals
 from src.backtester.metrics import compute_metrics
@@ -64,12 +77,15 @@ def _load_locked_streams(model_version: int) -> list:
         raise ValueError(f"No locked composition found in backtest.model_streams for model_version={model_version}")
     streams = []
     for r in rows:
-        if r.slot_count != 1 or r.slot_mode != "single":
-            raise ValueError(f"replay_model.py only supports single-slot streams "
-                             f"(got {r.full_name}: slot_count={r.slot_count}, slot_mode={r.slot_mode})")
+        if r.slot_mode not in ("single", "staggered"):
+            raise ValueError(f"replay_model.py does not support slot_mode={r.slot_mode!r} "
+                             f"(got {r.full_name}) -- blended has its own replay_gauntlet.py; "
+                             f"cascade live parity was removed 2026-08-10 (see docs/decisions/009); "
+                             f"scale_down/scale_up have no live parity yet")
         params = r.parameters if isinstance(r.parameters, dict) else json.loads(r.parameters)
         streams.append({"stream_id": r.stream_id, "version": r.version, "label": r.full_name,
-                        "lot_size": float(r.lot_size_usd), "params": params})
+                        "lot_size": float(r.lot_size_usd), "params": params,
+                        "slot_count": int(r.slot_count), "slot_mode": r.slot_mode})
     return streams
 
 
@@ -113,6 +129,7 @@ def run_replay(model_version: int, start: str, end: str):
         params = ms["params"]
         tf = params.get("primary_timeframe")
         label, lot_size = ms["label"], ms["lot_size"]
+        slot_count, slot_mode = ms["slot_count"], ms["slot_mode"]
 
         warmup = _warmup_days(params)
         load_start = (pd.Timestamp(start) - pd.Timedelta(days=warmup)).strftime("%Y-%m-%d")
@@ -126,29 +143,30 @@ def run_replay(model_version: int, start: str, end: str):
         df = df[df.index >= pd.Timestamp(start)]
         signals = generate_signals(df, params)
 
-        bt_results[label] = (run_backtest(params=params, start=start, end=end, slot_count=1,
-                                          slot_mode="single", stream_name=label, lot_size_usd=lot_size), lot_size)
+        bt_results[label] = (run_backtest(params=params, start=start, end=end, slot_count=slot_count,
+                                          slot_mode=slot_mode, stream_name=label, lot_size_usd=lot_size), lot_size)
 
         with engine.begin() as conn:
             db_stream_id = conn.execute(text("""
                 INSERT INTO live.streams (model_id, stream_name, stream_version, strategy_type,
                                           parameters, slot_count, slot_mode, lot_size_usd)
-                VALUES (:mid, :name, :ver, 'single', CAST(:p AS jsonb), 1, 'single', :lot)
+                VALUES (:mid, :name, :ver, :sm, CAST(:p AS jsonb), :sc, :sm, :lot)
                 RETURNING stream_id
-            """), {"mid": sandbox_model_id, "name": label, "ver": ms["version"],
-                   "p": json.dumps(params), "lot": lot_size}).scalar()
+            """), {"mid": sandbox_model_id, "name": label, "ver": ms["version"], "sm": slot_mode,
+                   "p": json.dumps(params), "sc": slot_count, "lot": lot_size}).scalar()
 
         stream_dfs[db_stream_id] = df
         stream_signals[db_stream_id] = signals
         streams[db_stream_id] = {"stream_id": db_stream_id, "model_id": sandbox_model_id, "stream_name": label,
-                                  "parameters": params, "slot_count": 1, "slot_mode": "single",
+                                  "parameters": params, "slot_count": slot_count, "slot_mode": slot_mode,
                                   "lot_size_usd": lot_size}
 
     print(f"Model {model_version} streams loaded: "
           f"{[(s['stream_name'], s['parameters'].get('primary_timeframe')) for s in streams.values()]}", flush=True)
     for label, (res, lot_size) in bt_results.items():
         m = compute_metrics(res["trades"], lot_size, res["start"], res["end"])
-        print(f"  BACKTEST reference -- {label:20s} trades={m['total_trades']:>3} ann={m['annualized_return_pct']:>7.2f}%", flush=True)
+        ann = f"{m['annualized_return_pct']:>7.2f}%" if m["annualized_return_pct"] is not None else "    n/a"
+        print(f"  BACKTEST reference -- {label:20s} trades={m['total_trades']:>3} ann={ann}", flush=True)
 
     all_ts = sorted(set().union(*[set(df.index) for df in stream_dfs.values()]))
     kraken = ReplayKraken()
@@ -174,9 +192,9 @@ def run_replay(model_version: int, start: str, end: str):
                 tf = stream["parameters"].get("primary_timeframe", "1h")
 
                 with engine.begin() as conn:
-                    if (order_manager.slot_is_available(conn, db_stream_id, slot_number=1)
-                            and bool(stream_signals[db_stream_id].loc[ts])):
-                        order_manager.place_entry(conn, stream, kraken, dry_run=False)
+                    slot_number = order_manager.next_signal_slot(conn, stream, now=_FakeDT._now)
+                    if slot_number is not None and bool(stream_signals[db_stream_id].loc[ts]):
+                        order_manager.place_entry(conn, stream, kraken, dry_run=False, slot_number=slot_number)
                     order_manager.check_pending(conn, kraken, dry_run=False)
                     position_monitor.check_all(conn, streams, candle_row_this_tick, {tf}, kraken,
                                                now=_FakeDT._now, dry_run=False)

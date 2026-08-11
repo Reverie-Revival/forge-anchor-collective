@@ -46,7 +46,8 @@ import pandas as pd
 from sqlalchemy import text
 
 from src.app.db import load_stream_configs, get_local_engine
-from src.backtester.engine import load_market_data, _warmup_days, run_backtest
+from src.backtester.engine import run_backtest
+from src.backtester.market_data import load_market_data, _warmup_days
 from src.backtester.indicators import add_indicators, resample_ohlcv
 from src.backtester.signals import generate_signals
 from src.backtester.metrics import compute_metrics

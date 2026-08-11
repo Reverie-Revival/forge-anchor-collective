@@ -1,6 +1,87 @@
+# Handoff — 2026-08-10
+
+## 🔴 START HERE — ADR 009 built and validated, on branch `unify-testing-live-replay` (not merged). Read `docs/decisions/009-unify-testing-with-live-execution.md` for full detail; this is the summary.
+
+Yesterday's session ended with a mandate but no plan: no separate
+"backtester," one test path that works the same as live. This session
+turned that into a real plan, in a dedicated planning pass with the user,
+then built and validated it same-session. Branch `unify-testing-live-replay`
+has all of it — **not merged to `main` yet**, 72 tests passing.
+
+### What actually happened, in order
+
+1. **Planned the architecture** with the user: `engine.py` deleted entirely
+   (no fast/approximate mode kept — profiling showed the "live-replay is
+   slow" complaint is 54% Postgres I/O, not rule-logic cost, so an in-memory
+   fast path was considered and explicitly rejected as just another second
+   code path). Cache reuse for already-tested stream results, rescaled to
+   whatever capital the caller actually needs. Full plan is in the ADR.
+2. **Built staggered slot-mode live parity** (`order_manager.
+   next_signal_slot`, `executor.py` no longer hardcodes `slot_number=1`).
+   **Also built cascade live parity, then removed it same session** after
+   its live-replay trade count didn't match `engine.py`'s (19 backtest vs
+   24-26 live-replay) and the mismatch couldn't be run down — the user's
+   call: don't carry unvalidated code forward just because it's written.
+3. **Found and fixed two real gaps while validating this** (not just
+   refactor risk): `trailing_stop_steps`/`trail_arm_gain_pct` were read by
+   `engine.py` for every slot mode with **zero live implementation** before
+   this session (no currently-locked config used them, so not an active
+   live-money bug, but the next one would have silently gotten it wrong).
+   And the new stream-trade cache has **no invalidation tied to engine.py's
+   own version** — confirmed with a real example (Model 1's Breakout Scout
+   v2's cached test predates the 2026-08-07 compounding fix) — why cache
+   reuse defaults to off everywhere it's offered.
+4. **Re-validated Model 1 (live, real money) and Model 2 (Run 3, assembled)**
+   via real live-replay runs, full Primary v2 window — every stream in both
+   matched its fresh backtest reference's trade count exactly (Model 1:
+   16/16, 20/20, 31/31 = 67; Model 2: 20/20, 20/20, 29/29, 39/39 = 108),
+   both matching their recorded `model_tests` rows exactly. Per the user,
+   this was the only re-validation needed — everything else in
+   `stream_tests`/`model_tests` is disowned/untrusted, regenerates fresh
+   whenever touched again, not retroactively audited. BTC bucket
+   deliberately excluded (Model 3's build, separate).
+5. **Converted `src/app/stream_tester.py`'s interactive Run/Re-run buttons**
+   to the live-replay path — this was a real gap the user caught by directly
+   asking "does it work like production, is Streamlit cleaned up." Built
+   `src/backtester/live_replay_stream.py` (generalizes
+   `tools/live_replay/replay_model1.py`'s single-stream pattern into a
+   reusable function, same return shape as `run_backtest()`); wired in for
+   single/staggered configs. blended/cascade/scale_down/scale_up still fall
+   back to `engine.py`, now explicitly flagged `NOT live-validated` in the
+   UI and the saved result's notes.
+6. **Moved `load_market_data`/`_warmup_days` out of `engine.py`** into
+   `src/backtester/market_data.py` — they had zero dependency on `engine.py`'s
+   own simulation logic, but real live-execution modules
+   (`signal_engine.py`, `executor.py`) were importing them from there anyway,
+   for no real reason. Prerequisite for `engine.py` ever being deletable.
+7. **`model_engine.run_model_backtest`'s fresh-run fallback now uses
+   `live_replay_stream.py`** for single/staggered at the default fee rate
+   (the common case) instead of `engine.py` — a real, significant speed
+   regression for anyone calling `run_model()` (minutes instead of seconds),
+   which is the accepted cost per item 1 above, not a bug.
+8. **`engine.py` is still not deletable** — `run_model_backtest`'s fallback
+   for blended/cascade/scale/fee-override modes, and Stream Tester's same
+   fallback, both still call it. Documented explicitly in the ADR so this
+   doesn't get assumed done.
+
+### What to actually do next session
+
+1. **Review and merge `unify-testing-live-replay`** if the branch looks
+   good — nothing has been merged or pushed yet.
+2. Model 2 deployment is still queued (since 2026-08-06) and still blocked
+   behind this work being trusted — now that it is, this is probably the
+   actual next real task, not more architecture.
+3. The cascade trade-count mismatch itself was never root-caused, just
+   removed. If cascade is wanted again later, it needs to be rebuilt and
+   debugged properly, not resurrected from this branch's history as-is.
+4. If continuing to fully retire `engine.py`: the blended/cascade/scale/
+   fee-override fallback paths (item 8 above) are the remaining dependents.
+
+---
+
 # Handoff — 2026-08-09
 
-## 🔴🔴 START HERE — supersedes everything below this session. Read `docs/decisions/009-unify-testing-with-live-execution.md` FIRST, before anything else.
+## 🔴🔴 (superseded by 2026-08-10 above) Read `docs/decisions/009-unify-testing-with-live-execution.md` FIRST, before anything else.
 
 User mandate, stated directly at the end of this session, not up for
 re-litigation: **there should not be a separate "backtester" that
