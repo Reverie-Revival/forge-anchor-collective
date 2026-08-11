@@ -1,12 +1,12 @@
 # Handoff — 2026-08-10
 
-## 🔴 START HERE — ADR 009 built and validated, on branch `unify-testing-live-replay` (not merged). Read `docs/decisions/009-unify-testing-with-live-execution.md` for full detail; this is the summary.
+## 🔴 START HERE — ADR 009 built, validated, and merged to `main` (`c15f8f3`). Read `docs/decisions/009-unify-testing-with-live-execution.md` for full detail; this is the summary.
 
 Yesterday's session ended with a mandate but no plan: no separate
 "backtester," one test path that works the same as live. This session
 turned that into a real plan, in a dedicated planning pass with the user,
-then built and validated it same-session. Branch `unify-testing-live-replay`
-has all of it — **not merged to `main` yet**, 72 tests passing.
+then built, validated, and merged it same-session (branch
+`unify-testing-live-replay`, 72 tests passing).
 
 ### What actually happened, in order
 
@@ -66,15 +66,13 @@ has all of it — **not merged to `main` yet**, 72 tests passing.
 
 ### What to actually do next session
 
-1. **Review and merge `unify-testing-live-replay`** if the branch looks
-   good — nothing has been merged or pushed yet.
-2. Model 2 deployment is still queued (since 2026-08-06) and still blocked
-   behind this work being trusted — now that it is, this is probably the
-   actual next real task, not more architecture.
-3. The cascade trade-count mismatch itself was never root-caused, just
+1. **Model 2 deployment** is still queued (since 2026-08-06) and was
+   blocked behind this work being trusted — now that it's merged, this is
+   probably the actual next real task, not more architecture.
+2. The cascade trade-count mismatch itself was never root-caused, just
    removed. If cascade is wanted again later, it needs to be rebuilt and
    debugged properly, not resurrected from this branch's history as-is.
-4. If continuing to fully retire `engine.py`: the blended/cascade/scale/
+3. If continuing to fully retire `engine.py`: the blended/cascade/scale/
    fee-override fallback paths (item 8 above) are the remaining dependents.
 
 ---
