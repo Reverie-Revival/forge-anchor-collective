@@ -137,7 +137,7 @@ def _latest_candle_for_stream(stream: dict):
     tf = stream["parameters"].get("primary_timeframe", "1h")
     tf_minutes = {"15m": 15, "1h": 60, "4h": 240}.get(tf, 60)
 
-    from src.backtester.engine import load_market_data
+    from src.backtester.market_data import load_market_data
     from src.backtester.indicators import resample_ohlcv
 
     now = pd.Timestamp.utcnow().replace(tzinfo=None)
@@ -174,7 +174,7 @@ def _bucket_tick(conn, kraken: KrakenClient, dry_run: bool) -> None:
     if not model_ids:
         return
 
-    from src.backtester.engine import load_market_data
+    from src.backtester.market_data import load_market_data
     from src.backtester.indicators import resample_ohlcv, rolling_high
 
     now = pd.Timestamp.utcnow().replace(tzinfo=None)
@@ -270,8 +270,10 @@ def tick(conn, streams: dict, kraken: KrakenClient, last_tick: datetime,
             tf = stream["parameters"].get("primary_timeframe", "1h")
             if tf not in closed_tfs:
                 continue
-            if not order_manager.slot_is_available(conn, stream_id, slot_number=1):
-                log.debug(f"{stream['stream_name']}: slot occupied, skipping signal check")
+
+            slot_number = order_manager.next_signal_slot(conn, stream, now)
+            if slot_number is None:
+                log.debug(f"{stream['stream_name']}: no slot available, skipping signal check")
                 continue
             try:
                 fired = signal_engine.check(stream)
@@ -279,9 +281,9 @@ def tick(conn, streams: dict, kraken: KrakenClient, last_tick: datetime,
                 log.error(f"Signal check failed for {stream['stream_name']}: {e}")
                 continue
             if fired:
-                log.info(f"Signal fired: {stream['stream_name']} — placing entry order")
+                log.info(f"Signal fired: {stream['stream_name']} — placing entry order (slot {slot_number})")
                 signals_fired.append(stream["stream_name"])
-                order_manager.place_entry(conn, stream, kraken, dry_run)
+                order_manager.place_entry(conn, stream, kraken, dry_run, slot_number=slot_number)
                 entries_placed += 1
             else:
                 log.debug(f"{stream['stream_name']}: no signal")

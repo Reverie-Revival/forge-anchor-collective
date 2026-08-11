@@ -14,8 +14,11 @@ For each OPEN lot belonging to a stream whose candle just closed:
      but live had no code path for it at all, so those positions just ran on
      using the trailing stop alone -- real money running a different rule
      set than the one that was backtested and approved.
-  4. Otherwise: compute stop_price = hwm * (1 - trail_pct); if candle_low <=
-     stop_price, trigger a market exit.
+  4. Otherwise: compute stop_price = hwm * (1 - trail_pct) -- trail_pct
+     tightens as gain grows if trailing_stop_steps is set, and the trail
+     doesn't arm at all until trail_arm_gain_pct is reached, if configured
+     (also missing from live until this session, see the inline comment
+     below) -- if candle_low <= stop_price, trigger a market exit.
 
 candles_held is derived from wall-clock elapsed time since lot.opened_at,
 not a stored counter -- there is no live equivalent of the backtest's
@@ -29,6 +32,7 @@ from datetime import datetime, timezone
 
 from sqlalchemy import text
 
+from src.fees import MAKER_FEE, TAKER_FEE
 from src.live import order_manager
 from src.live.kraken_client import KrakenClient
 
@@ -67,7 +71,7 @@ def check_all(
 
     open_lots = conn.execute(
         text("""
-            SELECT lot_id, stream_id, entry_price, high_water_mark, btc_quantity,
+            SELECT lot_id, stream_id, slot_number, entry_price, high_water_mark, btc_quantity,
                    opening_capital, entry_fee_usd, opened_at
             FROM live.lots
             WHERE status = 'OPEN'
@@ -97,7 +101,9 @@ def check_all(
         close = candle["close"]
         low = candle["low"]
         position_cfg = stream["parameters"]["position"]
-        trail_pct = position_cfg["trailing_stop_pct"] / 100.0
+        base_trail_pct = position_cfg.get("trailing_stop_pct")
+        trail_steps = position_cfg.get("trailing_stop_steps")       # [[gain_pct, tighter_pct], ...]
+        trail_arm_gain_pct = position_cfg.get("trail_arm_gain_pct")  # trail off until this much gain
         min_hold = position_cfg.get("min_hold_candles") or 0
         max_hold = position_cfg.get("max_hold_candles")
         stop_loss_pct = position_cfg.get("stop_loss_pct")
@@ -130,21 +136,63 @@ def check_all(
             stops_triggered += 1
             continue
 
+        entry_price = float(lot.entry_price)
+        gain_pct = (new_hwm - entry_price) / entry_price * 100
+        armed = (not trail_arm_gain_pct) or gain_pct >= trail_arm_gain_pct
+
+        # Trailing stop, with two engine.py mechanics that were missing
+        # entirely from live before this session (found while validating
+        # staggered/cascade live parity -- Cascade DCA v2's locked config
+        # sets trailing_stop_steps, and the mismatch it caused against the
+        # backtest reference in a replay run is what surfaced this gap; the
+        # gap itself is general, not cascade-specific):
+        #   trail_arm_gain_pct -- no trailing stop at all until price has
+        #     moved this far in the position's favor; once armed, never
+        #     trails back below breakeven (entry + round-trip fee).
+        #   trailing_stop_steps -- [[gain_pct, tighter_trail_pct], ...]
+        #     ascending: tighten the effective trail as gain grows, instead
+        #     of one fixed pct for the whole hold.
+        trail_stop = None
+        if base_trail_pct and armed:
+            eff_trail_pct = base_trail_pct
+            if trail_steps:
+                for threshold, tighter in sorted(trail_steps, key=lambda x: x[0]):
+                    if gain_pct >= threshold:
+                        eff_trail_pct = tighter
+            trail_stop = new_hwm * (1 - eff_trail_pct / 100.0)
+            if trail_arm_gain_pct:
+                breakeven = entry_price * (1 + MAKER_FEE + TAKER_FEE)
+                trail_stop = max(trail_stop, breakeven)
+
         # Hard stop loss, measured from entry and never moving -- distinct from
         # the trailing stop, which moves up with the high-water mark. Matches
         # engine.py: stop_price is whichever of the two is MORE protective
         # (higher/closer to current price), not the trailing stop alone.
         # This was entirely missing from live until 2026-08-07 -- Breakout
         # Scout v3 and Dip Hunter v3 both set stop_loss_pct.
-        hard_stop = float(lot.entry_price) * (1 - stop_loss_pct / 100.0) if stop_loss_pct else None
-        trail_stop = new_hwm * (1 - trail_pct)
-        stop_price = max(s for s in (trail_stop, hard_stop) if s is not None)
+        hard_stop = entry_price * (1 - stop_loss_pct / 100.0) if stop_loss_pct else None
+
+        candidates = [s for s in (trail_stop, hard_stop) if s is not None]
+        if candidates:
+            stop_price = max(candidates)
+        elif trail_arm_gain_pct:
+            log.debug(f"Lot {lot.lot_id} ({stream['stream_name']}): trail not yet armed "
+                      f"(gain={gain_pct:.2f}% < arm={trail_arm_gain_pct}%), no other stop configured — holding")
+            continue
+        else:
+            # Legacy safety net matching engine.py -- only reachable if a
+            # stream configures no stop mechanism at all, which no current
+            # locked stream does.
+            stop_price = new_hwm * 0.97
 
         if low <= stop_price:
-            exit_reason = "stop_loss" if hard_stop is not None and stop_price <= hard_stop else "trailing_stop"
+            if hard_stop is not None and stop_price <= hard_stop:
+                exit_reason = "stop_loss"
+            else:
+                exit_reason = "trailing_stop"
             log.info(
                 f"{exit_reason} triggered — lot {lot.lot_id} ({stream['stream_name']}): "
-                f"low={low:.2f} <= stop={stop_price:.2f} (hwm={new_hwm:.2f}, trail={trail_pct*100:.1f}%, "
+                f"low={low:.2f} <= stop={stop_price:.2f} (hwm={new_hwm:.2f}, gain={gain_pct:.2f}%, "
                 f"hard_stop={hard_stop})"
             )
             order_manager.place_exit(conn, lot, stop_price, kraken, dry_run,

@@ -12,7 +12,7 @@ from sqlalchemy import create_engine, text
 
 load_dotenv()
 
-from src.backtester.engine import _warmup_days
+from src.backtester.market_data import _warmup_days
 from src.backtester.indicators import add_indicators, resample_ohlcv
 from src.fees import TAKER_FEE
 

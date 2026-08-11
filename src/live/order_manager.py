@@ -5,11 +5,14 @@ Handles the full state machine: CASH → PENDING → OPEN → CLOSED.
 All DB writes use the passed connection (caller manages the transaction).
 In dry_run mode, Kraken calls are skipped and logged instead.
 """
+from __future__ import annotations
+
 import logging
 from datetime import datetime, timezone, timedelta
 
 from sqlalchemy import text
 
+from src.backtester.slot_math import slot_capitals_for
 from src.fees import MAKER_FEE, TAKER_FEE
 from src.live.kraken_client import KrakenClient
 from src.live import notifier
@@ -60,13 +63,15 @@ def get_reserve_state(conn, model_id: int):
     ).fetchone()
 
 
-def _reserve_entry_capital(conn, stream: dict) -> float:
-    """Reserve-aware entry size for this stream: its full configured
-    lot_size_usd if this model has no pooled reserve (opt-in) or the pool is
-    at/above baseline; shrunk proportionally to the stream's own weight if
-    the pool is below baseline; 0.0 if even that shrunk share can't clear
-    the $10 hard minimum -- callers must treat 0.0 as "skip this entry"."""
-    lot_size_usd = float(stream["lot_size_usd"])
+def _reserve_entry_capital(conn, stream: dict, base_capital: float = None) -> float:
+    """Reserve-aware entry size: base_capital (the full configured
+    lot_size_usd, or -- for a staggered slot -- that slot's own
+    share of it, see _slot_capital_for) if this model has no pooled reserve
+    (opt-in) or the pool is at/above baseline; shrunk proportionally to the
+    slot's own weight of the model's baseline if the pool is below baseline;
+    0.0 if even that shrunk share can't clear the $10 hard minimum --
+    callers must treat 0.0 as "skip this entry"."""
+    lot_size_usd = float(base_capital) if base_capital is not None else float(stream["lot_size_usd"])
     reserve = get_reserve_state(conn, stream["model_id"])
     if reserve is None:
         return lot_size_usd
@@ -78,6 +83,88 @@ def _reserve_entry_capital(conn, stream: dict) -> float:
     weight = lot_size_usd / baseline_total
     capital = pool_balance * weight
     return capital if capital >= 10.0 else 0.0
+
+
+def _slot_capital_for(stream: dict, slot_number: int) -> float:
+    """This slot's share of the stream's lot_size_usd, per
+    params['slots']['slot_capital_weight'] -- same slot_capitals_for used by
+    the backtester (src/backtester/slot_math.py), so a staggered
+    stream's live capital split is provably the same formula that was
+    backtested, not a hand-ported copy. Single-slot streams (slot_count < 2,
+    the only mode with real capital today) get the full lot_size_usd
+    unchanged -- this function is a no-op for them."""
+    slot_count = int(stream.get("slot_count", 1) or 1)
+    if slot_count < 2:
+        return float(stream["lot_size_usd"])
+    weights = stream["parameters"].get("slots", {}).get("slot_capital_weight")
+    capitals = slot_capitals_for(float(stream["lot_size_usd"]), weights, slot_count)
+    return capitals[slot_number - 1]
+
+
+def _slot_free_priority(conn, stream_id: int, slot_count: int) -> dict:
+    """For staggered dispatch: {slot_number: last_freed_at or None}. None
+    (never occupied) sorts before any real timestamp -- matches engine.py's
+    _run_staggered_slots, where a never-used slot's last_freed_candle=-1
+    sorts first."""
+    rows = conn.execute(
+        text("""
+            SELECT slot_number, MAX(closed_at) AS freed_at
+            FROM live.lots
+            WHERE stream_id = :sid AND status = 'CLOSED'
+            GROUP BY slot_number
+        """),
+        {"sid": stream_id},
+    ).fetchall()
+    freed = {r.slot_number: r.freed_at for r in rows}
+    return {s: freed.get(s) for s in range(1, slot_count + 1)}
+
+
+def next_signal_slot(conn, stream: dict, now: datetime = None) -> int | None:
+    """Which slot number a fresh signal should enter into, or None if no
+    slot is eligible right now.
+
+    single/scale_down/scale_up (only single has real live capital today):
+    slot 1 only, exactly the old hardcoded behavior.
+    staggered: dispatches to whichever eligible slot has been free longest
+    (matches engine.py's _run_staggered_slots), gated by
+    params['slots']['slot_entry_gap_candles'] measured from the most recent
+    entry across ANY of this stream's slots.
+
+    cascade live parity (price-trigger-driven adds off a prior slot's own
+    fill) was built and then removed 2026-08-10 -- see docs/decisions/009 --
+    after its live-replay trade count didn't match engine.py's and the
+    mismatch wasn't run down. slot_mode='cascade' is not supported live.
+    """
+    slot_mode = stream.get("slot_mode", "single")
+    slot_count = int(stream.get("slot_count", 1) or 1)
+    stream_id = stream["stream_id"]
+
+    if slot_mode != "staggered" or slot_count < 2:
+        return 1 if slot_is_available(conn, stream_id, 1) else None
+
+    if now is None:
+        now = datetime.now(timezone.utc)
+
+    available = [s for s in range(1, slot_count + 1) if slot_is_available(conn, stream_id, s)]
+    if not available:
+        return None
+
+    gap_candles = stream["parameters"].get("slots", {}).get("slot_entry_gap_candles", 0)
+    if gap_candles:
+        tf = stream["parameters"].get("primary_timeframe", "1h")
+        gap_minutes = _tf_minutes(tf) * gap_candles
+        last_entry = conn.execute(
+            text("SELECT MAX(opened_at) FROM live.lots WHERE stream_id = :sid"),
+            {"sid": stream_id},
+        ).scalar()
+        if last_entry is not None:
+            last_entry = last_entry if last_entry.tzinfo else last_entry.replace(tzinfo=timezone.utc)
+            if (now - last_entry).total_seconds() < gap_minutes * 60:
+                return None
+
+    priorities = _slot_free_priority(conn, stream_id, slot_count)
+    available.sort(key=lambda s: (priorities[s] is not None, priorities[s]))
+    return available[0]
 
 
 # Same tuned dynamic_skim values as docs/decisions/007's original design and
@@ -144,20 +231,27 @@ def place_entry(
     stream: dict,
     kraken: KrakenClient,
     dry_run: bool = False,
+    slot_number: int = 1,
+    entry_reason: str = None,
 ) -> None:
     """
-    Place a limit buy order and create a PENDING lot.
+    Place a limit buy order and create a PENDING lot in the given slot_number
+    (1 for single/scale/staggered's dispatched slot; 2+ only for a staggered
+    dispatch -- see next_signal_slot, the only caller that should ever pass
+    slot_number != 1).
     Uses the current Kraken ticker price as the limit price.
 
-    Sizing is reserve-aware (docs/decisions/008, opt-in via
-    live.capital_reserve): normally the full configured lot_size_usd, shrunk
+    Sizing is slot-aware (_slot_capital_for -- a no-op full lot_size_usd for
+    single-slot streams) then reserve-aware (docs/decisions/008, opt-in via
+    live.capital_reserve): normally that full slot capital, shrunk
     proportionally if this model has a pooled reserve below baseline, or
     skipped entirely (no order, no DB row -- caller's signal is simply not
     acted on this time) if even the shrunk share can't clear $10.
     """
     stream_id = stream["stream_id"]
     model_id = stream["model_id"]
-    entry_capital = _reserve_entry_capital(conn, stream)
+    base_capital = _slot_capital_for(stream, slot_number)
+    entry_capital = _reserve_entry_capital(conn, stream, base_capital)
     if entry_capital <= 0:
         log.info(f"{stream['stream_name']}: pooled reserve share below $10 minimum -- skipping entry")
         return
@@ -193,20 +287,21 @@ def place_entry(
                  opening_capital, btc_quantity, entry_price, entry_order_id,
                  entry_expiry_at, entry_reason, opened_at)
             VALUES
-                (:mid, :sid, 1, :seq, 'PENDING',
+                (:mid, :sid, :slot, :seq, 'PENDING',
                  :capital, :qty, :price, :txid,
                  :expiry, :reason, :now)
         """),
         {
             "mid":     model_id,
             "sid":     stream_id,
+            "slot":    slot_number,
             "seq":     lot_seq,
             "capital": entry_capital,
             "qty":     btc_qty,
             "price":   limit_price,
             "txid":    txid,
             "expiry":  expiry_at,
-            "reason":  f"signal:{params.get('core_signal')}",
+            "reason":  entry_reason or f"signal:{params.get('core_signal')}",
             "now":     datetime.now(timezone.utc),
         },
     )

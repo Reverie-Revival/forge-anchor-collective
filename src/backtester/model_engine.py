@@ -2,16 +2,104 @@
 Model-level backtest engine.
 Runs all locked streams simultaneously with their configured allocations and aggregates results.
 """
-import pandas as pd
+import os
+import pickle
+from pathlib import Path
 
-from .engine import run_backtest, load_market_data
+import pandas as pd
+from sqlalchemy import create_engine, text
+
+from .engine import run_backtest
+from .live_replay_stream import run_live_replay_stream
+from .market_data import load_market_data
 from .indicators import add_indicators
 from .metrics import compute_metrics, btc_buy_and_hold
 from src.fees import MAKER_FEE, TAKER_FEE
 
+# Same runs/ directory src/app/db.py's save_stream_test already pickles every
+# stream test's full payload (including raw trades) into -- reused here
+# read-only so this stays DB-layer-agnostic like engine.py's own
+# load_market_data, rather than importing src/app/db.py and pulling in its
+# Streamlit dependency for a pure backtest module.
+_RUNS_DIR = Path(__file__).parent.parent / "app" / "runs"
+
+
+def _get_local_engine():
+    db_url = os.getenv("DATABASE_URL")
+    if not db_url:
+        host = os.getenv("DB_HOST", "localhost")
+        port = os.getenv("DB_PORT", "5432")
+        name = os.getenv("DB_NAME", "forge_anchor")
+        user = os.getenv("DB_USER", "")
+        pwd  = os.getenv("DB_PASSWORD", "")
+        auth = f"{user}:{pwd}@" if user else ""
+        db_url = f"postgresql+psycopg2://{auth}{host}:{port}/{name}"
+    elif db_url.startswith("postgresql://") and "+psycopg2" not in db_url:
+        db_url = db_url.replace("postgresql://", "postgresql+psycopg2://", 1)
+    return create_engine(db_url)
+
+
+def _cached_stream_trades(stream_config_id: int, start: str, end: str):
+    """A saved stream_tests result's (trades, capital_it_was_tested_at) for
+    this exact (stream_config_id, start, end), reused instead of a fresh
+    run_backtest() call -- docs/decisions/009 item #7. save_stream_test
+    already pickles the full trades DataFrame into runs/{test_id}.pkl for
+    every stream test ever saved (stream_tester.py's payload["trades"]);
+    this just looks it up by matching either a custom-range row directly, or
+    a preset row whose timeframe_presets dates equal the requested (start,
+    end) -- the same two dedup shapes save_stream_test itself supports.
+
+    The capital is returned alongside the trades, not baked in, because a
+    stream-locking test's capital (CLAUDE.md: "a placeholder until model
+    assembly") is very often NOT the same dollar amount a model later
+    allocates that stream -- confirmed this session running both paths
+    side by side for Model 1: identical trade counts, different $ pnl,
+    because the locked test ran at its own placeholder lot_size_usd, not
+    Model 1's real $33.33 allocation. The caller must rescale pnl/capital
+    to its own lot_size_usd before using these trades for anything -- see
+    run_model_backtest below.
+
+    None if nothing on record matches, in which case the caller must run
+    fresh (and non-pooled model assembly then still gets a fresh, uncached
+    run -- this is a cache, not a requirement).
+    """
+    try:
+        engine = _get_local_engine()
+        with engine.begin() as conn:
+            row = conn.execute(text("""
+                SELECT test_id FROM backtest.stream_tests st
+                WHERE st.stream_config_id = :cid
+                  AND (
+                    (st.custom_start = :start AND st.custom_end IS NOT DISTINCT FROM :end)
+                    OR st.preset_id IN (
+                        SELECT preset_id FROM timeframe_presets
+                        WHERE start_date = :start AND end_date IS NOT DISTINCT FROM :end
+                    )
+                  )
+                ORDER BY st.saved_at DESC LIMIT 1
+            """), {"cid": stream_config_id, "start": start, "end": end}).fetchone()
+    except Exception:
+        return None
+    if row is None:
+        return None
+    path = _RUNS_DIR / f"{row[0]}.pkl"
+    if not path.exists():
+        return None
+    try:
+        with open(path, "rb") as f:
+            payload = pickle.load(f)
+    except Exception:
+        return None
+    trades = payload.get("trades")
+    cached_capital = payload.get("lot_size_usd") or payload.get("initial_capital")
+    if trades is None or not cached_capital:
+        return None
+    return trades, float(cached_capital)
+
 
 def run_model_backtest(stream_configs: list, start: str = None, end: str = None,
-                       maker_fee: float = MAKER_FEE, taker_fee: float = TAKER_FEE) -> dict:
+                       maker_fee: float = MAKER_FEE, taker_fee: float = TAKER_FEE,
+                       use_cache: bool = False) -> dict:
     """
     Run a combined model backtest across all streams.
 
@@ -21,10 +109,34 @@ def run_model_backtest(stream_configs: list, start: str = None, end: str = None,
         params       (dict)  — backtest params from backtest.streams
         lot_size_usd (float) — capital per slot
         slot_count   (int)   — max concurrent positions for this stream
-        slot_mode    (str)   — 'single' | 'scale_down' | 'scale_up'
+        slot_mode    (str)   — 'single' | 'staggered' | 'scale_down' | 'scale_up' |
+            'cascade' | 'blended' — only single/staggered go through live-replay
+            (see use_cache below); the rest fall back to engine.py's run_backtest.
+        stream_config_id (int, optional) — enables cache reuse below; without
+            it, this stream is always re-simulated fresh.
 
     maker_fee/taker_fee default to the real current Kraken rate (src/fees.py) --
     override to re-run history under a hypothetical rate without editing code.
+
+    use_cache: reuse an already-saved stream_tests trade result for a stream
+        whose (stream_config_id, start, end) exactly matches one on record,
+        instead of doing a fresh run for it -- docs/decisions/009 item #7.
+        Streams don't interact in this (non-pooled) combiner, so IN
+        PRINCIPLE a cached, already-validated stream's trades are exactly
+        what a fresh run would produce (rescaled for capital -- see
+        _cached_stream_trades). Defaults to **False** -- opt-in only.
+        Confirmed this session with a real example (Model 1's Breakout Scout
+        v2, test_id 172): the cache key is only (stream_config_id, start,
+        end) with no tie to what version of engine.py/live_replay_stream.py
+        computed it, so a `stream_tests` row saved before a real bug fix
+        (here: the 2026-08-07 unconditional-compounding fix) is served
+        forever as if still valid -- nothing currently re-runs or
+        invalidates it when the underlying logic changes. Safe to opt into
+        for fast exploratory iteration during stream/model design (the "why
+        are we re-running this" case this was built for) as long as you know
+        the streams involved haven't gone stale; NOT safe as the source of a
+        number that gates a real deployment decision -- those must always
+        come from a fresh run, same as before this flag existed.
 
     Returns a combined payload dict with per-stream results and aggregated metrics.
     """
@@ -40,22 +152,64 @@ def run_model_backtest(stream_configs: list, start: str = None, end: str = None,
             initial_capital = sc["lot_size_usd"]
         else:
             initial_capital = sc["lot_size_usd"] * sc["slot_count"]
-        result = run_backtest(
-            sc["params"],
-            start=start,
-            end=end,
-            slot_count=sc["slot_count"],
-            slot_mode=sc.get("slot_mode", "single"),
-            stream_name=sc["stream_name"],
-            lot_size_usd=sc["lot_size_usd"],
-            maker_fee=maker_fee,
-            taker_fee=taker_fee,
-        )
+
+        cached = None
+        if use_cache and sc.get("stream_config_id") is not None:
+            cached = _cached_stream_trades(sc["stream_config_id"], start, end)
+
+        if cached is not None:
+            cached_trades, cached_capital = cached
+            # A stream-locking test's capital is a placeholder (CLAUDE.md),
+            # very often not the model's real allocation for this stream --
+            # rescale pnl/capital to this model's actual lot_size_usd (%
+            # gain per trade is capital-independent, only the $ amount
+            # scales) rather than trusting the cached $ values as-is.
+            trades = cached_trades.copy()
+            if not trades.empty and cached_capital > 0:
+                scale = sc["lot_size_usd"] / cached_capital
+                if scale != 1.0:
+                    trades["capital"] = trades["capital"] * scale
+                    trades["pnl"] = trades["pnl"] * scale
+            result = {
+                "trades": trades, "df": None, "start": pd.Timestamp(start),
+                "end": pd.Timestamp(end) if end else pd.Timestamp.now(),
+                "signals": pd.Series(dtype=bool), "maker_fee": maker_fee, "taker_fee": taker_fee,
+            }
+        else:
+            slot_mode = sc.get("slot_mode", "single")
+            # live_replay_stream drives the REAL order_manager code, which
+            # always uses the real current MAKER_FEE/TAKER_FEE (src/fees.py)
+            # -- it has no hypothetical-fee-override hook the way run_backtest
+            # does, so a caller asking for a non-default rate (or a slot_mode
+            # live has no parity for -- blended/cascade/scale_down/scale_up)
+            # falls back to engine.py, same as before this session.
+            if slot_mode in ("single", "staggered") and maker_fee == MAKER_FEE and taker_fee == TAKER_FEE:
+                result = run_live_replay_stream(
+                    sc["params"],
+                    start=start,
+                    end=end,
+                    slot_count=sc["slot_count"],
+                    slot_mode=slot_mode,
+                    stream_name=sc["stream_name"],
+                    lot_size_usd=sc["lot_size_usd"],
+                )
+            else:
+                result = run_backtest(
+                    sc["params"],
+                    start=start,
+                    end=end,
+                    slot_count=sc["slot_count"],
+                    slot_mode=slot_mode,
+                    stream_name=sc["stream_name"],
+                    lot_size_usd=sc["lot_size_usd"],
+                    maker_fee=maker_fee,
+                    taker_fee=taker_fee,
+                )
         trades  = result["trades"]
         metrics = compute_metrics(trades, initial_capital, result["start"], result["end"])
         ending_balance = initial_capital + (trades["pnl"].sum() if not trades.empty else 0)
 
-        if reference_df is None:
+        if reference_df is None and result["df"] is not None:
             reference_df = result["df"]
 
         if not trades.empty:
