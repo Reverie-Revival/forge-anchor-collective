@@ -41,6 +41,7 @@ LIVE_MODEL_VERSION = int(os.getenv("LIVE_MODEL_VERSION", "1"))
 
 MARKET_DATA_MAX_RETRIES = 3
 MARKET_DATA_RETRY_DELAY_S = 30
+SENTIMENT_MAX_AGE_DAYS = 2
 
 
 class MarketDataStaleError(RuntimeError):
@@ -49,6 +50,15 @@ class MarketDataStaleError(RuntimeError):
     acting on an incomplete candle (see resample_ohlcv's dropna(), which
     only drops fully-empty bins, not partially-filled ones) can misfire a
     real trade off a wrong close/high/low."""
+
+
+class SentimentDataStaleError(RuntimeError):
+    """sentiment_data hasn't updated in > SENTIMENT_MAX_AGE_DAYS. Ported from
+    live-model-1's _preflight_check (that branch has always hard-aborted the
+    whole tick on this, main never did) -- any stream with params['sentiment']
+    set (signal_engine.check() then loads Fear & Greed) would otherwise
+    silently keep trading off a stale F&G value forever if the sentiment
+    cron step in market_data.yml ever broke, with no alert at all."""
 
 
 def _get_engine():
@@ -116,6 +126,28 @@ def _ensure_market_data_fresh(conn, now: datetime, closed_tfs: set, model_id: in
     raise MarketDataStaleError(
         f"market_data still stale after {MARKET_DATA_MAX_RETRIES} retries "
         f"(latest={latest}, need>={expected}) for closed_tfs={closed_tfs}"
+    )
+
+
+def _ensure_sentiment_fresh(conn, model_id: int) -> None:
+    """Hard-abort the whole tick if sentiment_data hasn't updated in
+    SENTIMENT_MAX_AGE_DAYS -- ported from live-model-1's _preflight_check,
+    which has always done this and main never did. Checked once per tick
+    (sentiment_data updates daily, no retry loop needed like market_data's
+    15m-boundary check)."""
+    latest = conn.execute(text("SELECT MAX(date) FROM sentiment_data")).scalar()
+    if latest is None:
+        days_old = None
+    else:
+        from datetime import date
+        days_old = (date.today() - latest).days
+        if days_old <= SENTIMENT_MAX_AGE_DAYS:
+            return
+
+    notifier.alert_sentiment_stale(model_id, latest, days_old)
+    raise SentimentDataStaleError(
+        f"sentiment_data stale (latest={latest}, {days_old} days old, "
+        f"max={SENTIMENT_MAX_AGE_DAYS})"
     )
 
 
@@ -354,6 +386,8 @@ def run(dry_run: bool = False) -> None:
         if gap_hours > 2:
             log.warning(f"Executor gap detected: {gap_hours:.1f}h since last tick — firing system-down alert")
             notifier.alert_system_down(gap_hours)
+
+        _ensure_sentiment_fresh(conn, model_id)
 
         tick(conn, model_id, streams, kraken, last_tick, now, dry_run)
         _write_last_run(conn, model_id, now)

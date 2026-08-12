@@ -95,6 +95,21 @@ def alert_market_data_stale(model_id: int, latest_ts, expected_ts) -> None:
     )
 
 
+def alert_sentiment_stale(model_id: int, latest_date, days_old) -> None:
+    _dispatch(
+        email_subject=f"Forge: Sentiment Data Stale - Model {model_id}",
+        email_body=(
+            f"Forge | Model {model_id}\n"
+            f"sentiment_data did not update in time and the tick was aborted.\n"
+            f"Latest sentiment_data entry: {latest_date} ({days_old} days old)\n"
+            f"No signals were checked and no stops were evaluated this cycle.\n"
+            f"Check the market_data_updater workflow/cron's sentiment step for failures -- "
+            f"this tick will retry next cycle."
+        ),
+        sms_body=f"Model {model_id}: sentiment_data STALE, tick aborted -- check market_data cron",
+    )
+
+
 def alert_fee_drift(real_maker: float, real_taker: float, const_maker: float, const_taker: float,
                     tier_volume: float, next_volume: float) -> None:
     _dispatch(
