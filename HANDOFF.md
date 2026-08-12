@@ -32,6 +32,17 @@ Model 3's infra slot, don't build fresh:**
    this session — decide it explicitly at the start of the deployment work,
    then apply it to both models' naming, not just Model 2's.
 
+**Confirmed: Model 3 is fully clean on the live/Supabase side, safe to
+repurpose its infra slot.** User cleaned it up directly; verified
+independently 2026-08-11 by querying Supabase — `live.models` has ONLY
+Model 1, and zero Model 3 (`model_version=3`) rows across
+streams/lots/executor_runs/executor_state/blended_positions/
+blended_capital. Also noted: `live.btc_bucket`, `live.btc_bucket_events`,
+and `live.capital_reserve` (migrations v9/v10) don't exist in Supabase at
+all — those were only ever applied to local Postgres, nothing's
+provisioned live. No cleanup work needed before reusing Model 3's slot for
+Model 2 — go straight to the rename/repoint work in the checklist above.
+
 **Model 2's real composition** (from `backtest.model_streams WHERE model_id=2`,
 live-replay validated 2026-08-11): Breakout Scout v3, Dip Hunter v3,
 Momentum Rider v4, Volume Raider v1 — all single-slot, $25/lot each,
@@ -89,6 +100,35 @@ tick-time, model-scoped by parameter/secret rather than by branch).
 5. Dry-run first (`--dry-run` flag pattern already exists in `executor.py`)
    before flipping real orders on
 6. Confirm Kraken API keys/secrets are provisioned for this workflow
+
+**Two more real bugs found and fixed this session, after the wrap-up above
+was first written (found while double-checking the BTC bucket work):**
+
+1. **`run_pooled_model_backtest`'s bucket was silently losing every
+   skimmed dollar.** `load_market_data()`'s Postgres query
+   (`timestamp AT TIME ZONE 'UTC'`) strips tz info — `df.index` came back
+   tz-naive. But `skims` dict keys come from `live.lots.closed_at`
+   (`TIMESTAMPTZ`, tz-aware). `if ts in skims:` in the bucket loop silently
+   never matched — money got subtracted from the pool (correctly) but
+   never credited to the bucket (bug). Confirmed via the Model Tester UI:
+   Total Skimmed showed $17.23 but Bucket Value/BTC Held were stuck at
+   $0.00. Fixed: `df.index = df.index.tz_localize("UTC")` right after
+   loading. Re-verify by re-running the BTC Bucket compute button for any
+   model/window you care about — anything computed before this fix has
+   the bug baked in.
+2. **Live Monitor's signal-readiness display crashed on Dip Hunter**:
+   `unsupported operand type(s) for -: 'decimal.Decimal' and 'float'`.
+   `market_data`'s OHLCV columns are Postgres `NUMERIC` → psycopg2 returns
+   `Decimal`. `2_live_monitor.py` built its own DataFrame by hand from raw
+   query rows (not `pd.read_sql`, which auto-converts) — columns stayed
+   Decimal-typed, crashing wherever one met a plain float. **Confirmed
+   NOT a trading-safety issue** — `signal_engine.py` (real executor.py's
+   actual signal code) uses the safe `load_market_data()`, verified by
+   reading the import directly. Fixed: cast OHLCV to float right after
+   loading, same instinct as the `pd.to_datetime()` line right next to it.
+   See [[feedback_decimal_float_dtype]] — worth a broader check for any
+   OTHER hand-built DataFrame from a NUMERIC-typed table before assuming
+   this was the only occurrence.
 
 ---
 

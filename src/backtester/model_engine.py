@@ -436,8 +436,17 @@ def run_pooled_model_backtest(
                   "filters": {"drawdown_from_high": {"lookback_days": 60}}}
     df = load_market_data(start, end)
     df = add_indicators(df, ref_params)
+    # load_market_data's "timestamp AT TIME ZONE 'UTC'" query strips tz info
+    # (df.index comes back naive) -- but `skims`' keys are `exit_ts` values
+    # sourced from live.lots.closed_at (TIMESTAMPTZ, tz-aware UTC). Without
+    # this, `if ts in skims` below NEVER matches (naive != aware, silently,
+    # no error) -- every skimmed dollar was subtracted from the pool but
+    # never credited to the bucket, i.e. real money vanishing from the
+    # computation, not a display bug. Found 2026-08-11 via the Model Tester
+    # UI showing Total Skimmed > $0 but Bucket Value/BTC Held stuck at $0.
+    df.index = df.index.tz_localize("UTC")
     if start:
-        df = df[df.index >= pd.Timestamp(start)]
+        df = df[df.index >= pd.Timestamp(start, tz="UTC")]
 
     bucket_cash = 0.0
     tracked_qty = 0.0

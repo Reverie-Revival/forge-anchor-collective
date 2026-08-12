@@ -276,6 +276,20 @@ def load_stream_status(model_id):
         return []
 
     df_15m = pd.DataFrame([dict(r._mapping) for r in mdata_rows])
+    # market_data's OHLCV columns are Postgres NUMERIC -- psycopg2 returns
+    # decimal.Decimal for those, and building a DataFrame from raw row dicts
+    # (instead of pd.read_sql, which auto-converts) keeps them as object-dtype
+    # Decimal. add_indicators()/resample_ohlcv() mostly tolerate that
+    # silently (Decimal arithmetic works fine on its own), but any spot that
+    # mixes a Decimal with a plain Python float raises "unsupported operand
+    # type(s) for -: 'decimal.Decimal' and 'float'" -- hit 2026-08-11 in the
+    # Dip Hunter signal-readiness row. src/backtester/market_data.py's
+    # load_market_data() (used by the real trading path, signal_engine.py)
+    # doesn't have this problem -- pd.read_sql there converts automatically.
+    # Cast here to match, eliminating the whole bug class rather than
+    # chasing individual call sites.
+    for col in ("open", "high", "low", "close", "volume"):
+        df_15m[col] = df_15m[col].astype(float)
     df_15m["timestamp"] = pd.to_datetime(df_15m["timestamp"])
     df_15m = df_15m.set_index("timestamp").sort_index()
     if df_15m.index.tz is not None:
