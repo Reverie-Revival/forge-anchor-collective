@@ -26,6 +26,16 @@ per-candle loop to increment one. This assumes check_all is only ever
 called on this stream's own timeframe boundary (true today: executor.py
 only calls it when the stream's tf is in closed_timeframes), so elapsed
 whole periods lines up with the backtest's per-candle count.
+
+*** DATABASE: this module is engine-agnostic -- it operates on whatever
+`conn` its caller passes in. Real production (src/live/executor.py) passes
+a connection to SUPABASE_DATABASE_URL (real money). The live-replay test
+harness (src/backtester/live_replay_stream.py, tools/live_replay/*.py)
+passes a connection to LOCAL POSTGRES's disposable sandbox `live` schema
+instead -- same table names, different physical database, never touching
+real money. Don't assume "this code touches live.lots" means real money
+without checking which engine the specific caller used. See
+feedback_db_split memory (2026-08-11 incident). ***
 """
 import logging
 from datetime import datetime, timezone

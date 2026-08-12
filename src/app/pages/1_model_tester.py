@@ -15,8 +15,10 @@ from src.app.db import (
     load_pending_model_runs, load_last_model_run,
     next_model_run_number, load_model_run_payload,
     _pending_model_for_hash, _alloc_hash, get_local_engine,
+    save_bucket_test, load_bucket_tests,
 )
 from src.app.model_dashboard import render_model_dashboard, render_overview_dashboard, STREAM_COLORS
+from src.backtester.model_engine import run_pooled_model_backtest
 
 st.set_page_config(layout="wide")
 st.title("⚓ Forge Anchor — Model Tester")
@@ -102,6 +104,13 @@ with st.sidebar:
         index=len(model_options) - 1,
     )
     selected_model_version = model_options.get(selected_model_id, "Model ?")
+
+    archived_models = load_models(include_archived=True)
+    archived_models = [m for m in archived_models if m["status"] == "archived"]
+    if archived_models:
+        with st.expander(f"🗄 {len(archived_models)} archived attempt(s) — not selectable, version numbers retired"):
+            for m in archived_models:
+                st.caption(f"Model {m['model_version']} — {m['description']}")
 
     st.markdown('<p class="config-group-header" style="margin-top:4px;">Test Run</p>',
                 unsafe_allow_html=True)
@@ -300,6 +309,8 @@ with st.sidebar:
             if row.get("notes"):
                 st.caption(f"💬 {row['notes']}")
 
+    st.caption("₿ BTC Bucket results are at the bottom of the main page.")
+
 
 # ── Main area ──────────────────────────────────────────────────────────────────
 
@@ -481,3 +492,138 @@ from src.backtester.model_runner import run_model
 result = run_model(start="2019-01-01", end="2023-12-31")
 print(result)
         """, language="python")
+
+
+# ── BTC Bucket (pooled reserve) ──────────────────────────────────────────────
+# Visualizes docs/decisions/008's pooled-reserve + BTC skim-bucket design
+# against the CURRENTLY LOCKED composition for whichever model is selected in
+# the sidebar. run_pooled_model_backtest drives run_live_replay_stream for
+# each stream's own signal timing (same live-validated path as everything
+# else on this page, not engine.py -- see docs/decisions/009 and
+# feedback_never_engine_py memory). The bucket's own buy/sell mechanics
+# (dip-buy/recover-principal) have no live order-placement wiring yet -- this
+# shows what WOULD happen, not something running for real money.
+#
+# Results persist to backtest.bucket_tests (migration v11) -- computed once
+# per (model, preset), reloads instantly after that. No need to re-run on
+# every page visit.
+st.divider()
+st.header(f"₿ BTC Bucket — Pooled Reserve  ·  {selected_model_version}")
+st.caption(
+    "Stream trade timing via run_live_replay_stream (live-validated, same path as the rest "
+    "of this page). Bucket buy/sell mechanics have no live order-placement wiring yet."
+)
+
+saved_bucket_tests = load_bucket_tests(selected_model_id)
+
+if not saved_bucket_tests.empty:
+    bwin_labels = {int(r["preset_id"]): r["preset_name"] for _, r in saved_bucket_tests.iterrows()}
+    bwin_id = st.radio(
+        "Window", list(bwin_labels.keys()), format_func=lambda i: bwin_labels[i],
+        horizontal=True, key="bucket_view_preset",
+    )
+    row = saved_bucket_tests[saved_bucket_tests["preset_id"] == bwin_id].iloc[0]
+
+    baseline   = float(row["baseline_total"])
+    pool       = float(row["final_pool_balance"])
+    combined   = float(row["combined_ending"])
+    uplift     = combined - pool
+    uplift_pct = (uplift / baseline * 100) if baseline else 0
+    total_return_pct = (combined - baseline) / baseline * 100 if baseline else 0
+
+    st.markdown(
+        f'<span class="grade-badge" style="background:#f7931a22;color:#f7931a;'
+        f'border:1px solid #f7931a66;font-size:1.1rem;padding:6px 14px;">'
+        f'₿ Bucket added ${uplift:,.2f} ({uplift_pct:+.1f}% of baseline) over pool-only</span>',
+        unsafe_allow_html=True,
+    )
+    st.caption(f"Combined ending ${combined:,.2f} vs ${baseline:,.2f} baseline "
+              f"({total_return_pct:+.1f}% total)  ·  as of {row['simulation_end'] or bwin_labels[bwin_id]}")
+    st.divider()
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Stream Pool", f"${pool:,.2f}", f"baseline ${baseline:,.2f}")
+    c2.metric("BTC Bucket Value", f"${float(row['total_holdings_value']):,.2f}")
+    c3.metric("Total Skimmed", f"${float(row['total_skimmed']):,.2f}")
+    c4.metric("Combined Ending", f"${combined:,.2f}")
+
+    tracked_qty  = float(row["tracked_qty"])
+    house_qty    = float(row["house_money_qty"])
+    total_qty    = tracked_qty + house_qty
+    final_price  = float(row["final_price"]) if pd.notna(row["final_price"]) else None
+    c5, c6, c7, c8 = st.columns(4)
+    c5.metric("Total BTC Held", f"{total_qty:.6f}", help="tracked (recoverable) + house money (locked-in profit)")
+    c6.metric("Still At Risk", f"{tracked_qty:.6f} BTC",
+             f"cost basis ${float(row['tracked_cost_basis']):,.2f}" if tracked_qty else None)
+    c7.metric("House Money", f"{house_qty:.6f} BTC", "locked-in profit, no longer at risk")
+    c8.metric("BTC Price (period end)", f"${final_price:,.2f}" if final_price else "—")
+
+    events = row.get("bucket_events")
+    events = events if isinstance(events, list) else (json.loads(events) if events else [])
+    n_buys      = sum(1 for e in events if e.get("type") == "buy")
+    n_recovers  = sum(1 for e in events if e.get("type") == "recover_principal")
+
+    status_col, skip_col = st.columns(2)
+    with status_col:
+        if row["halted_at"] is not None and pd.notna(row["halted_at"]):
+            st.error(f"🛑 Hard floor hit at {row['halted_at']} (floor=${float(row['hard_floor']):,.2f}) — "
+                    f"every stream's share fell below $10 simultaneously, needs a real alert + manual decision")
+        else:
+            st.success(f"✅ Never hit hard floor (${float(row['hard_floor']):,.2f})")
+    with skip_col:
+        skipped = int(row["skipped_entries"]) if pd.notna(row["skipped_entries"]) else 0
+        if skipped:
+            st.warning(f"⚠️ {skipped} entries skipped (pool share fell below $10 minimum)")
+        else:
+            st.success("✅ No entries skipped — pool never fell below any stream's $10 minimum")
+
+    st.caption(f"{n_buys} dip-buy event(s), {n_recovers} principal-recovery event(s)")
+    if events:
+        with st.expander(f"Buy/sell event log ({len(events)} events)"):
+            ev_df = pd.DataFrame(events)
+            st.dataframe(ev_df, use_container_width=True, hide_index=True)
+else:
+    st.info("No BTC Bucket results saved yet for this model — compute one below.")
+
+with st.expander("➕ Compute a new window" if not saved_bucket_tests.empty else "▶ Compute"):
+    with get_local_engine().connect() as _bconn:
+        bucket_presets = pd.read_sql(text(
+            "SELECT preset_id, name, start_date, end_date FROM timeframe_presets ORDER BY preset_id"
+        ), _bconn).to_dict("records")
+    bp_labels = {p["preset_id"]: p["name"] for p in bucket_presets}
+    bp_id = st.selectbox("Window", list(bp_labels.keys()), format_func=lambda i: bp_labels[i],
+                          index=len(bp_labels) - 1, key="bucket_compute_preset")
+    if st.button("Compute BTC Bucket", type="primary"):
+        bp = next(p for p in bucket_presets if p["preset_id"] == bp_id)
+        with get_local_engine().connect() as _lconn:
+            locked_rows = pd.read_sql(text("""
+                SELECT ms.lot_size_usd, sc.parameters, sc.slot_count, sc.slot_mode,
+                       s.stream_id, s.stream_name || ' ' || sc.version AS stream_name
+                FROM backtest.model_streams ms
+                JOIN backtest.stream_configs sc ON ms.stream_config_id = sc.stream_config_id
+                JOIN backtest.streams s ON sc.stream_id = s.stream_id
+                WHERE ms.model_id = :mid
+            """), _lconn, params={"mid": selected_model_id})
+        stream_configs = []
+        for _, srow in locked_rows.iterrows():
+            params = srow["parameters"] if isinstance(srow["parameters"], dict) else json.loads(srow["parameters"])
+            stream_configs.append({
+                "stream_id": int(srow["stream_id"]), "stream_name": srow["stream_name"],
+                "params": params, "lot_size_usd": float(srow["lot_size_usd"]),
+                "slot_count": int(srow["slot_count"]), "slot_mode": str(srow["slot_mode"]),
+            })
+        non_single = [sc["stream_name"] for sc in stream_configs
+                      if sc["slot_mode"] != "single" or sc["slot_count"] != 1]
+        if non_single:
+            st.error(f"BTC bucket only supports single-slot streams — "
+                     f"{selected_model_version} has: {', '.join(non_single)}")
+        else:
+            with st.spinner(f"Computing pooled backtest for {bp['name']}... this can take several minutes."):
+                result = run_pooled_model_backtest(
+                    stream_configs,
+                    start=str(bp["start_date"]),
+                    end=str(bp["end_date"]) if bp.get("end_date") else None,
+                )
+                save_bucket_test(selected_model_id, bp_id, result)
+            st.cache_data.clear()
+            st.rerun()

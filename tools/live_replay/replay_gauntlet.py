@@ -32,6 +32,14 @@ adopted) but a direct patch of the one function every alert funnels through
 in each module, verified via an assert BEFORE anything else runs. Do not
 simplify this away.
 
+*** DATABASE: every live.* table here is on LOCAL POSTGRES
+(get_local_engine()), a disposable sandbox schema — NOT Supabase. Real
+production only ever connects via SUPABASE_DATABASE_URL (src/live/
+executor.py) and never sees anything this script writes. Both databases
+have a schema named `live` with identical table names — don't assume a
+`live.*` reference means real money without checking which engine function
+built the connection. See feedback_db_split memory (2026-08-11 incident). ***
+
 Usage:
     python -m tools.live_replay.replay_gauntlet --stream-config-id 12 --version v2 \\
         --start 2026-01-01 --end 2026-01-31 --lot-size 20 --slot-count 5 --slot-mode blended

@@ -1,3 +1,118 @@
+# Handoff — 2026-08-11
+
+## 🔴 START HERE — DB decluttered, Model 2 numbers regenerated + accepted as-is, Model 2 has NO live deployment infra yet. `live-model-1` verified healthy at runtime but 101 commits behind `main`.
+
+### What actually happened, in order
+
+1. **Full backtest DB declutter.** Deleted everything not wired into a real
+   model: 38 stream_configs → 9, 13 streams → 6, wiped all 178
+   `stream_tests`/101 `model_tests`/1782 `lots` (every row predated the
+   ADR 009 live-replay conversion, so none of it was trustworthy anyway).
+   Models 3 & 4 set `status='archived'` (not deleted) — user corrected a
+   stale assumption: **Model 3 is NOT live, it was shut down** (memory had
+   this wrong). `load_models()` now excludes archived models by default so
+   they don't clutter the Model Tester/Dashboard selectors; version numbers
+   3/4 are permanently retired, next real model is Model 5. Full detail:
+   [[project_db_declutter]] (auto-memory).
+2. **Regenerated Model 1 + Model 2 numbers from scratch**, 100% via
+   `run_live_replay_stream` (not `engine.py`) — 35 stream_tests (7 configs ×
+   5 presets) + 10 model_tests (2 models × 5 presets). New trusted Primary
+   v2 baseline: **Model 1 +13.6% ann, Model 2 +15.9% ann** — both notably
+   lower than the old pre-ADR-009 numbers, which is the whole point: those
+   were `engine.py`'s approximation, these are what would actually happen.
+3. **Real bug found and fixed**: `run_pooled_model_backtest()` (BTC bucket
+   feature, built earlier this session) was calling `engine.py`'s
+   `run_backtest()` — the exact banned pattern. Triggered the strongest
+   user reaction of the project so far ("Backtest is dead... NEVER AGAIN...
+   We test correctly. 100% of the time. No exceptions."). Fixed to use
+   `run_live_replay_stream`, verified with a real run. New hard-rule memory:
+   [[feedback_never_engine_py]].
+4. **Real concurrency bug found and fixed**: `run_live_replay_stream` used
+   a single hardcoded sentinel (`model_version=990`) shared by every call —
+   two overlapping calls (e.g. two browser tabs) corrupted each other via a
+   `ForeignKeyViolation`. Fixed: each call now mints its own random
+   sentinel. Verified with a deliberate concurrent-call test (no collision).
+5. **DB conflation incident**: claimed a local-sandbox concurrency bug was
+   a risk to Model 1's real money — wrong, conflated local Postgres's own
+   `live` schema (the replay sandbox) with Supabase's real `live` schema.
+   Fixed in memory ([[feedback_db_split]], new section) and in code — loud
+   `*** DATABASE: ***` comments added to `live_replay_stream.py`,
+   `replay_gauntlet.py`, `position_monitor.py` stating which DB each
+   touches.
+6. **Built BTC Bucket section in Model Tester** — visualizes
+   `run_pooled_model_backtest()` (docs/decisions/008) for whichever
+   single-slot model is selected. Moved from a cramped sidebar to a
+   full-width section at the bottom of the page per user feedback; now
+   persists to a new `backtest.bucket_tests` table (migration v11) instead
+   of session-only state, so it doesn't need re-running every page visit.
+7. **Momentum Rider v4 drawdown investigated and NOT changed.** Root cause:
+   a 4-loss whipsaw streak, Jul-Nov 2018, all `trailing_stop` exits — the
+   `RSI>55`/`SMA200 above` filters can't distinguish a real trend from a
+   dead-cat bounce still nominally above a lagging average. Tested raising
+   the Fear&Greed floor (fixed the 2018 streak but wrecked Recent/Primary v2
+   returns — overcorrection) and raising the RSI floor to 65 (better: fixed
+   most of the drawdown with only ~0.3pp return cost on Full History, but
+   still cost real drawdown on Recent and Primary v2). **User's call: keep
+   v4 unchanged** — neither lever was a clean win.
+8. **Explored Quiet Climber as a possible MR replacement** for the
+   Jul-Aug-2026-style quiet/choppy regime none of Model 2's 4 streams cover
+   (confirmed real: BTC chopped $57.7k-$67.3k, -4.6% net, mid-Jun–early-Aug
+   2026). Recovered its v4 params from the pre-declutter backup (never
+   locked into a model, was deleted in item 1). Live-replay validated for
+   the first time ever (its saved numbers were all pre-ADR-009) — turned
+   out **worse** than the old engine.py notes suggested: -36.5% max DD on
+   Full History (worse than MR's own -30.4%), driven by a 9-loss streak
+   Aug 2019–Jan 2020, and unlike MR, **100% of its exits are `trailing_stop`
+   — the 8.5% hard stop never once fires.** RSI floor (MR's fix) doesn't
+   transfer: Quiet Climber runs on 1h candles (vs MR's 4h), RSI(14) is too
+   noisy there to confirm a real trend. **Left unresolved** — candidate
+   next steps: try reverting to Quiet Climber's original SMA50 trend filter
+   (risky — v3→v4's own notes say SMA50 whipsawed badly in 2026), or build
+   a real slope/N-day-return filter (doesn't exist in the codebase at all
+   yet — every current trend filter is either a static SMA level check or
+   RSI, nothing measures "is this actually still going up").
+9. **Quick experiment: tried to push Volume Raider v1 to 30% ann on Primary
+   v2** (currently +23.7%). 10 parameter variants tested (wider/tighter
+   trail, stricter/looser volume threshold, RSI band changes) — every
+   single one was worse, several catastrophically (drawdown up to -52%).
+   Honest conclusion: the current config already sits at a local optimum;
+   30% isn't reachable via quick tuning without taking on real additional
+   risk. Not pursued further.
+10. **Verified `live-model-1` (Model 1's real deployed branch)**: runtime
+    is healthy — executor ticking every 30 min, zero errors in recent runs,
+    2 open positions correctly tracked. But structurally, **`live-model-1`
+    is 101 commits behind `main` and has 9 commits `main` doesn't** (fee-
+    drift safeguard, connection timeouts, market-data freshness guard,
+    real per-trade fee capture, alerting — all hotfixed directly onto that
+    branch). Spot-checked all 9 against `main`'s current code — `main` has
+    equivalent or more advanced versions of every one of them, so nothing
+    is currently missing/broken. User's call: since the buy/sell path is
+    confirmed working, leave `live-model-1` as-is — the branch divergence
+    itself is a real thing to close eventually, just not urgent tonight.
+
+### What to actually do next session
+
+1. **Model 2 has zero live deployment infrastructure** — this is the real
+   next milestone, separate from (and after) the numbers being trusted.
+   Needs its own `deploy_model2.py` (mirrors `deploy.py`'s pattern for
+   Model 1) + its own GitHub Actions workflow (mirrors `executor_m3.yml`'s
+   pattern for Model 3) + a `live.models` row. Model 2 is plain single-slot
+   (not blended like Model 3), so this should be simpler than Model 3's
+   build was — closer to reusing `executor.py` parameterized by model,
+   rather than a whole new `blended_executor.py`.
+2. Momentum Rider v4 and Quiet Climber both have real, unresolved drawdown
+   problems — neither is blocking Model 2 (MR v4 stays as-is; Quiet Climber
+   was never a candidate to begin with, just explored). If revisited: MR
+   needs a genuinely new lever (RSI/F&G both explored and rejected); Quiet
+   Climber needs either its old SMA50 filter re-tested properly or a new
+   slope/momentum filter built from scratch.
+3. `live-model-1` vs `main` branch divergence (item 10 above) — not urgent,
+   but worth reconciling before it gets any wider, especially once Model 2
+   deployment starts touching the same shared modules (`position_monitor.py`,
+   `order_manager.py`).
+
+---
+
 # Handoff — 2026-08-10
 
 ## 🔴 START HERE — ADR 009 built, validated, and merged to `main` (`c15f8f3`). Read `docs/decisions/009-unify-testing-with-live-execution.md` for full detail; this is the summary.

@@ -284,10 +284,12 @@ def run_pooled_model_backtest(
     streams only (slot_count == 1, slot_mode == 'single'); Model 1/2's real
     composition. Each stream's own trailing-stop/entry-signal timing is
     unaffected by capital size (% based, not $ based -- true throughout this
-    codebase), so each stream is first backtested normally at its full
-    lot_size_usd via run_backtest() to get real (entry_ts, exit_ts, roi)
-    triples; this function then re-derives dollar P&L by walking all streams'
-    entries/exits in true chronological order against ONE shared cash pool:
+    codebase), so each stream is first run live-replay (run_live_replay_stream,
+    the real order_manager/position_monitor code -- NOT engine.py's
+    run_backtest, see docs/decisions/009) at its full lot_size_usd to get real
+    (entry_ts, exit_ts, roi) triples; this function then re-derives dollar
+    P&L by walking all streams' entries/exits in true chronological order
+    against ONE shared cash pool:
 
     - pool >= baseline (sum of configured lot_size_usd): stream trades at its
       full configured size, unchanged from compound=False.
@@ -317,17 +319,27 @@ def run_pooled_model_backtest(
                 f"(got {sc['stream_name']}: slot_count={sc.get('slot_count')}, "
                 f"slot_mode={sc.get('slot_mode')}) -- see docs/decisions/008."
             )
+    if maker_fee != MAKER_FEE or taker_fee != TAKER_FEE:
+        raise ValueError(
+            "run_pooled_model_backtest no longer supports hypothetical fee overrides for "
+            "stream trade timing -- it drives run_live_replay_stream, which always uses "
+            "the real current MAKER_FEE/TAKER_FEE (src/fees.py), same as production. "
+            "See docs/decisions/009 -- engine.py's run_backtest is not used here anymore."
+        )
 
     baseline_total = sum(sc["lot_size_usd"] for sc in stream_configs)
 
-    # Pass 1: each stream's own real trade timing/returns, independent of pool state.
+    # Pass 1: each stream's own real trade timing/returns, independent of pool
+    # state. Drives run_live_replay_stream (the real order_manager/
+    # position_monitor code), NOT engine.py's run_backtest -- see
+    # docs/decisions/009. Every stream here is already required to be
+    # single-slot (checked above), which is exactly what live-replay supports.
     events = []  # (ts, seq, kind, stream_idx, trade_idx)
     per_stream_trades = []
     for si, sc in enumerate(stream_configs):
-        result = run_backtest(
+        result = run_live_replay_stream(
             sc["params"], start=start, end=end, slot_count=1, slot_mode="single",
             stream_name=sc["stream_name"], lot_size_usd=sc["lot_size_usd"],
-            maker_fee=maker_fee, taker_fee=taker_fee,
         )
         trades = result["trades"].reset_index(drop=True)
         trades["roi"] = trades["pnl"] / sc["lot_size_usd"] if not trades.empty else pd.Series(dtype=float)

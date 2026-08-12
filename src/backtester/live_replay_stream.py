@@ -28,6 +28,15 @@ modules mocked for the ENTIRE call, verified via an assert BEFORE anything
 else runs. Uses a reserved sandbox live.models sentinel, cleaned up in a
 finally block regardless of success/failure.
 
+*** DATABASE: every live.* table this file touches is on LOCAL POSTGRES
+(get_local_engine(), DATABASE_URL/DB_HOST env vars) -- a disposable sandbox
+schema, NOT Supabase. Real production (src/live/executor.py, real money)
+only ever connects via SUPABASE_DATABASE_URL and never sees anything this
+file writes. Both databases happen to have a schema named `live` with the
+same table names -- that's the trap. See feedback_db_split memory
+(2026-08-11 incident) before assuming a `live.*` reference here means real
+money. ***
+
 Usage (mirrors run_backtest()'s signature):
     from src.backtester.live_replay_stream import run_live_replay_stream
     result = run_live_replay_stream(params, start="2022-01-01", end=None,
@@ -36,6 +45,7 @@ Usage (mirrors run_backtest()'s signature):
     # result["trades"] is a DataFrame in the same shape run_backtest() returns
 """
 import json
+import random
 from datetime import datetime, timezone
 from unittest import mock
 
@@ -51,7 +61,16 @@ from src.fees import MAKER_FEE, TAKER_FEE
 from src.live import order_manager
 from src.live import position_monitor
 
-TEST_MODEL_VERSION = 990  # reserved sentinel, distinct from 991/992/993 (see tools/live_replay/)
+# Was a single fixed sentinel (990) shared by every call -- fine for one
+# invocation at a time, but Stream Tester and Model Tester both call this,
+# and a real user with two browser tabs open (or Model Tester's BTC-bucket
+# helper, which calls this once per stream) can genuinely overlap two calls
+# in time. When that happened (2026-08-11), one call's cleanup step deleted
+# the live.models row the other had just inserted mid-flight, crashing with
+# a ForeignKeyViolation on live.lots. Each call now mints its own random
+# sentinel instead, so concurrent calls can no longer collide. Range chosen
+# to stay clear of tools/live_replay/*.py's own fixed sentinels (991-999).
+_SENTINEL_RANGE = (100_000_000, 899_999_999)
 
 _TF_MINUTES = {"15m": 15, "1h": 60, "4h": 240}
 
@@ -126,14 +145,16 @@ def run_live_replay_stream(
         df = df[df.index >= pd.Timestamp(start)]
     signals = generate_signals(df, params)
 
+    run_sentinel = random.randint(*_SENTINEL_RANGE)
+
     engine = get_local_engine()
     with engine.begin() as conn:
-        _cleanup(conn, TEST_MODEL_VERSION)
+        _cleanup(conn, run_sentinel)
         model_id = conn.execute(text("""
             INSERT INTO live.models (model_version, description, based_on_model_test_id, status)
             VALUES (:v, 'LIVE-REPLAY-STREAM -- not a real model, alerts mocked', 0, 'active')
             RETURNING model_id
-        """), {"v": TEST_MODEL_VERSION}).scalar()
+        """), {"v": run_sentinel}).scalar()
         db_stream_id = conn.execute(text("""
             INSERT INTO live.streams (model_id, stream_name, stream_version, strategy_type,
                                       parameters, slot_count, slot_mode, lot_size_usd)
@@ -203,4 +224,4 @@ def run_live_replay_stream(
         }
     finally:
         with engine.begin() as conn:
-            _cleanup(conn, TEST_MODEL_VERSION)
+            _cleanup(conn, run_sentinel)

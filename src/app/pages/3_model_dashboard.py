@@ -244,9 +244,10 @@ with st.sidebar:
     model_opts = {f"Model {m['model_version']}": m["model_id"] for m in models}
     model_version_by_id = {m["model_id"]: m["model_version"] for m in models}
     model_labels = list(model_opts.keys())
-    # Default to Model 3 -- the one currently live and checked most often.
-    # Falls back to the last (most recent) model if Model 3 ever isn't listed.
-    default_model_idx = model_labels.index("Model 3") if "Model 3" in model_labels else len(model_labels) - 1
+    # Default to Model 1 -- the only model actually live as of 2026-08-11
+    # (Model 3 was shut down and archived; see project_db_declutter memory).
+    # Falls back to the last (most recent) model if Model 1 ever isn't listed.
+    default_model_idx = model_labels.index("Model 1") if "Model 1" in model_labels else len(model_labels) - 1
     model_label = st.selectbox("Model", model_labels, index=default_model_idx)
     model_id = model_opts[model_label]
     model_version = model_version_by_id[model_id]
