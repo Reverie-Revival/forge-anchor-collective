@@ -445,6 +445,40 @@ def load_stream_status(model_id):
                     "pass": fired, "note": note, "progress": _p,
                 })
 
+            elif core == "volume_surge":
+                # Mirrors src/backtester/signals.py's volume_surge check exactly:
+                # fires when volume exceeds its rolling average by a multiplier
+                # AND the candle is bullish (close > open). The RSI bound this
+                # core signal also applies is displayed as its own row below
+                # (generic "RSI filter" section) rather than folded in here, so
+                # all_pass = core AND filter still matches signals.py's combined
+                # `vol_ok and bullish and rsi_ok`.
+                vol = float(last.get("volume", float("nan")))
+                vol_avg = float(last.get("volume_avg", float("nan")))
+                multiplier = core_p.get("volume_multiplier", 2.5)
+                vol_trigger = vol_avg * multiplier if not pd.isna(vol_avg) else float("nan")
+                vol_ok = (not pd.isna(vol_trigger)) and vol > vol_trigger
+                bullish = float(last["close"]) > float(last["open"])
+                fired = vol_ok and bullish
+                gap = (vol - vol_trigger) / vol_trigger * 100 if vol_trigger else float("nan")
+                if fired:
+                    note = "surge + bullish candle ✓"
+                elif vol_ok and not bullish:
+                    note = "volume surged but candle isn't bullish"
+                elif not pd.isna(gap):
+                    note = f"{abs(gap):.0f}% below {multiplier}x volume trigger"
+                else:
+                    note = "no volume data"
+                _p = 1.0 if fired else (min(vol / vol_trigger * 0.9, 0.9) if vol_trigger and not pd.isna(gap) else 0.0)
+                conditions.append({
+                    "label": f"Volume surge ({multiplier}x avg) + bullish candle",
+                    "current": (
+                        f"Vol {vol:,.0f}  /  Trigger {vol_trigger:,.0f} ({multiplier}x avg)"
+                        f"  ·  {'bullish' if bullish else 'bearish'}"
+                    ),
+                    "pass": fired, "note": note, "progress": _p,
+                })
+
             # RSI filter
             rsi_f = filters.get("rsi") or {}
             if rsi_f and "rsi" in last.index and not pd.isna(last["rsi"]):
