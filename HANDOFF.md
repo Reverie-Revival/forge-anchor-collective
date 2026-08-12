@@ -1,6 +1,68 @@
 # Handoff — 2026-08-11
 
-## 🔴 START HERE — DB decluttered, Model 2 numbers regenerated + accepted as-is, Model 2 has NO live deployment infra yet. `live-model-1` verified healthy at runtime but 101 commits behind `main`.
+## 🔴🔴 NEXT SESSION: DEPLOYING MODEL 2 LIVE. Concrete checklist below — three real landmines already found, don't rediscover them from scratch.
+
+**Model 2's real composition** (from `backtest.model_streams WHERE model_id=2`,
+live-replay validated 2026-08-11): Breakout Scout v3, Dip Hunter v3,
+Momentum Rider v4, Volume Raider v1 — all single-slot, $25/lot each,
+**$100 total**. Numbers accepted as-is (see item 7 below in yesterday's
+recap) — this is a deployment task, not a design task.
+
+**Landmine 1 — `src/live/deploy.py` is broken against the current schema,
+do not copy it as-is.** It queries `backtest.streams` for `model_id`,
+`stream_version`, `parameters`, `slot_count`, `slot_mode` — none of those
+columns exist on that table anymore (v3 migration moved them to
+`backtest.stream_configs`/`backtest.model_streams`; `backtest.streams` is
+identity-only: `stream_id`, `stream_name`, `strategy_type`, `description`).
+Verified 2026-08-11 by querying `information_schema.columns` directly. A
+`deploy_model2.py` needs a real rewrite joining `model_streams` →
+`stream_configs` → `streams`, not a copy-paste of `deploy.py`'s query.
+
+**Landmine 2 — `executor.py` is hardcoded to one model.**
+`LIVE_MODEL_VERSION = 1` at module level; the whole file assumes it's
+running exactly one model. Real design decision needed before writing any
+code: parameterize `executor.py` (env var or CLI arg for model version) so
+Model 1 and Model 2 share one executor, or duplicate it the way Model 3
+got its own `blended_executor.py`. Model 2 is plain single-slot (not
+blended like Model 3), so parameterizing the existing `executor.py` is
+probably the better fit than a full duplicate — but this is a real call to
+make deliberately, not default into.
+
+**Landmine 3 — GitHub Actions secret-mapping convention changed between
+Model 1 and Model 3's workflows, and current `main` only supports the
+newer one.** `executor.yml` (Model 1, older) maps only
+`DATABASE_URL: ${{ secrets.SUPABASE_DATABASE_URL }}`. `executor_m3.yml`
+(Model 3, newer) maps the secret to BOTH `DATABASE_URL` and
+`SUPABASE_DATABASE_URL`. Checked 2026-08-11: `main`'s current
+`executor.py:_get_engine()` reads `SUPABASE_DATABASE_URL` ONLY and raises
+`RuntimeError` if unset — it does NOT fall back to `DATABASE_URL` at all
+anymore. A Model 2 workflow copied from the old `executor.yml` pattern
+would crash on its first tick. Must use `executor_m3.yml`'s dual-mapping
+pattern (or newer, if `SUPABASE_DATABASE_URL` alone is now sufficient —
+recheck `_get_engine()` before assuming).
+
+**Also worth deciding, not just defaulting into:** every previously
+deployed model got its own permanently-branched-off deployment branch
+(`live-model-1`, `live-model-3`, `live-model-4`) that then stops tracking
+`main` — this is exactly the pattern that caused the 101/9 commit
+divergence documented in [[project_live_model1_branch_divergence]]. Worth
+asking out loud whether `live-model-2` should follow the same pattern
+(known to drift) or whether this is the moment to try something that stays
+in sync with `main` (e.g. a workflow that always checks out `main` at
+tick-time, model-scoped by parameter/secret rather than by branch).
+
+**Standard checklist either way:**
+1. Rewrite `deploy_model2.py` against current schema (Landmine 1)
+2. Decide executor approach (Landmine 2) and implement
+3. Create `live.models` row for Model 2 ($100, the 4-stream composition above)
+4. Create the GitHub Actions workflow with correct secret mapping (Landmine 3)
+5. Dry-run first (`--dry-run` flag pattern already exists in `executor.py`)
+   before flipping real orders on
+6. Confirm Kraken API keys/secrets are provisioned for this workflow
+
+---
+
+## Yesterday's session recap — DB decluttered, Model 2 numbers regenerated + accepted as-is, Model 2 had NO live deployment infra as of end of session. `live-model-1` verified healthy at runtime but 101 commits behind `main`.
 
 ### What actually happened, in order
 
