@@ -37,7 +37,7 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-LIVE_MODEL_VERSION = 1
+LIVE_MODEL_VERSION = int(os.getenv("LIVE_MODEL_VERSION", "1"))
 
 MARKET_DATA_MAX_RETRIES = 3
 MARKET_DATA_RETRY_DELAY_S = 30
@@ -196,8 +196,11 @@ def _bucket_tick(conn, kraken: KrakenClient, dry_run: bool) -> None:
         bucket_manager.check_dip_buy(conn, model_id, price, drawdown_pct, kraken, dry_run)
 
 
-def _read_last_run(conn) -> datetime:
-    row = conn.execute(text("SELECT last_run_at FROM live.executor_state WHERE id = 1")).fetchone()
+def _read_last_run(conn, model_id: int) -> datetime:
+    row = conn.execute(
+        text("SELECT last_run_at FROM live.executor_state WHERE model_id = :mid"),
+        {"mid": model_id},
+    ).fetchone()
     if row is None:
         return datetime.now(timezone.utc)
     ts = row.last_run_at
@@ -206,27 +209,35 @@ def _read_last_run(conn) -> datetime:
     return ts
 
 
-def _write_last_run(conn, now: datetime) -> None:
-    conn.execute(
-        text("UPDATE live.executor_state SET last_run_at = :now WHERE id = 1"),
-        {"now": now},
+def _write_last_run(conn, model_id: int, now: datetime) -> None:
+    result = conn.execute(
+        text("UPDATE live.executor_state SET last_run_at = :now WHERE model_id = :mid"),
+        {"now": now, "mid": model_id},
     )
+    if result.rowcount == 0:
+        # id has DEFAULT 1 (a leftover from the old singleton design) -- must be
+        # given explicitly here or this collides with Model 1's id=1 row. Same
+        # fix as blended_executor.py's _write_last_run.
+        conn.execute(
+            text("INSERT INTO live.executor_state (id, last_run_at, model_id) VALUES (:mid, :now, :mid)"),
+            {"now": now, "mid": model_id},
+        )
 
 
-def _log_tick(conn, last_tick: datetime, closed_tfs: set, open_count: int,
+def _log_tick(conn, model_id: int, last_tick: datetime, closed_tfs: set, open_count: int,
               pending_count: int, signals_fired: list, entries_placed: int,
               fills: int, expirations: int, stops_triggered: int,
               error: str = None) -> None:
     conn.execute(text(
-        "DELETE FROM live.executor_runs WHERE ran_at < now() - interval '90 days'"
-    ))
+        "DELETE FROM live.executor_runs WHERE ran_at < now() - interval '90 days' AND model_id = :mid"
+    ), {"mid": model_id})
     conn.execute(text("""
         INSERT INTO live.executor_runs
             (last_tick_at, closed_tfs, open_lots, pending_lots, signals_fired,
-             entries_placed, fills, expirations, stops_triggered, error)
+             entries_placed, fills, expirations, stops_triggered, error, model_id)
         VALUES
             (:last_tick, :closed_tfs, :open, :pending, :signals,
-             :entries, :fills, :expirations, :stops, :error)
+             :entries, :fills, :expirations, :stops, :error, :mid)
     """), {
         "last_tick":   last_tick,
         "closed_tfs":  list(closed_tfs) if closed_tfs else [],
@@ -238,15 +249,22 @@ def _log_tick(conn, last_tick: datetime, closed_tfs: set, open_count: int,
         "expirations": expirations,
         "stops":       stops_triggered,
         "error":       error,
+        "mid":         model_id,
     })
 
 
-def tick(conn, streams: dict, kraken: KrakenClient, last_tick: datetime,
+def tick(conn, model_id: int, streams: dict, kraken: KrakenClient, last_tick: datetime,
          now: datetime, dry_run: bool) -> None:
     closed_tfs = _detect_closed_timeframes(last_tick, now)
     _ensure_market_data_fresh(conn, now, closed_tfs, LIVE_MODEL_VERSION)
-    open_count = conn.execute(text("SELECT COUNT(*) FROM live.lots WHERE status = 'OPEN'")).scalar()
-    pending_count = conn.execute(text("SELECT COUNT(*) FROM live.lots WHERE status = 'PENDING'")).scalar()
+    open_count = conn.execute(
+        text("SELECT COUNT(*) FROM live.lots WHERE status = 'OPEN' AND model_id = :mid"),
+        {"mid": model_id},
+    ).scalar()
+    pending_count = conn.execute(
+        text("SELECT COUNT(*) FROM live.lots WHERE status = 'PENDING' AND model_id = :mid"),
+        {"mid": model_id},
+    ).scalar()
     log.info(
         f"Tick — last_run={last_tick.strftime('%Y-%m-%d %H:%M')} "
         f"closed_tfs={closed_tfs or 'none'} "
@@ -298,7 +316,7 @@ def tick(conn, streams: dict, kraken: KrakenClient, last_tick: datetime,
 
     _bucket_tick(conn, kraken, dry_run)
 
-    _log_tick(conn, last_tick, closed_tfs, open_count, pending_count,
+    _log_tick(conn, model_id, last_tick, closed_tfs, open_count, pending_count,
               signals_fired, entries_placed, fills, expirations, stops_triggered)
 
 
@@ -325,19 +343,20 @@ def run(dry_run: bool = False) -> None:
         conn.execute(text("SET statement_timeout = '15s'"))
         streams = _load_streams(conn)
         if not streams:
-            log.error(f"No active streams found for Model {LIVE_MODEL_VERSION}. Run deploy.py first.")
+            log.error(f"No active streams found for Model {LIVE_MODEL_VERSION}. Run the model's deploy script first.")
             sys.exit(1)
         log.info(f"Loaded {len(streams)} streams: {[s['stream_name'] for s in streams.values()]}")
 
-        last_tick = _read_last_run(conn)
+        model_id = next(iter(streams.values()))["model_id"]
+        last_tick = _read_last_run(conn, model_id)
 
         gap_hours = (now - last_tick).total_seconds() / 3600
         if gap_hours > 2:
             log.warning(f"Executor gap detected: {gap_hours:.1f}h since last tick — firing system-down alert")
             notifier.alert_system_down(gap_hours)
 
-        tick(conn, streams, kraken, last_tick, now, dry_run)
-        _write_last_run(conn, now)
+        tick(conn, model_id, streams, kraken, last_tick, now, dry_run)
+        _write_last_run(conn, model_id, now)
 
     log.info("=== Tick complete ===")
 

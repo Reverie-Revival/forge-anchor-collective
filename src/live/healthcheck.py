@@ -22,6 +22,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)-7s  %(
 log = logging.getLogger(__name__)
 
 ALERT_THRESHOLD_HOURS = 2
+LIVE_MODEL_VERSION = int(os.getenv("LIVE_MODEL_VERSION", "1"))
 
 
 def run() -> None:
@@ -36,12 +37,22 @@ def run() -> None:
     now = datetime.now(timezone.utc)
 
     with engine.connect() as conn:
+        model_row = conn.execute(
+            text("SELECT model_id FROM live.models WHERE model_version = :ver"),
+            {"ver": LIVE_MODEL_VERSION},
+        ).fetchone()
+        if model_row is None:
+            log.error(f"No live.models row for model_version={LIVE_MODEL_VERSION} — run the model's deploy script first")
+            sys.exit(1)
+        model_id = model_row.model_id
+
         row = conn.execute(
-            text("SELECT last_run_at FROM live.executor_state WHERE id = 1")
+            text("SELECT last_run_at FROM live.executor_state WHERE model_id = :mid"),
+            {"mid": model_id},
         ).fetchone()
 
     if row is None:
-        log.error("No executor_state row found — executor may never have run")
+        log.error(f"No executor_state row found for Model {LIVE_MODEL_VERSION} — executor may never have run")
         notifier.alert_system_down(999)
         return
 
@@ -50,13 +61,13 @@ def run() -> None:
         last_run = last_run.replace(tzinfo=timezone.utc)
 
     gap_hours = (now - last_run).total_seconds() / 3600
-    log.info(f"Last executor run: {last_run.strftime('%Y-%m-%d %H:%M UTC')} ({gap_hours:.1f}h ago)")
+    log.info(f"Model {LIVE_MODEL_VERSION} last executor run: {last_run.strftime('%Y-%m-%d %H:%M UTC')} ({gap_hours:.1f}h ago)")
 
     if gap_hours > ALERT_THRESHOLD_HOURS:
-        log.warning(f"Executor has been silent for {gap_hours:.1f}h — firing alert")
+        log.warning(f"Model {LIVE_MODEL_VERSION} executor has been silent for {gap_hours:.1f}h — firing alert")
         notifier.alert_system_down(gap_hours)
     else:
-        log.info("Executor heartbeat OK")
+        log.info(f"Model {LIVE_MODEL_VERSION} executor heartbeat OK")
 
     # Both live models share one Kraken account, but Model 1 and Model 3 live
     # on separate branches with their OWN copy of MAKER_FEE/TAKER_FEE -- these
