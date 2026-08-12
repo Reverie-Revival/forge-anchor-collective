@@ -858,9 +858,9 @@ st.markdown('<p class="section-label">System Status</p>', unsafe_allow_html=True
 last_exec   = exec_runs.iloc[0] if not exec_runs.empty else None
 last_mdata  = mdata_runs.iloc[0] if not mdata_runs.empty else None
 
-c1, c2, c3, c4, c5 = st.columns(5)
+r1c1, r1c2 = st.columns(2)
 
-with c1:
+with r1c1:
     if last_exec is not None:
         dot = _status_dot(last_exec["error"])
         st.metric("Last Executor Run", _ago(last_exec["ran_at"]), delta=f"{dot} {'error' if last_exec['error'] else 'clean'}", delta_color="off")
@@ -868,13 +868,15 @@ with c1:
     else:
         st.metric("Last Executor Run", "No data")
 
-with c2:
+with r1c2:
     if last_mdata is not None:
         dot = _status_dot(last_mdata["error"])
         st.metric("Last Market Data Run", _ago(last_mdata["ran_at"]), delta=f"{dot} {'error' if last_mdata['error'] else 'clean'}", delta_color="off")
         st.caption(_fmt_central(last_mdata["ran_at"]))
     else:
         st.metric("Last Market Data Run", "No data")
+
+c3, c4, c5 = st.columns(3)
 
 with c3:
     st.metric("Open Positions", open_count)
