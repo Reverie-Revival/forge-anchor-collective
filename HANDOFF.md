@@ -1,3 +1,133 @@
+# Handoff — 2026-08-12
+
+## ✅ MODEL 2 IS LIVE. Trading real money, running in parallel with Model 1. Read this before touching live infra again.
+
+**Deployed:** `live.models.model_id=4` (surrogate PK — don't confuse with
+`model_version=2`), 4 streams (Volume Raider v1, Dip Hunter v3, Breakout
+Scout v3, Momentum Rider v4), all single-slot $25/lot, $100 total.
+`based_on_model_test_id=156` (Primary v2, live-replay-validated, +15.90%
+ann / 106 trades). `DRY_RUN_M2` is `false` — real orders, confirmed via a
+real cron-triggered tick landing clean 2026-08-12 16:00 UTC.
+
+### Infra map (current state — all three branches)
+- `main` — shared code baseline, dev/testing. Has everything below.
+- `live-model-1` — Model 1's actual deployment branch. **101+ commits
+  behind main, structurally different** (still uses `engine.py`'s
+  `load_market_data` for candles, its own `_preflight_check` instead of
+  `main`'s `_ensure_market_data_fresh`/`_ensure_sentiment_fresh` pair,
+  hardcoded `id=1`/`model_id=1` for `executor_state`). This divergence is
+  **known and accepted, not a bug** — reconciling it is a real future
+  project, not something to casually fix mid-session. Only minimal,
+  surgical patches were applied here this session (see below) — never a
+  full merge from main.
+- `live-model-2` — Model 2's deployment branch, forked fresh from `main`
+  2026-08-12 and kept in sync via merges all session. Should be treated
+  the same way `live-model-1` now is: a working branch that's expected to
+  diverge from `main` over time, not force-synced.
+- Naming convention, now applied consistently: `executor_m{N}.yml` /
+  `healthcheck_m{N}.yml` / `deploy_model{N}.py`, `DRY_RUN_M{N}` secret,
+  `live-model-{N}` branch. Model 1 was retrofitted to this convention this
+  session (was unsuffixed `executor.yml` etc. before). Model 4 branch
+  archived (`archive/live-model-4`) — was never deployed live, confirmed
+  via Supabase query before archiving.
+- `live-market-data` — market data ingestion's own dedicated branch
+  (previously coupled to `live-model-1`, now independent since it affects
+  every model). Workflow YAML mirrored on `main` too, same pattern as the
+  executor/healthcheck files.
+
+### Real bugs found and fixed this session (all verified against live Supabase data, not assumed)
+1. **`executor.py` was unsafe for two models sharing `live.lots`.**
+   `live.executor_state` used a hardcoded `id=1` row (would've clobbered
+   between models), `open_count`/`pending_count` queries had no
+   `model_id` filter (Model 1's own dashboard stats would've silently
+   started including Model 2's lots once Model 2 had real trades). Fixed
+   by porting the `model_id`-scoped pattern `blended_executor.py` already
+   proved out for Model 3. `executor.py`/`healthcheck.py` now read
+   `LIVE_MODEL_VERSION` from an env var (default 1) instead of a hardcoded
+   constant — Model 1 and Model 2 share the same executor code, no fork.
+2. **Fee-drift safeguard was silently no-op on every model, including live
+   Model 1.** `check_fee_drift()` needs a real Kraken API call, but no
+   healthcheck workflow (Model 1, Model 2, or the old Model 3) ever mapped
+   `KRAKEN_API_KEY`/`KRAKEN_API_SECRET` into the job env. The function
+   never raises on the resulting auth error — logs and returns `True`, as
+   if fees matched — so this had never actually verified anything since
+   it was built. Fixed on `main`, `live-model-1`, `live-model-2`; verified
+   live via `gh run view` showing a real fee-tier check succeed.
+3. **`main`'s executor never checked `sentiment_data` freshness at all** —
+   `live-model-1` has always hard-aborted a tick if `sentiment_data` is
+   stale, `main` only ever guarded `market_data`. Any stream gating on
+   Fear & Greed would've silently traded on frozen sentiment forever if
+   that cron step broke. Ported (`_ensure_sentiment_fresh`,
+   `SentimentDataStaleError`) to `main` and `live-model-2`.
+4. **Failed order placement was silent everywhere.** `place_entry`'s
+   except block only logged an error, no alert — now fires
+   `notifier.alert_order_failed`. This matters a lot more now: **the real
+   Kraken account currently holds $132.89 USD against a worst-case
+   simultaneous demand of $133.33** (Model 1's one open Dip Hunter slot +
+   all four of Model 2's empty slots firing at once). Razor-thin margin,
+   unlikely to actually collide (different streams rarely all signal at
+   once), but there is currently ~$0 real buffer between the two models'
+   combined worst case and the account balance. **Consider adding cash
+   headroom to the Kraken account** — not urgent, but worth a deliberate
+   decision rather than discovering it via a failed order.
+5. **Live Monitor (`2_live_monitor.py`) had three real bugs**, all fixed:
+   - Hardcoded `MODEL_LABELS = {1: "Model 1", 3: "Model 3"}` — missed
+     Model 2 entirely, would've kept showing a "Model 3" option pointing
+     at a `model_id` long deleted from `live.models`. Now data-driven
+     (`load_deployed_models()` queries `live.models WHERE status='active'`).
+     `IS_BLENDED` similarly switched from hardcoded `== 3` to checking for
+     a `live.blended_capital` row.
+   - **Missing `volume_surge` condition branch** — Volume Raider's actual
+     core signal had no case in the Stream Status condition builder, so
+     the panel only ever evaluated the generic filter rows (RSI, F&G) and
+     mislabeled that as "🟢 signal firing" regardless of whether volume
+     actually surged. Same bug class as the 2026-08-06 Dip Hunter
+     mismatch. Fixed — verified against real data that the last closed 4h
+     candle *did* see a volume surge but closed bearish, so it correctly
+     was not firing.
+   - System Status tiles (Last Executor Run / Last Market Data Run) were
+     squeezed into 1/5-width columns, clipping the "Xm ago" text. Split
+     into two rows.
+6. **`Model Dashboard` (`3_model_dashboard.py` + `src/app/db.py`) needed
+   NO changes** — already fully data-driven (`backtest.models` selector,
+   `_live_model_id_for_version()` bridges the two independent `model_id`
+   spaces, `is_blended` derived per-model from `slot_mode`). Worth knowing
+   this file is the reference pattern for "how to do this correctly" if
+   another dashboard page needs the same treatment later.
+
+### Migrations applied to Supabase this session
+`migration_v9_capital_reserve.sql` and `migration_v10_btc_bucket.sql` —
+previously only ever applied to local Postgres (flagged as a gap in the
+2026-08-11 handoff below). Both purely additive `CREATE TABLE IF NOT
+EXISTS`, no risk to existing data. Model 2 has both a `live.capital_reserve`
+row (baseline=pool=$100, hard_floor=$40) and a `live.btc_bucket` row
+(empty, funded by future skims) — **Model 1 has neither, deliberately left
+alone** (opt-in design, untouched this session).
+
+### A methodology trap worth remembering
+`src/backtester/market_data.py`'s `load_market_data()` reads `DATABASE_URL`
+(local Postgres), NOT `SUPABASE_DATABASE_URL` — this bit an ad hoc
+verification script this session (silently returned an empty DataFrame
+against local Postgres, giving a coincidentally-"correct" but methodologically-
+wrong answer for whether Volume Raider's signal was firing). The real
+executor workflows work around this by mapping `DATABASE_URL:
+${{ secrets.SUPABASE_DATABASE_URL }}` in the GH Actions env (see
+`executor_m1.yml`/`executor_m2.yml`) — any local ad hoc script calling
+`signal_engine.check()` or `load_market_data()` directly needs
+`os.environ['DATABASE_URL'] = os.environ['SUPABASE_DATABASE_URL']` set
+first, or it'll silently read stale/empty local data instead of erroring.
+
+### Open items, not urgent
+- Kraken account cash buffer (see bug #4 above) — a deliberate decision,
+  not a bug to fix in code.
+- `live-model-1`/`main` divergence reconciliation — still deferred, still
+  known, see [[project_live_model1_branch_divergence]].
+- Cron-job.org job labels — user was renaming these to match personal
+  preference; cosmetic only, doesn't affect what they dispatch, no
+  follow-up needed.
+
+---
+
 # Handoff — 2026-08-11
 
 ## 🔴🔴 NEXT SESSION: DEPLOYING MODEL 2 LIVE. Concrete checklist below — three real landmines already found, don't rediscover them from scratch.

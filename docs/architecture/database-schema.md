@@ -3,7 +3,7 @@
 **Database:** `forge_anchor` (PostgreSQL, local during development; Supabase for live)
 **Schemas:** `backtest`, `live`, `reporting` + shared `market_data` / `sentiment_data` / `timeframe_presets`
 
-> **Current status:** v3 architecture. Local postgres fully migrated. Supabase migration (`migration_v3.sql`) deferred until Model 2 development starts — live executor uses `live.*` schema only and is unaffected.
+> **Current status:** v3 architecture. Local postgres fully migrated. Model 2 is now live (2026-08-12), alongside Model 1 — both deployed to Supabase's `live.*` schema, which has also received migrations v9 (`live.capital_reserve`) and v10 (`live.btc_bucket`/`live.btc_bucket_events`) as of 2026-08-12.
 > Pre-v3 data is preserved in `backtest_bak.*` permanently.
 
 ---
@@ -276,10 +276,21 @@ Backtest schema migrations do NOT affect live — always verify before touching 
 live.models      -- one row per deployed model
 live.streams     -- stream configs for the deployed model (copied from stream_configs at deploy time)
 live.lots        -- per-trade record; mirrors backtest.lots + adds Kraken order IDs + PENDING status
-live.executor_state   -- single-row last_run_at for stateless executor
-live.executor_runs    -- one row per executor tick (for Live Monitor dashboard)
+live.executor_state   -- one row per model (keyed by model_id), last_run_at for that model's executor
+live.executor_runs    -- one row per executor tick (for Live Monitor dashboard), tagged by model_id
 live.market_data_runs -- one row per market data fetch (for Live Monitor dashboard)
+live.capital_reserve  -- opt-in pooled solvency reserve (docs/decisions/008); Model 2 has a row, Model 1 doesn't
+live.btc_bucket, live.btc_bucket_events -- opt-in profit-skim BTC bucket (docs/decisions/008); Model 2 only
+live.blended_positions, live.blended_fills, live.blended_capital -- Model 3-style blended DCA (archived, kept for history)
 ```
+
+`live.executor_state`/`live.executor_runs` were originally single-row/
+unscoped (Model 1 only) — multi-model support (`model_id` column, Model 2
+deployed 2026-08-12) means every write must filter by `model_id`. Model
+1's own executor still writes its original `id=1`/`model_id IS NULL`
+rows unchanged (a deliberate, minimal-footprint choice, not a bug) — see
+`load_executor_runs()` in `src/app/pages/2_live_monitor.py` for how the
+dashboard bridges both conventions.
 
 **live.lots adds vs backtest.lots:**
 - Status includes `PENDING` (limit order placed, not yet filled)

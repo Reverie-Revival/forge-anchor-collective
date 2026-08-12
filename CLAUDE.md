@@ -71,7 +71,7 @@ These are two distinct steps:
 ## Key Constraints
 
 - No leverage, ever
-- BTC only (Model 1)
+- BTC only (Models 1 and 2, live as of 2026-08-12)
 - Limit orders on entry, market orders on exit. **Fees are tiered by 30-day volume, not fixed** — confirmed live via Kraken's `TradeVolume` API (`{"pair": "XXBTZUSD"}`), not assumed. At this project's current low-volume tier: **0.40% maker / 0.80% taker**. A "limit" entry is not guaranteed a maker fill — it can cross the spread and pay taker (confirmed on Model 3's first real trade). Re-check the real tier before trusting any fee assumption in code; see `MAKER_FEE`/`TAKER_FEE` in `src/live/order_manager.py` and `src/backtester/engine.py`.
 - No LLM in the live execution path — deterministic rules only
 - All gains measured as realized cash, not unrealized BTC value

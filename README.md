@@ -24,21 +24,17 @@ S&P 500 (~10%) is the midpoint. Poor results are data, not failure.
 
 ## Current Status
 
-Model 1 is in the build phase. Five candidate streams are designed and under backtesting:
+Model 1 and Model 2 are both live, trading real money in parallel with independent $100 capital each.
 
-| Stream | Type |
-|---|---|
-| Momentum Rider v1 | Trend-following (EMA crossover) |
-| Dip Hunter v1 | Mean reversion (RSI dip) |
-| Breakout Scout v1 | Consolidation breakout |
-| Surge Rider v1 | Volume momentum |
-| Steady Climber v1 | Trend-filtered pullback |
+**Model 1** — Momentum Rider v2, Dip Hunter v2, Breakout Scout v2 ($33.33/lot each)
+
+**Model 2** — Volume Raider v1, Dip Hunter v3, Breakout Scout v3, Momentum Rider v4 ($25/lot each)
 
 ## Key Constraints
 
 - No leverage, ever
-- BTC/USD only (Model 1)
-- Limit orders only (0.25% maker fee, 0.50% round trip)
+- BTC/USD only (Models 1 and 2)
+- Limit orders on entry, market orders on exit. Fees are tiered by 30-day Kraken volume, not fixed — currently 0.40% maker / 0.80% taker at this project's volume tier (re-checked live via a fee-drift safeguard, not assumed)
 - No LLM in the live execution path — deterministic rules only
 - All gains measured as realized cash, not unrealized BTC value
 - No real money until backtesting earns it
@@ -56,11 +52,13 @@ pip install -r requirements.txt
 cp .env.example .env  # add DATABASE_URL
 ```
 
-## Running the Stream Tester
+## Running the App
 
 ```bash
 .venv/bin/streamlit run src/app/stream_tester.py --browser.gatherUsageStats false
 ```
+
+Stream Tester is the entry point; Model Tester, Live Monitor, and Model Dashboard are additional pages under `src/app/pages/` (Streamlit's standard multipage convention — they show up in the sidebar automatically).
 
 ## Backfill Sentiment Data
 
@@ -72,16 +70,18 @@ python -m src.data.sentiment
 
 ```
 src/
-  backtester/    ← backtesting engine (signals, indicators, engine, runner)
-  app/           ← Streamlit stream tester
-  data/          ← market data downloader, sentiment pipeline, schema
-  strategies/    ← live execution (not yet built)
-  analytics/     ← reporting (not yet built)
+  backtester/    ← backtesting engine + live-replay harness (signals, indicators, engine)
+  app/           ← Streamlit apps: Stream Tester, Model Tester, Live Monitor, Model Dashboard
+  data/          ← market data downloader, sentiment pipeline, schema, migrations
+  live/          ← live execution: executor, order manager, position monitor, Kraken client, alerting
+  fees.py        ← single source of truth for MAKER_FEE/TAKER_FEE (shared by backtester + live)
 docs/
   decisions/     ← ADRs: vendor choices, architecture decisions
   architecture/  ← system design, data flows, stream attribute system
   specs/         ← strategy stream specs and model definitions
   results/       ← backtest run summaries (populated as models complete)
+tools/
+  live_replay/   ← replay real strategy code against historical data (Model 1/2/3 gauntlets)
 tests/
 ```
 
