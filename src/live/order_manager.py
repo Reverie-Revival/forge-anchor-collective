@@ -90,6 +90,7 @@ def place_entry(
                                         limit_price, btc_qty, expiry_str)
         except Exception as e:
             log.error(f"Failed to place entry order for {stream['stream_name']}: {e}")
+            notifier.alert_order_failed(stream["stream_name"], model_id, lot_size_usd, str(e))
             return
 
     conn.execute(
