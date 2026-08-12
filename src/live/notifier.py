@@ -53,6 +53,29 @@ def alert_order_placed(stream_name: str, model_id: int, usd_in: float, limit_pri
     )
 
 
+def alert_order_failed(stream_name: str, model_id: int, attempted_usd: float, error: str) -> None:
+    """Fires when a real Kraken order placement raises -- most likely cause
+    once two models share one Kraken account (see the live-model-1 +
+    live-model-2 concurrency review): insufficient USD balance because both
+    models' streams signaled close together. Previously this only logged an
+    error with no alert -- a real signal that fired and then silently didn't
+    trade would otherwise go unnoticed until someone happened to compare
+    signal history against live.lots."""
+    _dispatch(
+        email_subject=f"Forge: Order FAILED - Model {model_id} | {stream_name}",
+        email_body=(
+            f"Forge | Model {model_id} | {stream_name}\n"
+            f"A signal fired but the real Kraken order failed to place.\n"
+            f"Attempted capital: ${attempted_usd:.2f}\n"
+            f"Error: {error}\n"
+            f"No lot was created -- this entry was simply skipped this cycle. "
+            f"If this is an insufficient-funds error, check the shared Kraken "
+            f"account balance against all models' combined open exposure."
+        ),
+        sms_body=f"Model {model_id} | {stream_name}: ORDER FAILED (${attempted_usd:.2f}) -- {error[:80]}",
+    )
+
+
 def alert_order_expired(stream_name: str, model_id: int, limit_price: float) -> None:
     _dispatch(
         email_subject=f"Forge: Order Expired - Model {model_id} | {stream_name}",
