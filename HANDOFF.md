@@ -2,6 +2,36 @@
 
 ## 🔴🔴 NEXT SESSION: DEPLOYING MODEL 2 LIVE. Concrete checklist below — three real landmines already found, don't rediscover them from scratch.
 
+**User instruction, given explicitly, changes the approach below — REUSE
+Model 3's infra slot, don't build fresh:**
+1. **Replace Model 3 with Model 2 EVERYWHERE in cron & GitHub Actions** —
+   not a brand-new `executor_m2.yml`/`healthcheck_m2.yml`, but repurpose
+   the existing `executor_m3.yml`/`healthcheck_m3.yml` (Model 3 is
+   archived/shut down, that slot is idle). This means: rename the files,
+   update `ref: live-model-3` → whatever the Model 2 branch ends up being
+   called, rename the `DRY_RUN_M3` secret to `DRY_RUN_M2` (or update
+   whatever it's replaced with), and — important, don't miss this —
+   **update the external cron-job.org trigger itself**, not just the
+   GitHub Actions files in this repo. cron-job.org is an external service;
+   its trigger currently points at Model 3's workflow and needs to be
+   repointed to whatever Model 2's workflow ends up named. Not discoverable
+   from the repo alone — needs direct access to the cron-job.org account.
+2. **`executor_m3.yml` invokes `python -m src.live.blended_executor`** —
+   that module is Model 3-specific (blended slot_mode). Model 2 is plain
+   single-slot, so simply renaming the workflow file is NOT enough — the
+   `run:` step must call whatever Model 2's actual executor ends up being
+   (see Landmine 2 below), not `blended_executor.py`. Repurposing the
+   workflow *slot* (the cron schedule, the file identity) is separate from
+   reusing the *code* it calls — don't conflate the two.
+3. **Rename Model 1's files/references "where necessary" to align
+   naming conventions** — once Model 2 exists as a properly-named sibling
+   (whatever that ends up being, e.g. `executor_m2.yml`/`deploy_model2.py`),
+   Model 1's currently-unsuffixed files (`executor.yml`, `healthcheck.yml`,
+   `deploy.py`) likely need renaming too for consistency (e.g. an `_m1`/
+   `_model1` suffix matching Model 2's). Exact convention wasn't decided
+   this session — decide it explicitly at the start of the deployment work,
+   then apply it to both models' naming, not just Model 2's.
+
 **Model 2's real composition** (from `backtest.model_streams WHERE model_id=2`,
 live-replay validated 2026-08-11): Breakout Scout v3, Dip Hunter v3,
 Momentum Rider v4, Volume Raider v1 — all single-slot, $25/lot each,
