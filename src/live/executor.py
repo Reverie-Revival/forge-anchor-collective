@@ -232,8 +232,11 @@ def tick(conn, streams: dict, kraken: KrakenClient, last_tick: datetime,
          now: datetime, dry_run: bool) -> None:
     closed_tfs = _detect_closed_timeframes(last_tick, now)
     _ensure_market_data_fresh(conn, now, closed_tfs, LIVE_MODEL_VERSION)
-    open_count = conn.execute(text("SELECT COUNT(*) FROM live.lots WHERE status = 'OPEN'")).scalar()
-    pending_count = conn.execute(text("SELECT COUNT(*) FROM live.lots WHERE status = 'PENDING'")).scalar()
+    # Scoped to model_id=1 -- Model 2 now shares this table (deployed on its
+    # own live-model-2 branch), and an unscoped count here would silently
+    # start including Model 2's lots in Model 1's own tick logs/dashboard.
+    open_count = conn.execute(text("SELECT COUNT(*) FROM live.lots WHERE status = 'OPEN' AND model_id = 1")).scalar()
+    pending_count = conn.execute(text("SELECT COUNT(*) FROM live.lots WHERE status = 'PENDING' AND model_id = 1")).scalar()
     log.info(
         f"Tick — last_run={last_tick.strftime('%Y-%m-%d %H:%M')} "
         f"closed_tfs={closed_tfs or 'none'} "
