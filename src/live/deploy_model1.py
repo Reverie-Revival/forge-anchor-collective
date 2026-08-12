@@ -3,7 +3,7 @@ One-time deployment script for a live model.
 Run once on the server before starting the executor.
 
 Usage:
-    python -m src.live.deploy
+    python -m src.live.deploy_model1
 
 What it does:
   1. Creates a live.models row (Model 1, status=active)

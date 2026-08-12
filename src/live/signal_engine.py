@@ -5,7 +5,7 @@ completed candle fired a signal — using the exact same logic as backtesting.
 """
 import pandas as pd
 
-from src.backtester.engine import load_market_data, _warmup_days
+from src.backtester.market_data import load_market_data, _warmup_days
 from src.backtester.indicators import add_indicators, resample_ohlcv
 from src.backtester.signals import generate_signals
 from src.data.sentiment import load_sentiment

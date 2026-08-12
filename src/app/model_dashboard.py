@@ -142,7 +142,7 @@ def render_model_dashboard(payload: dict, show_save: bool = True, key_prefix: st
 
     # Header
     model_version = next(
-        (m["model_version"] for m in load_models() if m["model_id"] == payload.get("model_id")),
+        (m["model_version"] for m in load_models(include_archived=True) if m["model_id"] == payload.get("model_id")),
         payload.get("model_id", "?"),
     )
     col_title, col_grade = st.columns([3, 1])

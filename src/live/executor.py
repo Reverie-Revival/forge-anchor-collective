@@ -24,7 +24,7 @@ import pandas as pd
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
 
-from src.live import notifier, order_manager, position_monitor, signal_engine
+from src.live import notifier, order_manager, position_monitor, signal_engine, bucket_manager
 from src.live.kraken_client import KrakenClient
 
 load_dotenv()
@@ -137,7 +137,7 @@ def _latest_candle_for_stream(stream: dict):
     tf = stream["parameters"].get("primary_timeframe", "1h")
     tf_minutes = {"15m": 15, "1h": 60, "4h": 240}.get(tf, 60)
 
-    from src.backtester.engine import load_market_data
+    from src.backtester.market_data import load_market_data
     from src.backtester.indicators import resample_ohlcv
 
     now = pd.Timestamp.utcnow().replace(tzinfo=None)
@@ -156,6 +156,44 @@ def _latest_candle_for_stream(stream: dict):
 
     last = df.iloc[-1]
     return {"close": float(last["close"]), "low": float(last["low"])}
+
+
+def _bucket_tick(conn, kraken: KrakenClient, dry_run: bool) -> None:
+    """Check every model's BTC accumulation bucket (docs/decisions/008), if
+    any have one -- not scoped to LIVE_MODEL_VERSION, since the bucket isn't
+    stream-timeframe-gated and any executor script (this one, or a future
+    Model 2's) shares the same bucket_manager functions. Fast no-op today:
+    no model has a live.btc_bucket row yet.
+
+    Drawdown-from-high uses real daily candles (60-day rolling high, per the
+    docs/decisions/007 tuning) -- coarser than any stream's own intraday
+    timeframe, deliberately: the bucket's dip trigger is meant to be a rare,
+    strict signal, not react to intraday noise.
+    """
+    model_ids = [r[0] for r in conn.execute(text("SELECT model_id FROM live.btc_bucket")).fetchall()]
+    if not model_ids:
+        return
+
+    from src.backtester.market_data import load_market_data
+    from src.backtester.indicators import resample_ohlcv, rolling_high
+
+    now = pd.Timestamp.utcnow().replace(tzinfo=None)
+    load_start = (now - pd.Timedelta(days=70)).strftime("%Y-%m-%d")
+    df_raw = load_market_data(load_start)
+    if df_raw.empty:
+        log.warning("Bucket tick: no market_data available, skipping")
+        return
+
+    daily = resample_ohlcv(df_raw, "1d")
+    if daily.empty:
+        return
+    price = float(daily["close"].iloc[-1])
+    peak = rolling_high(daily["close"], 60).shift(1).iloc[-1]
+    drawdown_pct = (price - float(peak)) / float(peak) * 100 if peak and not pd.isna(peak) else None
+
+    for model_id in model_ids:
+        bucket_manager.check_principal_recovery(conn, model_id, price, kraken, dry_run)
+        bucket_manager.check_dip_buy(conn, model_id, price, drawdown_pct, kraken, dry_run)
 
 
 def _read_last_run(conn) -> datetime:
@@ -232,8 +270,10 @@ def tick(conn, streams: dict, kraken: KrakenClient, last_tick: datetime,
             tf = stream["parameters"].get("primary_timeframe", "1h")
             if tf not in closed_tfs:
                 continue
-            if not order_manager.slot_is_available(conn, stream_id, slot_number=1):
-                log.debug(f"{stream['stream_name']}: slot occupied, skipping signal check")
+
+            slot_number = order_manager.next_signal_slot(conn, stream, now)
+            if slot_number is None:
+                log.debug(f"{stream['stream_name']}: no slot available, skipping signal check")
                 continue
             try:
                 fired = signal_engine.check(stream)
@@ -241,9 +281,9 @@ def tick(conn, streams: dict, kraken: KrakenClient, last_tick: datetime,
                 log.error(f"Signal check failed for {stream['stream_name']}: {e}")
                 continue
             if fired:
-                log.info(f"Signal fired: {stream['stream_name']} — placing entry order")
+                log.info(f"Signal fired: {stream['stream_name']} — placing entry order (slot {slot_number})")
                 signals_fired.append(stream["stream_name"])
-                order_manager.place_entry(conn, stream, kraken, dry_run)
+                order_manager.place_entry(conn, stream, kraken, dry_run, slot_number=slot_number)
                 entries_placed += 1
             else:
                 log.debug(f"{stream['stream_name']}: no signal")
@@ -253,8 +293,10 @@ def tick(conn, streams: dict, kraken: KrakenClient, last_tick: datetime,
     stops_triggered = 0
     if closed_tfs and candle_row:
         stops_triggered = position_monitor.check_all(
-            conn, streams, candle_row, closed_tfs, kraken, dry_run
+            conn, streams, candle_row, closed_tfs, kraken, now=now, dry_run=dry_run
         )
+
+    _bucket_tick(conn, kraken, dry_run)
 
     _log_tick(conn, last_tick, closed_tfs, open_count, pending_count,
               signals_fired, entries_placed, fills, expirations, stops_triggered)

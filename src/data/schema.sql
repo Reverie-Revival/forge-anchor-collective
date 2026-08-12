@@ -402,6 +402,51 @@ CREATE TABLE IF NOT EXISTS live.blended_capital (
     updated_at         TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 );
 
+-- Pooled solvency reserve for single/staggered/cascade models with multiple
+-- streams sharing one real cash balance (docs/decisions/008). Distinct from
+-- live.blended_capital: streams NEVER trade above their own configured
+-- lot_size_usd here (no compounding upside, deliberately -- see 2026-08-07
+-- HANDOFF), this only ever shrinks sizing (and eventually halts it) once
+-- real losses have actually depleted the pool below baseline. Opt-in: a
+-- model with no row here trades exactly as before (order_manager.place_entry
+-- always sizes off lot_size_usd, no reserve check at all) -- provisioning a
+-- row is a deliberate deployment step, not automatic.
+CREATE TABLE IF NOT EXISTS live.capital_reserve (
+    model_id        INTEGER PRIMARY KEY REFERENCES live.models(model_id),
+    baseline_total  NUMERIC(12,2) NOT NULL,  -- sum of all this model's streams' configured lot_size_usd
+    pool_balance    NUMERIC(12,2) NOT NULL,
+    hard_floor      NUMERIC(12,2) NOT NULL,  -- 10.0 / max(stream weight) -- below this, no stream can trade at all
+    halted_at       TIMESTAMPTZ,             -- NULL = healthy; set once, first time pool_balance < hard_floor
+    updated_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+
+-- Profit-skim BTC bucket (docs/decisions/008) -- one per model, funded from
+-- live.capital_reserve's surplus (above baseline). Buys real BTC on a real
+-- dip, sells only enough to recover its own principal once a real premium
+-- clears, remainder becomes permanent house money. Mirrors the backtest's
+-- simulate_skim_bucket exactly (docs/decisions/007 section 4).
+CREATE TABLE IF NOT EXISTS live.btc_bucket (
+    model_id            INTEGER PRIMARY KEY REFERENCES live.models(model_id),
+    bucket_cash         NUMERIC(12,2)  NOT NULL DEFAULT 0,
+    tracked_qty         NUMERIC(20,8)  NOT NULL DEFAULT 0,
+    tracked_cost_basis  NUMERIC(12,2)  NOT NULL DEFAULT 0,
+    house_money_qty     NUMERIC(20,8)  NOT NULL DEFAULT 0,
+    updated_at          TIMESTAMPTZ    NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS live.btc_bucket_events (
+    event_id       BIGSERIAL PRIMARY KEY,
+    model_id       INTEGER      NOT NULL REFERENCES live.models(model_id),
+    event_type     VARCHAR(20)  NOT NULL CHECK (event_type IN ('skim', 'buy', 'recover_principal')),
+    amount_usd     NUMERIC(12,2),
+    qty_btc        NUMERIC(20,8),
+    price          NUMERIC(12,2),
+    order_id       VARCHAR(50),
+    created_at     TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_btc_bucket_events_model ON live.btc_bucket_events (model_id);
+
 CREATE TABLE IF NOT EXISTS live.market_data_runs (
     run_id          SERIAL       PRIMARY KEY,
     ran_at          TIMESTAMPTZ  NOT NULL DEFAULT NOW(),

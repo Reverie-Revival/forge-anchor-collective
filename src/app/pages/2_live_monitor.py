@@ -12,6 +12,7 @@ from sqlalchemy import create_engine, text
 
 load_dotenv()
 
+from src.backtester.market_data import _warmup_days
 from src.backtester.indicators import add_indicators, resample_ohlcv
 from src.fees import TAKER_FEE
 
@@ -256,7 +257,16 @@ def load_stream_status(model_id):
     if not streams_rows:
         return []
 
-    cutoff = (datetime.now(timezone.utc) - timedelta(days=70)).strftime("%Y-%m-%d")
+    now = datetime.now(timezone.utc)
+    # Load enough history for the widest warmup any stream here needs, then each
+    # stream slices down to its own exact window below -- an EMA's trajectory
+    # depends on how far back it starts, so a shared longer window would silently
+    # disagree with signal_engine.check() (the real trading decision), which
+    # loads exactly _warmup_days(params) + 5 per stream. This bit the Momentum
+    # Rider dashboard row 2026-08-06: a real, correctly-fired EMA crossover
+    # showed as "not ready" here because this used a hardcoded 70-day window.
+    max_warmup_days = max((_warmup_days(dict(sr._mapping)["parameters"]) for sr in streams_rows), default=30) + 5
+    cutoff = (now - timedelta(days=max_warmup_days)).strftime("%Y-%m-%d")
     mdata_rows = _q(
         "SELECT timestamp, open, high, low, close, volume FROM market_data "
         "WHERE timestamp >= :c ORDER BY timestamp",
@@ -266,6 +276,20 @@ def load_stream_status(model_id):
         return []
 
     df_15m = pd.DataFrame([dict(r._mapping) for r in mdata_rows])
+    # market_data's OHLCV columns are Postgres NUMERIC -- psycopg2 returns
+    # decimal.Decimal for those, and building a DataFrame from raw row dicts
+    # (instead of pd.read_sql, which auto-converts) keeps them as object-dtype
+    # Decimal. add_indicators()/resample_ohlcv() mostly tolerate that
+    # silently (Decimal arithmetic works fine on its own), but any spot that
+    # mixes a Decimal with a plain Python float raises "unsupported operand
+    # type(s) for -: 'decimal.Decimal' and 'float'" -- hit 2026-08-11 in the
+    # Dip Hunter signal-readiness row. src/backtester/market_data.py's
+    # load_market_data() (used by the real trading path, signal_engine.py)
+    # doesn't have this problem -- pd.read_sql there converts automatically.
+    # Cast here to match, eliminating the whole bug class rather than
+    # chasing individual call sites.
+    for col in ("open", "high", "low", "close", "volume"):
+        df_15m[col] = df_15m[col].astype(float)
     df_15m["timestamp"] = pd.to_datetime(df_15m["timestamp"])
     df_15m = df_15m.set_index("timestamp").sort_index()
     if df_15m.index.tz is not None:
@@ -282,10 +306,27 @@ def load_stream_status(model_id):
         params = stream["parameters"]
         tf = params.get("primary_timeframe", "15m")
         try:
-            df = resample_ohlcv(df_15m, tf) if tf != "15m" else df_15m.copy()
+            # Match signal_engine.check()'s exact window for this stream, not
+            # the shared max fetched above -- see comment where max_warmup_days
+            # is computed. Truncate to a date string (midnight), same as
+            # load_market_data(load_start) does there -- keeping now's time-of-day
+            # component here would shift the EMA seed by a few hours, which is
+            # enough to flip a razor-thin crossover's sign.
+            stream_cutoff = (now - timedelta(days=_warmup_days(params) + 5)).strftime("%Y-%m-%d")
+            stream_15m = df_15m[df_15m.index >= stream_cutoff]
+            df = resample_ohlcv(stream_15m, tf) if tf != "15m" else stream_15m.copy()
             if params.get("sentiment"):
                 df["fng_value"] = [fng_map.get(d) for d in df.index.date]
             df = add_indicators(df, params)
+
+            # Drop the current in-progress candle -- same trimming
+            # signal_engine.check() does, so "last" here is always a completed
+            # candle, matching what the real trading decision actually saw.
+            if tf and len(df) > 1:
+                tf_minutes = {"15m": 15, "1h": 60, "4h": 240}.get(tf, 15)
+                candle_duration = timedelta(minutes=tf_minutes)
+                df = df[df.index + candle_duration <= now.replace(tzinfo=None)]
+
             if len(df) < 2:
                 results.append({"stream_name": stream["stream_name"], "error": "insufficient data"})
                 continue

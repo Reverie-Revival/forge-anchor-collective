@@ -1,4 +1,778 @@
-# Handoff — 2026-08-02
+# Handoff — 2026-08-11
+
+## 🔴🔴 NEXT SESSION: DEPLOYING MODEL 2 LIVE. Concrete checklist below — three real landmines already found, don't rediscover them from scratch.
+
+**User instruction, given explicitly, changes the approach below — REUSE
+Model 3's infra slot, don't build fresh:**
+1. **Replace Model 3 with Model 2 EVERYWHERE in cron & GitHub Actions** —
+   not a brand-new `executor_m2.yml`/`healthcheck_m2.yml`, but repurpose
+   the existing `executor_m3.yml`/`healthcheck_m3.yml` (Model 3 is
+   archived/shut down, that slot is idle). This means: rename the files,
+   update `ref: live-model-3` → whatever the Model 2 branch ends up being
+   called, rename the `DRY_RUN_M3` secret to `DRY_RUN_M2` (or update
+   whatever it's replaced with), and — important, don't miss this —
+   **update the external cron-job.org trigger itself**, not just the
+   GitHub Actions files in this repo. cron-job.org is an external service;
+   its trigger currently points at Model 3's workflow and needs to be
+   repointed to whatever Model 2's workflow ends up named. Not discoverable
+   from the repo alone — needs direct access to the cron-job.org account.
+2. **`executor_m3.yml` invokes `python -m src.live.blended_executor`** —
+   that module is Model 3-specific (blended slot_mode). Model 2 is plain
+   single-slot, so simply renaming the workflow file is NOT enough — the
+   `run:` step must call whatever Model 2's actual executor ends up being
+   (see Landmine 2 below), not `blended_executor.py`. Repurposing the
+   workflow *slot* (the cron schedule, the file identity) is separate from
+   reusing the *code* it calls — don't conflate the two.
+3. **Rename Model 1's files/references "where necessary" to align
+   naming conventions** — once Model 2 exists as a properly-named sibling
+   (whatever that ends up being, e.g. `executor_m2.yml`/`deploy_model2.py`),
+   Model 1's currently-unsuffixed files (`executor.yml`, `healthcheck.yml`,
+   `deploy.py`) likely need renaming too for consistency (e.g. an `_m1`/
+   `_model1` suffix matching Model 2's). Exact convention wasn't decided
+   this session — decide it explicitly at the start of the deployment work,
+   then apply it to both models' naming, not just Model 2's.
+
+**Confirmed: Model 3 is fully clean on the live/Supabase side, safe to
+repurpose its infra slot.** User cleaned it up directly; verified
+independently 2026-08-11 by querying Supabase — `live.models` has ONLY
+Model 1, and zero Model 3 (`model_version=3`) rows across
+streams/lots/executor_runs/executor_state/blended_positions/
+blended_capital. Also noted: `live.btc_bucket`, `live.btc_bucket_events`,
+and `live.capital_reserve` (migrations v9/v10) don't exist in Supabase at
+all — those were only ever applied to local Postgres, nothing's
+provisioned live. No cleanup work needed before reusing Model 3's slot for
+Model 2 — go straight to the rename/repoint work in the checklist above.
+
+**Model 2's real composition** (from `backtest.model_streams WHERE model_id=2`,
+live-replay validated 2026-08-11): Breakout Scout v3, Dip Hunter v3,
+Momentum Rider v4, Volume Raider v1 — all single-slot, $25/lot each,
+**$100 total**. Numbers accepted as-is (see item 7 below in yesterday's
+recap) — this is a deployment task, not a design task.
+
+**Landmine 1 — `src/live/deploy.py` is broken against the current schema,
+do not copy it as-is.** It queries `backtest.streams` for `model_id`,
+`stream_version`, `parameters`, `slot_count`, `slot_mode` — none of those
+columns exist on that table anymore (v3 migration moved them to
+`backtest.stream_configs`/`backtest.model_streams`; `backtest.streams` is
+identity-only: `stream_id`, `stream_name`, `strategy_type`, `description`).
+Verified 2026-08-11 by querying `information_schema.columns` directly. A
+`deploy_model2.py` needs a real rewrite joining `model_streams` →
+`stream_configs` → `streams`, not a copy-paste of `deploy.py`'s query.
+
+**Landmine 2 — `executor.py` is hardcoded to one model.**
+`LIVE_MODEL_VERSION = 1` at module level; the whole file assumes it's
+running exactly one model. Real design decision needed before writing any
+code: parameterize `executor.py` (env var or CLI arg for model version) so
+Model 1 and Model 2 share one executor, or duplicate it the way Model 3
+got its own `blended_executor.py`. Model 2 is plain single-slot (not
+blended like Model 3), so parameterizing the existing `executor.py` is
+probably the better fit than a full duplicate — but this is a real call to
+make deliberately, not default into.
+
+**Landmine 3 — GitHub Actions secret-mapping convention changed between
+Model 1 and Model 3's workflows, and current `main` only supports the
+newer one.** `executor.yml` (Model 1, older) maps only
+`DATABASE_URL: ${{ secrets.SUPABASE_DATABASE_URL }}`. `executor_m3.yml`
+(Model 3, newer) maps the secret to BOTH `DATABASE_URL` and
+`SUPABASE_DATABASE_URL`. Checked 2026-08-11: `main`'s current
+`executor.py:_get_engine()` reads `SUPABASE_DATABASE_URL` ONLY and raises
+`RuntimeError` if unset — it does NOT fall back to `DATABASE_URL` at all
+anymore. A Model 2 workflow copied from the old `executor.yml` pattern
+would crash on its first tick. Must use `executor_m3.yml`'s dual-mapping
+pattern (or newer, if `SUPABASE_DATABASE_URL` alone is now sufficient —
+recheck `_get_engine()` before assuming).
+
+**Also worth deciding, not just defaulting into:** every previously
+deployed model got its own permanently-branched-off deployment branch
+(`live-model-1`, `live-model-3`, `live-model-4`) that then stops tracking
+`main` — this is exactly the pattern that caused the 101/9 commit
+divergence documented in [[project_live_model1_branch_divergence]]. Worth
+asking out loud whether `live-model-2` should follow the same pattern
+(known to drift) or whether this is the moment to try something that stays
+in sync with `main` (e.g. a workflow that always checks out `main` at
+tick-time, model-scoped by parameter/secret rather than by branch).
+
+**Standard checklist either way:**
+1. Rewrite `deploy_model2.py` against current schema (Landmine 1)
+2. Decide executor approach (Landmine 2) and implement
+3. Create `live.models` row for Model 2 ($100, the 4-stream composition above)
+4. Create the GitHub Actions workflow with correct secret mapping (Landmine 3)
+5. Dry-run first (`--dry-run` flag pattern already exists in `executor.py`)
+   before flipping real orders on
+6. Confirm Kraken API keys/secrets are provisioned for this workflow
+
+**Two more real bugs found and fixed this session, after the wrap-up above
+was first written (found while double-checking the BTC bucket work):**
+
+1. **`run_pooled_model_backtest`'s bucket was silently losing every
+   skimmed dollar.** `load_market_data()`'s Postgres query
+   (`timestamp AT TIME ZONE 'UTC'`) strips tz info — `df.index` came back
+   tz-naive. But `skims` dict keys come from `live.lots.closed_at`
+   (`TIMESTAMPTZ`, tz-aware). `if ts in skims:` in the bucket loop silently
+   never matched — money got subtracted from the pool (correctly) but
+   never credited to the bucket (bug). Confirmed via the Model Tester UI:
+   Total Skimmed showed $17.23 but Bucket Value/BTC Held were stuck at
+   $0.00. Fixed: `df.index = df.index.tz_localize("UTC")` right after
+   loading. Re-verify by re-running the BTC Bucket compute button for any
+   model/window you care about — anything computed before this fix has
+   the bug baked in.
+2. **Live Monitor's signal-readiness display crashed on Dip Hunter**:
+   `unsupported operand type(s) for -: 'decimal.Decimal' and 'float'`.
+   `market_data`'s OHLCV columns are Postgres `NUMERIC` → psycopg2 returns
+   `Decimal`. `2_live_monitor.py` built its own DataFrame by hand from raw
+   query rows (not `pd.read_sql`, which auto-converts) — columns stayed
+   Decimal-typed, crashing wherever one met a plain float. **Confirmed
+   NOT a trading-safety issue** — `signal_engine.py` (real executor.py's
+   actual signal code) uses the safe `load_market_data()`, verified by
+   reading the import directly. Fixed: cast OHLCV to float right after
+   loading, same instinct as the `pd.to_datetime()` line right next to it.
+   See [[feedback_decimal_float_dtype]] — worth a broader check for any
+   OTHER hand-built DataFrame from a NUMERIC-typed table before assuming
+   this was the only occurrence.
+
+---
+
+## Yesterday's session recap — DB decluttered, Model 2 numbers regenerated + accepted as-is, Model 2 had NO live deployment infra as of end of session. `live-model-1` verified healthy at runtime but 101 commits behind `main`.
+
+### What actually happened, in order
+
+1. **Full backtest DB declutter.** Deleted everything not wired into a real
+   model: 38 stream_configs → 9, 13 streams → 6, wiped all 178
+   `stream_tests`/101 `model_tests`/1782 `lots` (every row predated the
+   ADR 009 live-replay conversion, so none of it was trustworthy anyway).
+   Models 3 & 4 set `status='archived'` (not deleted) — user corrected a
+   stale assumption: **Model 3 is NOT live, it was shut down** (memory had
+   this wrong). `load_models()` now excludes archived models by default so
+   they don't clutter the Model Tester/Dashboard selectors; version numbers
+   3/4 are permanently retired, next real model is Model 5. Full detail:
+   [[project_db_declutter]] (auto-memory).
+2. **Regenerated Model 1 + Model 2 numbers from scratch**, 100% via
+   `run_live_replay_stream` (not `engine.py`) — 35 stream_tests (7 configs ×
+   5 presets) + 10 model_tests (2 models × 5 presets). New trusted Primary
+   v2 baseline: **Model 1 +13.6% ann, Model 2 +15.9% ann** — both notably
+   lower than the old pre-ADR-009 numbers, which is the whole point: those
+   were `engine.py`'s approximation, these are what would actually happen.
+3. **Real bug found and fixed**: `run_pooled_model_backtest()` (BTC bucket
+   feature, built earlier this session) was calling `engine.py`'s
+   `run_backtest()` — the exact banned pattern. Triggered the strongest
+   user reaction of the project so far ("Backtest is dead... NEVER AGAIN...
+   We test correctly. 100% of the time. No exceptions."). Fixed to use
+   `run_live_replay_stream`, verified with a real run. New hard-rule memory:
+   [[feedback_never_engine_py]].
+4. **Real concurrency bug found and fixed**: `run_live_replay_stream` used
+   a single hardcoded sentinel (`model_version=990`) shared by every call —
+   two overlapping calls (e.g. two browser tabs) corrupted each other via a
+   `ForeignKeyViolation`. Fixed: each call now mints its own random
+   sentinel. Verified with a deliberate concurrent-call test (no collision).
+5. **DB conflation incident**: claimed a local-sandbox concurrency bug was
+   a risk to Model 1's real money — wrong, conflated local Postgres's own
+   `live` schema (the replay sandbox) with Supabase's real `live` schema.
+   Fixed in memory ([[feedback_db_split]], new section) and in code — loud
+   `*** DATABASE: ***` comments added to `live_replay_stream.py`,
+   `replay_gauntlet.py`, `position_monitor.py` stating which DB each
+   touches.
+6. **Built BTC Bucket section in Model Tester** — visualizes
+   `run_pooled_model_backtest()` (docs/decisions/008) for whichever
+   single-slot model is selected. Moved from a cramped sidebar to a
+   full-width section at the bottom of the page per user feedback; now
+   persists to a new `backtest.bucket_tests` table (migration v11) instead
+   of session-only state, so it doesn't need re-running every page visit.
+7. **Momentum Rider v4 drawdown investigated and NOT changed.** Root cause:
+   a 4-loss whipsaw streak, Jul-Nov 2018, all `trailing_stop` exits — the
+   `RSI>55`/`SMA200 above` filters can't distinguish a real trend from a
+   dead-cat bounce still nominally above a lagging average. Tested raising
+   the Fear&Greed floor (fixed the 2018 streak but wrecked Recent/Primary v2
+   returns — overcorrection) and raising the RSI floor to 65 (better: fixed
+   most of the drawdown with only ~0.3pp return cost on Full History, but
+   still cost real drawdown on Recent and Primary v2). **User's call: keep
+   v4 unchanged** — neither lever was a clean win.
+8. **Explored Quiet Climber as a possible MR replacement** for the
+   Jul-Aug-2026-style quiet/choppy regime none of Model 2's 4 streams cover
+   (confirmed real: BTC chopped $57.7k-$67.3k, -4.6% net, mid-Jun–early-Aug
+   2026). Recovered its v4 params from the pre-declutter backup (never
+   locked into a model, was deleted in item 1). Live-replay validated for
+   the first time ever (its saved numbers were all pre-ADR-009) — turned
+   out **worse** than the old engine.py notes suggested: -36.5% max DD on
+   Full History (worse than MR's own -30.4%), driven by a 9-loss streak
+   Aug 2019–Jan 2020, and unlike MR, **100% of its exits are `trailing_stop`
+   — the 8.5% hard stop never once fires.** RSI floor (MR's fix) doesn't
+   transfer: Quiet Climber runs on 1h candles (vs MR's 4h), RSI(14) is too
+   noisy there to confirm a real trend. **Left unresolved** — candidate
+   next steps: try reverting to Quiet Climber's original SMA50 trend filter
+   (risky — v3→v4's own notes say SMA50 whipsawed badly in 2026), or build
+   a real slope/N-day-return filter (doesn't exist in the codebase at all
+   yet — every current trend filter is either a static SMA level check or
+   RSI, nothing measures "is this actually still going up").
+9. **Quick experiment: tried to push Volume Raider v1 to 30% ann on Primary
+   v2** (currently +23.7%). 10 parameter variants tested (wider/tighter
+   trail, stricter/looser volume threshold, RSI band changes) — every
+   single one was worse, several catastrophically (drawdown up to -52%).
+   Honest conclusion: the current config already sits at a local optimum;
+   30% isn't reachable via quick tuning without taking on real additional
+   risk. Not pursued further.
+10. **Verified `live-model-1` (Model 1's real deployed branch)**: runtime
+    is healthy — executor ticking every 30 min, zero errors in recent runs,
+    2 open positions correctly tracked. But structurally, **`live-model-1`
+    is 101 commits behind `main` and has 9 commits `main` doesn't** (fee-
+    drift safeguard, connection timeouts, market-data freshness guard,
+    real per-trade fee capture, alerting — all hotfixed directly onto that
+    branch). Spot-checked all 9 against `main`'s current code — `main` has
+    equivalent or more advanced versions of every one of them, so nothing
+    is currently missing/broken. User's call: since the buy/sell path is
+    confirmed working, leave `live-model-1` as-is — the branch divergence
+    itself is a real thing to close eventually, just not urgent tonight.
+
+### What to actually do next session
+
+1. **Model 2 has zero live deployment infrastructure** — this is the real
+   next milestone, separate from (and after) the numbers being trusted.
+   Needs its own `deploy_model2.py` (mirrors `deploy.py`'s pattern for
+   Model 1) + its own GitHub Actions workflow (mirrors `executor_m3.yml`'s
+   pattern for Model 3) + a `live.models` row. Model 2 is plain single-slot
+   (not blended like Model 3), so this should be simpler than Model 3's
+   build was — closer to reusing `executor.py` parameterized by model,
+   rather than a whole new `blended_executor.py`.
+2. Momentum Rider v4 and Quiet Climber both have real, unresolved drawdown
+   problems — neither is blocking Model 2 (MR v4 stays as-is; Quiet Climber
+   was never a candidate to begin with, just explored). If revisited: MR
+   needs a genuinely new lever (RSI/F&G both explored and rejected); Quiet
+   Climber needs either its old SMA50 filter re-tested properly or a new
+   slope/momentum filter built from scratch.
+3. `live-model-1` vs `main` branch divergence (item 10 above) — not urgent,
+   but worth reconciling before it gets any wider, especially once Model 2
+   deployment starts touching the same shared modules (`position_monitor.py`,
+   `order_manager.py`).
+
+---
+
+# Handoff — 2026-08-10
+
+## 🔴 START HERE — ADR 009 built, validated, and merged to `main` (`c15f8f3`). Read `docs/decisions/009-unify-testing-with-live-execution.md` for full detail; this is the summary.
+
+Yesterday's session ended with a mandate but no plan: no separate
+"backtester," one test path that works the same as live. This session
+turned that into a real plan, in a dedicated planning pass with the user,
+then built, validated, and merged it same-session (branch
+`unify-testing-live-replay`, 72 tests passing).
+
+### What actually happened, in order
+
+1. **Planned the architecture** with the user: `engine.py` deleted entirely
+   (no fast/approximate mode kept — profiling showed the "live-replay is
+   slow" complaint is 54% Postgres I/O, not rule-logic cost, so an in-memory
+   fast path was considered and explicitly rejected as just another second
+   code path). Cache reuse for already-tested stream results, rescaled to
+   whatever capital the caller actually needs. Full plan is in the ADR.
+2. **Built staggered slot-mode live parity** (`order_manager.
+   next_signal_slot`, `executor.py` no longer hardcodes `slot_number=1`).
+   **Also built cascade live parity, then removed it same session** after
+   its live-replay trade count didn't match `engine.py`'s (19 backtest vs
+   24-26 live-replay) and the mismatch couldn't be run down — the user's
+   call: don't carry unvalidated code forward just because it's written.
+3. **Found and fixed two real gaps while validating this** (not just
+   refactor risk): `trailing_stop_steps`/`trail_arm_gain_pct` were read by
+   `engine.py` for every slot mode with **zero live implementation** before
+   this session (no currently-locked config used them, so not an active
+   live-money bug, but the next one would have silently gotten it wrong).
+   And the new stream-trade cache has **no invalidation tied to engine.py's
+   own version** — confirmed with a real example (Model 1's Breakout Scout
+   v2's cached test predates the 2026-08-07 compounding fix) — why cache
+   reuse defaults to off everywhere it's offered.
+4. **Re-validated Model 1 (live, real money) and Model 2 (Run 3, assembled)**
+   via real live-replay runs, full Primary v2 window — every stream in both
+   matched its fresh backtest reference's trade count exactly (Model 1:
+   16/16, 20/20, 31/31 = 67; Model 2: 20/20, 20/20, 29/29, 39/39 = 108),
+   both matching their recorded `model_tests` rows exactly. Per the user,
+   this was the only re-validation needed — everything else in
+   `stream_tests`/`model_tests` is disowned/untrusted, regenerates fresh
+   whenever touched again, not retroactively audited. BTC bucket
+   deliberately excluded (Model 3's build, separate).
+5. **Converted `src/app/stream_tester.py`'s interactive Run/Re-run buttons**
+   to the live-replay path — this was a real gap the user caught by directly
+   asking "does it work like production, is Streamlit cleaned up." Built
+   `src/backtester/live_replay_stream.py` (generalizes
+   `tools/live_replay/replay_model1.py`'s single-stream pattern into a
+   reusable function, same return shape as `run_backtest()`); wired in for
+   single/staggered configs. blended/cascade/scale_down/scale_up still fall
+   back to `engine.py`, now explicitly flagged `NOT live-validated` in the
+   UI and the saved result's notes.
+6. **Moved `load_market_data`/`_warmup_days` out of `engine.py`** into
+   `src/backtester/market_data.py` — they had zero dependency on `engine.py`'s
+   own simulation logic, but real live-execution modules
+   (`signal_engine.py`, `executor.py`) were importing them from there anyway,
+   for no real reason. Prerequisite for `engine.py` ever being deletable.
+7. **`model_engine.run_model_backtest`'s fresh-run fallback now uses
+   `live_replay_stream.py`** for single/staggered at the default fee rate
+   (the common case) instead of `engine.py` — a real, significant speed
+   regression for anyone calling `run_model()` (minutes instead of seconds),
+   which is the accepted cost per item 1 above, not a bug.
+8. **`engine.py` is still not deletable** — `run_model_backtest`'s fallback
+   for blended/cascade/scale/fee-override modes, and Stream Tester's same
+   fallback, both still call it. Documented explicitly in the ADR so this
+   doesn't get assumed done.
+
+### What to actually do next session
+
+1. **Model 2 deployment** is still queued (since 2026-08-06) and was
+   blocked behind this work being trusted — now that it's merged, this is
+   probably the actual next real task, not more architecture.
+2. The cascade trade-count mismatch itself was never root-caused, just
+   removed. If cascade is wanted again later, it needs to be rebuilt and
+   debugged properly, not resurrected from this branch's history as-is.
+3. If continuing to fully retire `engine.py`: the blended/cascade/scale/
+   fee-override fallback paths (item 8 above) are the remaining dependents.
+
+---
+
+# Handoff — 2026-08-09
+
+## 🔴🔴 (superseded by 2026-08-10 above) Read `docs/decisions/009-unify-testing-with-live-execution.md` FIRST, before anything else.
+
+User mandate, stated directly at the end of this session, not up for
+re-litigation: **there should not be a separate "backtester" that
+approximates live behavior for speed.** This week's bugs (silent
+compounding, missing exit rules) plus a worse historical incident (a
+backtested ~95% annualized candidate that was actually negative once
+checked against real execution — the 2026-08-05 phantom-fill bug) are the
+same root pattern: `engine.py` and live execution are two independently
+maintained implementations with nothing forcing them to agree, discovered
+only by manual side-by-side checks that don't happen every time. **Do not
+patch `engine.py` further. Do not deploy Model 2. Do not build new
+streams/models.** The next session's job is to turn ADR 009 into a real
+plan — what replaces `engine.py`, how iteration speed gets handled without
+quietly reintroducing a second diverging code path, and how everything
+currently "validated" gets re-validated under the new architecture.
+Everything below this point (Model 2 deployment queue, the pooled
+reserve/BTC bucket work, the Model Tester UI fixes) is real, committed work
+but now provisional pending that redesign.
+
+## 🔴 (superseded, kept for continuity) built and tested a full pooled-reserve + BTC skim-bucket design for Model 2 (docs/decisions/008) — Gauntlet-tested, a real deadlock bug found and fixed, and a live capital ledger built (opt-in, not provisioned anywhere). Model 2 deployment itself (queued since 2026-08-06) **still hasn't started** — three sessions in a row now have found real work before getting to it. Next session should seriously consider just deploying Model 2 first, before any more design work, unless there's a specific reason not to.
+
+### What actually happened, in order
+
+1. Walked through, with the user, a concrete real-trade example (Volume Raider v1) proving `compound=False` beats `compound=True` via sequence-of-returns drag — a losing streak right before the stream's single best trade (+57.6%) meant compounding had less capital behind it than fixed sizing did. This directly informed the design below.
+2. **Designed and implemented `run_pooled_model_backtest()`** (`src/backtester/model_engine.py`) — single-slot streams only (Model 1/2's real composition). Streams trade at their full configured `lot_size_usd` while a shared pool is at/above baseline (no compounding upside, preserving the `compound=False` result), shrink proportionally to their own weight below baseline, and pause individually below their $10 share. Skims only the portion of a winning trade's gain that pushes the pool *above* baseline into a BTC accumulation bucket, reusing the exact tuned dip-buy/recover-principal mechanics from `docs/decisions/007` (commit `bb18d45`). First real run, Model 2's composition: $173.17 (plain, no bucket) → **$175.81** (pooled + bucket).
+3. **Ran the full Gauntlet** (`tools/gauntlet_model2_pooled_bucket.py`) — walk-forward, bootstrap, real bear markets, code review all passed. But `skipped_entries: 0` in every single run, including all 4 real bear-market windows — the floor/shrink mechanic had never actually been exercised.
+4. **Built a deliberate stress test** (Part 5, `starting_pool` override) and found a real design flaw, not just an untested path: below the point where every one of Model 2's (equally-weighted) streams crosses its own $10 floor **at the same instant**, the pool freezes **permanently** — nothing is left trading to generate the win that would lift it back up. The original design's "winnings bring it back above the floor" assumption silently assumed something would still be trading.
+5. **User's call: treat this as a hard stop requiring a real alert + manual decision** (inject capital, or pull the stream/model), not automatic recovery. Implemented: `hard_floor`/`halted_at` now returned explicitly from `run_pooled_model_backtest()`, verified via the stress test (`None` while healthy, fires exactly at the true floor).
+6. **Built the live side**: new `live.capital_reserve` table (migration v9), fully **opt-in** — a model with no row trades exactly as it always has (verified with a dedicated test). `order_manager.place_entry` now reads it (`_reserve_entry_capital`) and shrinks/skips exactly like the backtest; `place_exit` updates the pool (`_update_reserve`) and fires a new `notifier.alert_capital_halted()` the first time (and only the first time) the pool crosses the hard floor. 7 new tests, `tests/live/test_capital_reserve.py`.
+7. **Added the first backtester-level test suite this project has ever had** (`tests/backtester/test_pooled_model_backtest.py`, 5 tests, flagged as a real gap by the Gauntlet's own Part 4) — deterministic canned fixtures, not real market data.
+8. **Nothing here is live yet.** No model — including the currently-live Model 1 — has an actual `live.capital_reserve` row. The BTC bucket itself has no live wiring at all (no real buy/sell order placement) — that's explicitly flagged as materially larger scope, not started.
+
+### What to actually do next session
+
+The design work here is done and tested. What's NOT decided, and needs a real conversation, not more building:
+1. **Deploy Model 2** — this has been queued since 2026-08-06 and keeps getting pushed by real work found along the way (today's work was legitimate, but the pattern is worth naming). Use the corrected numbers from 2026-08-07's session (12.72% ann., $173.17, not the stale 11.50%/$164.71).
+2. Decide whether to provision `live.capital_reserve` for Model 1 and/or Model 2 at all right now, or leave it opt-in/unused until the BTC bucket itself is ready to ship (the reserve check has value on its own — real solvency protection — independent of the bucket, worth considering deploying it alone first).
+3. If/when ready to build further: live BTC bucket execution (real buy/sell orders) is the one big remaining piece, not started, larger scope than everything above combined.
+
+---
+
+# Handoff — 2026-08-07
+
+## 🔴 START HERE (new session): compounding support built for single/staggered/cascade (opt-in `compound` flag, default off, matches live). While validating it via live-replay, found and fixed TWO separate real bugs where live silently never enforced backtested exit rules (`max_hold_candles`, `min_hold_candles`, `stop_loss_pct`) — affecting Dip Hunter (live now, Model 1) and Breakout Scout/Dip Hunter's Model 2 configs. All 7 real Model 1/2 stream configs now verified via live-replay. Model 2 deployment (queued from 2026-08-06) still not started — do that next, using the corrected numbers below, not the stale ones from yesterday.
+
+### What actually happened, in order
+
+1. **Compounding, as asked**: `position.compound` (bool, default `False`) added to `_run_slot`/`_run_staggered_slots`/`_run_cascade_slots` in `engine.py`, matching the flag `_run_blended_slots` already had. `False` sizes every entry from the fixed `lot_size_usd` (matches live). `True` shares one pool across all slots, recomputed fresh at every entry (same `slot_capitals_for()` mechanism blended already used).
+2. **Found a real pre-existing bug while building it**: before this fix, all three single/staggered/cascade functions unconditionally reinvested each slot's own realized P&L into its next entry's size — silent compounding, no flag, the whole life of the project. Live (`order_manager.place_entry`) always used the fixed `lot_size_usd`. Backtest and live were quietly running different position sizing this whole time.
+3. **Re-ran Model 1/2 under the corrected default (`compound=False`)** — every stream moved *up*: Model 1 9.06%→**10.59%** ann. ($148.86→$158.66), Model 2 11.50%→**12.72%** ann. ($164.71→$173.17, max DD -16.25%→-13.39%). Confirmed `compound=True` on Model 2 reproduces the OLD saved numbers exactly (since slot_count=1 everywhere, shared-pool math collapses to the old per-slot bug) — i.e. the distrusted post-hoc "compounding is worse" estimate from 2026-08-06 was right, now backed by a real implementation, not a reconstruction.
+4. **Live-replay used to validate the fix** (`tools/live_replay/replay_model1.py` — existed already, built earlier, never actually run against real data until today) surfaced a much bigger problem: Dip Hunter v2 showed a real trade-count mismatch (20 backtest vs 16 live), not just small price noise. Root cause: **`position_monitor.py` never implemented `max_hold_candles` at all, and explicitly skipped `min_hold_candles`** ("deferred for v1" comment). Dip Hunter has `max_hold_candles=240` — 40% of its trades close via that rule in backtest. Live just never force-closed them; real positions ran weeks longer than backtested. **This was live, real money, right now (Model 1), the whole time.**
+5. Fixed: `position_monitor.check_all()` now takes a `now` param (threaded from `executor.py`'s tick and from the replay harnesses) and computes `candles_held` from `lot.opened_at`, enforcing `min_hold` (holds regardless of price) and `max_hold` (forced close, `exit_reason='max_hold'`) exactly like `engine.py`. `order_manager.place_exit()` now takes an `exit_reason` param instead of hardcoding `'trailing_stop'`.
+6. **Checked all 7 real Model 1/2 stream configs for every position param in use** (not just the one that broke) — found a THIRD missing rule: `stop_loss_pct` (hard stop from entry, distinct from the trailing stop) is set on Breakout Scout v3 and Dip Hunter v3, and was also completely unimplemented live. Fixed the same way: `stop_price = max(trail_stop, hard_stop)`, matching `engine.py` exactly, including which one wins the `exit_reason` label on a tie.
+7. **All 7 configs now verified clean via live-replay** (trade count matches backtest to within the expected 1-trade end-of-window artifact — backtest force-closes any still-open position at the window's last candle via `end_of_data`, live correctly leaves it open):
+
+| Stream | Backtest trades | Live-replay trades | Notes |
+|---|---|---|---|
+| Momentum Rider v2 | 31 | 31 | — |
+| Momentum Rider v4 | 29 | 29 | — |
+| Dip Hunter v2 | 20 | 19 (+1 still open, expected) | max_hold fix confirmed: 14 max_hold exits now match to the day |
+| Dip Hunter v3 | 20 | 19 (+1 still open, expected) | same |
+| Breakout Scout v2 | 16 | 16 | — |
+| Breakout Scout v3 | 20 | 20 | stop_loss_pct fix confirmed |
+| Volume Raider v1 | 39 | 38 (+1 still open, expected) | — |
+
+   Cumulative $ P&L still drifts modestly between backtest and live-replay even on a clean run (always live slightly ahead, ~16-38% relative seen) — same class of small mechanical exit-price timing differences already known/accepted for blended mode, just never measured for single-slot mode before now. Trust trade count / exit reason, not the exact dollar figure from either side alone.
+8. **New architecture memory written**: [[project_architecture_backtest_live_parity]] and [[project_live_replay_harness]] (in the auto-memory system, not this repo) — backtest and live are hand-ported twins with nothing that fails loudly when a rule is added to one side and not the other. Found 3 instances of this exact bug class in one session. Going forward: any new position rule needs either a matching live implementation or a live-replay run proving it, before trusting backtested numbers for a real deployment decision.
+
+### What to actually do next session
+
+1. **Model 2 deployment** (queued since 2026-08-06, not yet started): repurpose the empty infra slot (workflow rename, `LIVE_MODEL_VERSION` update, fresh `live.models`/`live.streams` rows, capital ledger entry) — same plan as before, just use the corrected numbers from step 3 above (12.72% ann., $173.17 ending, not the stale 11.50%/$164.71). Also: Model 2 includes a 2-slot stream (Volume Raider gets weighted differently per the $12.50×2×1 allocation, or check current intended composition) — **`executor.py`/`order_manager.py` currently hardcode `slot_number=1`, single-slot only.** Confirm whether Model 2's actual composition needs more than 1 slot on any stream before deploying; if so, that's live code that doesn't exist yet, not just a config change.
+2. Compounding itself (`compound=True`) is now available but the validated conclusion (twice now) is it hurts Model 2 — not recommended for deployment. Available for future streams/models to test on their own terms.
+3. The "gains bucket" idea from 2026-08-06 is still queued, still not built, lower priority now that compounding has a real (negative) answer.
+
+---
+
+# Handoff — 2026-08-06 (late evening)
+
+## 🔴 START HERE (new session): Model 3 is sold out and purged from the live DB; `live-model-3` branch renamed to `archive/live-model-3`. Tomorrow's real work: (1) finalize + deploy Model 2 into that now-empty infra slot, (2) build and test REAL compounding for Model 2 (currently doesn't exist for its slot modes -- a post-hoc estimate suggests it would hurt, but that needs verifying with a real implementation, not just an estimate), (3) if compounding doesn't help, test the "gains bucket" alternative instead. Model 3/4 redesign continues separately on `experiment/model3-4-redesign`, user frustrated with the lack of a working result there tonight.
+
+### The decision, plainly, and what's actually already done
+
+Tonight's session did three things: (1) a deep redesign/debug pass on Model
+3/4 (GS: Phoenix) on `experiment/model3-4-redesign` -- real bugs found and
+fixed, still not deployment-ready, see below; (2) discovered Model 1/2's
+individual stream + model-level backtest numbers were stale (predated the
+2026-08-05 engine fixes), re-ran and re-validated all of them on `main`;
+(3) acted on the result -- **Model 2 (9.06%→11.50% ann. beats Model 1 on
+Primary v2, similar drawdown, carries Volume Raider, the single best
+stream in the whole lineup) is being deployed for real, replacing
+`live-model-3`.**
+
+**Already done tonight, not just decided:**
+- User manually sold `live-model-3`'s open position on Kraken (real fill:
+  0.00031836 BTC @ $64,128.25, $0.30 fee, $20.11 net -- a small real LOSS
+  vs. the $20.16 original cost, not the gain it looked like on paper
+  minutes earlier; a real fee-drift check was run against live Kraken and
+  confirmed the 0.40%/0.80% fee tier is still accurate, so this wasn't a
+  stale-fee-constant problem, just real execution/small-trade-size noise).
+- Cron jobs paused (`cron-job.org`, external to this repo -- can't be
+  toggled from here).
+- **Model 3 fully purged from the live Supabase database** -- `live.models`,
+  `live.streams`, `live.blended_positions`, `live.blended_fills`,
+  `live.blended_capital`, `live.executor_state`, all 194
+  `live.executor_runs` rows for model_id=3, all deleted. Only Model 1
+  remains in `live.models` now.
+- `live-model-3` branch renamed to **`archive/live-model-3`** (both local
+  and on origin, old name fully removed). Checked first whether it had
+  anything not already on `main` -- it didn't (only 2 commits ahead of a
+  much-earlier `main`, both already independently present on current
+  `main`; 33 commits behind). **When Model 3 comes back for real, cut a
+  fresh branch off `main` at that time -- don't resurrect this one.**
+- `live-model-1` is untouched, still running as-is, unaffected by any of
+  this.
+
+### What to actually do next session (the Model 2 deployment)
+
+This is real money / real infra work, not yet started:
+1. **Repurpose the now-empty infra slot for Model 2** -- workflow rename
+   (`executor_m3.yml`/`healthcheck_m3.yml` → something Model-2-appropriate),
+   `LIVE_MODEL_VERSION` update, fresh `live.models`/`live.streams` rows for
+   Model 2's real composition (Momentum Rider v4 $25 + Dip Hunter v3 $25 +
+   Breakout Scout v3 $25 + Volume Raider v1 $25 = $100), fresh capital
+   ledger entry.
+2. Model 2 is **single/staggered/scale_up mode only** (no blended-mode
+   streams) -- none of tonight's blended-specific bracket fixes apply to
+   it. It should already be running on whatever `live-model-1`-equivalent
+   single-slot live code path Model 1 uses today (untouched, unaffected by
+   any of tonight's blended-only work) -- confirm that code path is
+   current/correct before deploying, same diligence as any live change.
+3. Full validated Model 1 vs Model 2 comparison (Primary v2, current/
+   honest numbers, for reference when doing this):
+
+| | Model 1 | Model 2 |
+|---|---|---|
+| Annualized Return | 9.06% | **11.50%** |
+| Max Drawdown | -16.05% | -16.25% |
+| Total Trades | 67 | 108 |
+| Win Rate | 40.3% | 41.7% |
+| Ending Balance ($100 start) | $148.86 | **$164.71** |
+
+   Streams inside each (all re-validated this session, current on `main`):
+
+| Stream | Model | Ann. Return | Max DD | Win Rate |
+|---|---|---|---|---|
+| Volume Raider v1 | 2 | **18.68%** | -27.80% | 46.2% |
+| Momentum Rider v2 | 1 | 11.52% | -20.85% | 32.3% |
+| Breakout Scout v3 | 2 | 11.26% | -25.45% | 30.0% |
+| Momentum Rider v4 | 2 | 9.03% | -21.20% | 34.5% |
+| Breakout Scout v2 | 1 | 8.27% | -28.14% | 31.3% |
+| Dip Hunter v2 | 1 | 7.24% | -30.23% | 60.0% |
+| Dip Hunter v3 | 2 | 5.48% | -28.51% | 55.0% |
+
+   Volume Raider v1 is clearly carrying Model 2. Also found (not yet
+   pursued): a NOT-yet-deployed version, Volume Raider v4, backtests even
+   stronger (22.80% ann., Primary v2) -- a real candidate to swap in later,
+   but not validated for this deployment; ship the already-proven v1
+   composition first, revisit v4 as a future stream-config upgrade once
+   locked and properly tested standalone.
+
+### Why the Model 1/2 numbers changed (resolved, don't re-litigate)
+
+Model 1/2's `backtest.stream_tests` rows were last saved 2026-08-03,
+predating the 2026-08-05 engine fixes (`e1cea7a` one-tick entry-fill delay,
+`6730ec3` staggered/cascade exit-fill optimism) -- both apply to
+single/staggered/scale_up mode (what Model 1/2 actually use). Re-ran all 16
+stream configs × 5 presets = 80 rows on current `main`; nearly every number
+moved, mostly down (e.g. Volume Raider v3 looked like a clear standout at
+31.03% ann., corrected to 17.13% -- no longer better than what's already
+deployed). `backtest.model_tests` for Models 1/2/3 were ALREADY current
+(saved same fix-session, 2026-08-06 early morning, model_test_id 127-136,
+142-146) -- did not need re-running. **Model 4 has NO saved model_test at
+all** -- `backtest.model_streams` has two conflicting rows for
+model_version=4 (v1 and v2 both attached), blocking the official save
+path. Real, still-open, unrelated to tonight's other work.
+
+### GS: Phoenix (Model 3/4 redesign) status -- separate track, still in progress, user frustrated with the lack of a working result
+
+Full technical detail in `docs/decisions/008-gs-phoenix-redesign.md` on
+`experiment/model3-4-redesign` (merged up to date with `main`). Real fixes
+made and kept: a genuine stop-anchor bug in the slot-5 bracket (was
+anchored to average cost, not current price -- stop was already breached
+before the bracket even went live, target could never fire), real
+30-minute sub-candle exit resolution (matches live's actual poll cadence),
+a last-fill-anchored arm/trail alternative to the bracket, a re-entry
+cooldown. All tested (49/49 passing), all opt-in/additive.
+
+**Despite all of that, no variant tested tonight is net positive on the
+full Primary v2 window (2022-present).** Tried, in order, after the fixes
+above: tuned bracket stop/target distances (best: -2.02% ann, stop=11%),
+no bracket at all / normal arm-trail fallback (-2.13% ann, 100% win rate
+on closed trades but only 36 trades total), a 4-slot "combo last slot"
+redesign at 2/5/10% cascade spacing with a doubled final slot (-11.59%
+ann, 27% of trades hit the forced-exit slot), the same redesign at wider
+spacing 4/9/18% (best of that family: -4.72% ann), and a "pyramid" capital
+weighting ($10/$20/$30/$40 per slot instead of equal, 5/10/20% spacing)
+which gave the best RISK profile of the whole session (-3.30% ann but only
+-18.98% max DD, vs. -32% to -60% for everything else) without beating the
+best return. **User's own assessment, stated directly: frustrated this
+doesn't work, may come back to it later.** Not touched again this session
+after that. Also still queued, not started: a better re-entry filter than
+the blanket SMA200 gate (blocks real dip-buying opportunities, not just
+falling knives), and Stream Tester still stale for Grid Stacker Blended /
+GS: Reflex.
+
+### Model 2 compounding + "gains bucket" -- new, queued for next session, NOT YET BUILT
+
+User's real question after seeing Model 2's validated numbers: Model 2
+doesn't compound (confirmed by reading the code -- `compound` is only
+implemented in `_run_blended_slots`, doesn't exist at all for
+single/staggered/scale_up, the modes Model 1/2 actually use -- not just
+"off", not currently possible without new engine work). Estimated the
+effect via a post-hoc reconstruction (same real trade sequence/% returns,
+replayed with position size scaled to running balance instead of a fixed
+$25/stream): **compounding would have made Model 2 WORSE on Primary v2**
+($164.71 non-compound vs. $133.46 compound ending balance from $100,
+every one of the 4 streams individually worse compounded, Volume Raider
+hit hardest -- its return nearly halved). Likely cause: volatility
+drag/sequence-of-returns effect -- a losing stretch shrinks the balance
+right before a stream's big winning trades, so those winners compound off
+a smaller base than the fixed lot size would have given them.
+
+**User does not trust this estimate at face value** (fair, given tonight's
+track record) and wants it properly built and tested for real next
+session -- true compounding support added to the single/staggered/
+scale_up engine paths (not just a post-hoc reconstruction), then re-run
+against Model 2's real composition.
+
+**Found the prior "gains bucket" design in full, 2026-08-06 late night** --
+it's real, it's `docs/decisions/007-model4-gs-reflex-design.md` section 4
+("Profit-skim satellite BTC bucket"), built during the original Model 4
+design session. Full mechanics, already tuned via extensive backtesting:
+
+- Skim a % of every winning trade's *realized gain* (not total capital)
+  into a separate bucket.
+- Once the bucket has ≥$10, buy BTC on a real dip -- stricter than the
+  main stream's own entry signal (`drawdown_from_high`, price N% below its
+  M-day high, can't fire right after a fresh ATH). **Tuned best: 15% below
+  a 60-day high** (8/10/12/15/20% all tested, 15% was the standout).
+- No market-based sell trigger. Tracks a real cost basis for whatever's
+  currently at risk. The moment unrealized value clears that cost basis by
+  a premium, sell *exactly* enough to recover the original principal as
+  cash (back into the bucket, waiting for the next dip) -- the remainder
+  becomes permanent "house money," never sold again. Principal can never
+  be lost twice; only realized profit stays permanently exposed to BTC.
+  **Tuned best: 50% sell premium** (10/20/25/50/100% tested, 50% most
+  robust across time horizons -- this is the number the user remembered).
+- `dynamic_skim` variant: solves per-trade for the skim rate that would
+  take `target_trades` wins to accumulate `min_buy_capital` at the
+  *current* pool size (naturally decays as the pool grows). Tuned best:
+  target 22 trades, floored 10%, capped 25%.
+
+**Real, working code exists** -- `simulate_skim_bucket()` and the
+`dynamic_skim` logic, implemented in `engine.py` at commit `bb18d45`
+("Add profit-skim satellite BTC bucket experiment; document as rejected"),
+then deliberately **stripped back out** at commit `63d95f8` ("Clean
+cutover: strip rejected Model 4 experiments from engine.py") after being
+rejected for Model 4's use case (see below). `git show bb18d45:src/backtester/engine.py`
+to pull the exact function back -- it's a self-contained post-process over
+an already-computed `main_trades` DataFrame, not wired into `run_backtest()`
+itself, so it's cheap to re-add without touching anything else.
+
+**Why it was rejected for Model 4, and why that reason may NOT apply to
+Model 2:** tested honestly (accounting for the real feedback loop --
+skimming shrinks the pool that compounds forward, which shrinks future
+wins, which shrinks future skims), skimming from Model 4's own
+*compounding* capital was a severe net negative in every preset (Full
+History -30.4%, Primary v2 -7.7%, Recent -7.6%, vs. main-stream-only) --
+because the main stream already beats plain BTC buy-and-hold (the whole
+point of running it as a strategy), so skimming moves money from a
+higher-yielding strategy into a lower-yielding one (buy-and-hold, which is
+structurally what the bucket is). Doc 007 explicitly flags the escape
+hatch: **"kept... in case a version funded from something *other* than
+the main stream's own compounding capital is ever worth revisiting."**
+**Model 2 not compounding (see above) may be exactly that scenario** --
+if Model 2's gains aren't being reinvested into Model 2's own future
+position sizing anyway, skimming them into this bucket isn't cannibalizing
+a compounding pool the way it did for Model 4. Worth testing on its own
+honest terms next session, not assumed to work just because the original
+objection doesn't apply -- but the original objection is a real reason it
+might actually work here where it didn't there.
+
+---
+
+## Superseded by the above — kept for history
+
+# Handoff — 2026-08-05
+
+## 🔴 (superseded) backtest + live-replay both fixed and merged to `main`. Next: a NEW branch (off `main`) to redesign Model 3/4 and see if either can actually be made good. `live-model-3` deployment is deliberately deferred until after that.
+
+### The one-sentence version
+
+This session found that the backtest had been crediting phantom fills (sales at prices the market never touched) for the entire life of the project — catastrophically for blended mode (Model 3/4, 10-20x inflation), modestly for Model 1/2 (10-25%, normal slop) — and that live code's exits used a market sell that could genuinely sell below the "never lose" floor. Both are now fixed, cross-validated against each other with a new live-replay harness, and merged to `main`. With the fabrication gone, Model 3/4's *honest* backtested performance is weak (Grade 2-3, not the Grade 4-5 story everyone believed) — **so the next session's job is a redesign attempt, on a fresh branch, before touching real money again.** Porting the fix to `live-model-3` (where real money sits right now, unprotected) is explicitly deferred until after that — see "Deferred, not forgotten" below.
+
+### What to actually do this session
+
+1. **Branch off `main`** (not off `live-model-4` — that branch is now stale, see below) for the Model 3/4 redesign work.
+2. Use the backtest for fast iteration on stream parameters (arm threshold, ladder spacing/depth, capital weighting, maybe a different core signal entirely) — it's honest now, no longer fabricating fills, so real signal will show up in it.
+3. **Before trusting any promising candidate, run it through `tools/live_replay/replay_gauntlet.py` too** (exact commands below) — backtest alone is not sufficient evidence, per the trust discussion below. A large backtest-vs-live-replay disagreement on a candidate is a stop sign.
+4. Goal: find a configuration for Model 3 and/or Model 4 that clears something like Grade 4 (beats S&P by a real margin) *honestly*, not just clears break-even.
+5. `live-model-3`'s real deployment gap (it's still running the old market-sell exit code, unprotected) is a separate, still-urgent item — but the user has explicitly chosen to defer it until after this redesign attempt. Don't start that work unprompted this session.
+
+### What actually happened, in order
+
+1. Built `tools/live_replay/replay_gauntlet.py` — drives the real production order-management code (not a backtest reimplementation) tick-by-tick against real historical data, with a safety pattern (both notifier `_dispatch` functions mocked, verified before anything else runs) that took two real alert incidents to get right. Found a single-trade discrepancy; fixed the harness's tick ordering to match production exactly; **the discrepancy persisted**, proving it was real, not a harness artifact.
+2. Traced it to a real 5-slot GS: Reflex trade and found **two stacked bugs**: (a) `place_exit()` did an unconditional **market sell** the instant the floor was computed, which can fill far below the floor during an active crash — exactly when a position tends to arm for the first time; (b) the **backtest's own exit-fill check was one-sided** (`low <= effective_stop`, no `high` check, unlike every entry/add fill in the same file) — it could credit a sale at a price the candle's high never reached. **Bug (b) exists in all four backtest slot modes**, meaning every model's backtest carried this optimism, not just blended's.
+3. Ran the full Primary v2 window (2022→present): backtest showed 182 trades / 2.2% loss rate / $100→$871; live replay showed 51 trades / **49% loss rate** / capital **permanently frozen at $49.42 by Aug 2022** (below the $10 minimum lot, never recovers). Loss rate scaled with slot count: 0% at 1 slot, **100% at 5 slots**.
+4. **Fixed, for blended mode (Model 3/4, shared `blended_order_manager.py`/`blended_position_monitor.py`)**: exits are now a real resting **limit** sell at the floor (`ensure_pending_exit`/`check_pending_exit`, migration v8), re-priced as the floor moves, confirmed via a real poll — not an immediate market sell. `trail_armed` persists once true and permanently disables capitulation (a position that's proven it can arm should never be forced into the backstop meant for positions that never did) — but cascade adds keep working after arming, since a new cheaper fill only ever lowers the floor. Model 1/2 deliberately **kept** their market-sell exit (a real stop-loss should guarantee execution, not rest unfilled) — only got the backtest-side realism fix (`min(stop_price, close)`, "never assume a fill better than the close").
+5. **Re-validated after the fix**: GS: Reflex's live loss rate dropped from 49% to **9%** (matching backtest), Grid Stacker Blended dropped to **0%**. Neither model's capital freezes anymore. Model 1/2 re-audited and confirmed only modestly affected (10-25% overstatement, not broken) — corrected backtest results saved permanently (`backtest.model_tests` id 127-136).
+6. **Found a real double-sell safety bug while digging into why backtest and live-replay still didn't fully agree**: `ensure_pending_exit()` cancelled and replaced an existing resting order without ever checking if it had already filled for real first — in production (continuous real time, unlike backtest's discrete ticks), this could place a second sell order for BTC no longer held. Fixed: check real status first, finalize from that fill if already filled.
+7. **Found and fixed a second real backtest bug**: every slot mode's loop checked for a fill on a pre-existing pending order *before* placing any new one each iteration — meaning an order placed this tick could never be checked for a fill until the *next* tick, even though its price (always the current close) trivially sits inside that same candle's own range and would fill immediately in reality. Fixed across all four slot modes. Verified safe for Model 1/2 (trade counts moved by at most 1, returns shifted under 1pp).
+8. **The aggregate P&L gap between backtest and live-replay for blended mode never fully closed**, despite three rounds of real, verified fixes (each one individually confirmed correct via concrete trace evidence). GS: Reflex went from 2.7x to ~5.6x after the entry-timing fix — i.e., closing one real bug didn't monotonically shrink the gap. **Working conclusion: this is not a single remaining bug** — backtest and live-replay are two independently-built simulations of the same rules, and small mechanical differences between them compound over hundreds of trades into large aggregate differences. Not resolved; probably not worth chasing to zero. Loss *rate* and capital-freeze behavior are now honest and match well; exact cumulative P&L between the two systems does not, and shouldn't be trusted to the dollar from either side alone.
+9. **Merged to `main`** (cherry-picked cleanly off the `live-replay-testing` branch, deliberately excluding that branch's `live-model-4`-specific workflow renames and Model-1-only dead-code deletions — those stay specific to that branch, since Model 1 may still dispatch against `ref:main` for `executor.yml`/`healthcheck.yml`). 40/41 tests passing (`test_signal_parity.py` excluded, pre-existing unrelated issue).
+
+### What this means for decisions already in motion
+
+**The documented reason for retiring Model 1/2 ("Model 3/4 beat them 3-7x") no longer holds.** With honest numbers on both sides: Model 1 ~9-24% annualized depending on preset, Model 2 ~11-17%, Model 3 ~-2-13%, Model 4 ~1-16%. Model 1/2 are comparable to or better than Model 3/4 now. **This retirement decision needs revisiting directly with the user — not yet resolved, flagged repeatedly this session, still open. Separate from the redesign work below — don't conflate the two.**
+
+### Current honest numbers, all four models, all five presets (all saved permanently in `backtest.model_tests` — query by these IDs if you need the full row)
+
+| Model | Preset | Trades | Ann. Return | Max DD | Total P&L | `model_test_id` |
+|---|---|---|---|---|---|---|
+| **1** (Momentum Rider + Dip Hunter + Breakout Scout, $33.33 each) | Full History | 143 | 15.2% | -19.0% | $236.48 | 128 |
+| 1 | Primary v2 | 67 | 9.1% | -16.1% | $48.87 | 131 |
+| 1 | Primary Window | 80 | 23.5% | -17.7% | $186.60 | 127 |
+| 1 | Recent | 41 | 8.9% | -16.2% | $24.52 | 129 |
+| 1 | 2026 YTD | 8 | 13.6% | -3.0% | $7.75 | 130 |
+| **2** (Breakout Scout + Dip Hunter + Momentum Rider + Volume Raider, $25 each) | Full History | 219 | 12.6% | -23.1% | $177.16 | 133 |
+| 2 | Primary v2 | 108 | 11.5% | -16.3% | $64.71 | 136 |
+| 2 | Primary Window | 120 | 17.5% | -19.5% | $123.71 | 132 |
+| 2 | Recent | 66 | 12.9% | -15.8% | $36.92 | 134 |
+| 2 | 2026 YTD | 13 | 11.6% | -3.3% | $6.62 | 135 |
+| **3** (Grid Stacker Blended v8, $100 solo) | Full History | 96 | 2.5% | -43.5% | $23.71 | 143 |
+| 3 | Primary v2 | 68 | 1.5% | -43.5% | $7.00 | 146 |
+| 3 | Primary Window | 72 | 12.6% | -32.7% | $80.90 | 142 |
+| 3 | Recent | 60 | **-1.8%** | -43.5% | -$4.56 | 144 |
+| 3 | 2026 YTD | 2 | -43.9% | -28.8% | -$28.72 | 145 |
+| **4** (GS: Reflex v2, $100 solo) | Full History | 70 | 1.3% | -47.2% | $11.56 | *(not saved — see note)* |
+| 4 | Primary v2 | 45 | 3.5% | -47.2% | $17.23 | *(not saved)* |
+| 4 | Primary Window | 70 | 11.9% | -33.1% | $75.04 | *(not saved)* |
+| 4 | Recent | 37 | 0.5% | -47.2% | $1.36 | *(not saved)* |
+| 4 | 2026 YTD | 2 | -43.3% | -28.7% | -$28.30 | *(not saved)* |
+
+**Model 4's numbers are NOT saved to `backtest.model_tests`** — `backtest.model_streams` currently has **two conflicting rows** for model_version=4 (GS: Reflex `v1` and `v2` both attached), explicitly marked in its own description as "not finalized/deployed; placeholder." Running the official `run_model()`/`save_model_test()` path against it right now would double-count both stream configs into one result. **Fix this (delete the stale `v1` row, keep only `v2`) before trying to save Model 4 results the official way** — the numbers above came from a direct `run_backtest()` call bypassing that layer, which is fine for reference but shouldn't be treated as saved/permanent. The 2026 YTD numbers for both models 3 and 4 (~-43%) are a 2-trade sample in a single bad stretch — noise, not signal, don't over-read it.
+
+**⚠️ Stream Tester (individual stream-level view) is stale for all six relevant streams — checked directly, deliberately left as-is, not a bug to fix.** Grid Stacker Blended, GS: Reflex, Momentum Rider, Dip Hunter, Breakout Scout, Volume Raider all have `backtest.stream_tests` rows that predate this session's engine.py fixes (some from hours before, some from days/weeks before) — GS: Reflex's latest saved row shows `total_pnl` up to $31,486 on a $100 stream, the old phantom-fill-inflated math. If you open Stream Tester and see numbers like that, it's stale data, not a regression — expected to get naturally overwritten as the redesign work re-runs these streams anyway. User's explicit call: leave it, don't spend time re-running these now.
+
+### What to do with the `live-model-4` branch
+
+**Keep it, but treat it as stale — do not build the redesign work on top of it.** It's still at commit `e6124e3`, unchanged since before this session, meaning it still has the market-sell exit bug, the phantom-fill backtest bug, and none of this session's fixes. It has real, still-valid infra prep on it (the `executor_m3.yml`→`executor_m4.yml` workflow rename, `LIVE_MODEL_VERSION=4`, deletion of genuinely Model-1-only dead code) for the eventual plan of repurposing Model 1's infra slot for Model 4 — that plan itself is still fine, just premature until a redesigned Model 4 config is actually validated. When that day comes: either rebase `live-model-4` onto current `main` (bringing in all of this session's fixes) or re-apply just its infra-specific diff (workflow renames, dead-code deletion) onto a fresh branch cut from `main` at that time — don't just pick up where `live-model-4` left off assuming it's current, it isn't.
+
+### How to use the two live-replay tools (both under `tools/live_replay/`)
+
+**Blended mode (Model 3/Grid Stacker Blended, Model 4/GS: Reflex, or any future blended-mode stream)** — `replay_gauntlet.py`:
+```
+python -m tools.live_replay.replay_gauntlet --stream-config-id <id> --version <v> \
+    --start 2022-01-01 --end 2026-08-05 --lot-size <per-slot $> --slot-count <n> \
+    --slot-mode blended --stream-name "<name>"
+```
+e.g. Model 3: `--stream-config-id 11 --version v8 --lot-size 20 --slot-count 5`. Model 4: `--stream-config-id 12 --version v2` (same lot/slot). Takes ~40-90s for a 2022→present run. Prints a `BACKTEST reference` block, then ticks through, then `LIVE REPLAY:` with every closed position (slots used, entry avg, exit, pnl, reason).
+
+**Plain single-slot mode (Model 1/2 streams)** — `replay_model1.py`, same idea, no `--slot-count`/`--slot-mode`:
+```
+python -m tools.live_replay.replay_model1 --stream-id <id> --version <v> \
+    --start 2022-01-01 --end 2026-08-05 --lot-size <$> --stream-name "<name>"
+```
+Stream IDs: Momentum Rider=1, Dip Hunter=2, Breakout Scout=3, Volume Raider=4.
+
+**Both scripts print a notifier-mock safety check first** (`Notifier mock check ... must print True for both`) — if you ever see `False` there, or the script doesn't print that block at all before doing anything else, stop and do not let it continue; that check existing and passing is what makes it safe to run against real (non-dry-run) order-placement code. Two real alerts fired before this pattern existed — don't simplify it away, don't skip it "just this once."
+
+**Do not run these in parallel against the same local Postgres** — they share a reserved sentinel `model_version` (991 for blended, 992 for Model 1) for their sandbox rows; running two at once causes a real collision (confirmed this session — corrupted both runs). Run them sequentially.
+
+### How much to trust backtest vs. live-replay going forward (asked directly this session, worth restating)
+
+Backtest: fast, no longer catastrophically wrong, good for first-pass iteration and comparing variants quickly. Not precise enough to trust for an exact number — still diverges from live-replay by a wide margin on blended mode's cumulative P&L (though loss *rate* now matches well).
+Live-replay: exercises the *real* production code, which is why it caught every bug above that a backtest reimplementation structurally never could. But it's still a simulation on the same historical OHLC data with the same touch-based fill assumptions (no order-book depth, no real slippage beyond candle-close for market orders) — it is **not** independently verified against actual Kraken execution, and its absolute numbers shouldn't be treated as ground truth either.
+**Practical rule:** backtest for fast iteration; anything before a real deploy decision needs to also clear live-replay, and a large disagreement between the two is a stop sign, not a detail to shrug off. Neither one alone is sufficient for a go/no-go call. The only real ground truth is actual executed trades on Kraken, which barely exist yet (Model 3 has fills but no completed real trailing-stop exit cycle).
+
+### Deferred, not forgotten (do not start unprompted — user's explicit call)
+
+1. **Port the blended live-code fix to `live-model-3`.** Real money, real open position, no protection (still on the old market-sell exit) until this ships — genuinely the single most urgent item in the project, but explicitly deferred until after the Model 3/4 redesign attempt above. Needs: migration v8 applied to Supabase (not just local Postgres), the `blended_order_manager.py`/`blended_position_monitor.py`/`blended_executor.py` changes merged in, full `tests/live/` green on that branch, then a careful, deliberate deploy (review the diff against `live-model-3`'s current state first — it diverged from `main` before this session started).
+2. **Revisit the Model 1/2 retirement decision** with the user, using the corrected numbers above.
+3. Consider whether to formalize the live-replay harness as a named, mandatory process (parallel to "The Gauntlet") every model must pass before deployment.
+
+**⚠️ Safety pattern, still required for any future replay work, unchanged:**
+`mock.patch("src.live.blended_notifier._dispatch")` and `mock.patch("src.live.notifier._dispatch")` wrapping the entire script, with a printed+asserted call-through check *before* anything else runs. `replay_gauntlet.py`'s `_verify_alerts_mocked()` does this first thing in `run_replay()`. Two real alerts fired before this pattern was adopted — do not simplify it away.
+
+---
+
+## ⏸️ PAUSED (superseded by the above — kept for history): Model 4 (GS: Reflex) replacing Model 1 on the same infra
+
+**Decision (user's, explicit, documented):** Models 1 and 2 are being retired ahead of schedule — not for underperformance in the sense the Model Commitment Rule was written to guard against, but because Models 3 and 4 are so far ahead (Model 3 ~3x, Model 4 ~4.5-7x Model 1/2's annualized returns, verified against real numbers, holds up after realistic tax treatment too) that continuing to run 1/2 isn't worth it. This is a one-time, conscious exception to the Commitment Rule — CLAUDE.md's Model Tournament section and the Commitment Rule subsection currently contradict each other slightly (one says "manually stopped" is a valid end condition, the other doesn't) — **CLAUDE.md still needs updating to reflect this decision and resolve that contradiction. Not done yet.**
+
+**The plan:** repurpose `live-model-1`'s branch/GitHub Actions/cron-job.org slot for Model 4, reusing the existing $100 capital (once Model 1's Breakout Scout position is manually sold) rather than deploying new money. Model 3 stays running unchanged.
+
+**Where things stand right now:** the code side of this is substantially built (see below) but **nothing has gone live yet** — no cron-job.org changes, no Supabase changes, no real position closed. Everything so far is safe, local/GitHub-only work.
+
+## Done This Session
+
+**1. Clean Model 4 cutover to `main` (separate from the live-infra work, landed first):**
+- PR #6 merged: `src/backtester/engine.py`'s `_run_blended_slots` now carries only what's actually used — Model 3 (v8, live)'s `capitulation_stop_pct`, plus Model 4 (GS: Reflex v2)'s capitulation ladder, sentiment tilt, slot promotion, shallow breakeven margin. Every rejected/unexercised experiment from the design session (concurrent stacks, skim bucket, wide-trail, vol-adaptive, `prior_slot` promotion anchor, ladder start/step shorthand) removed.
+- `docs/decisions/007-model4-gs-reflex-design.md` — renamed from `model4-design-notes.md` to follow the existing ADR numbering convention; now documents what shipped vs. what stayed archived.
+- Verified via independent hand-traced math (matched real engine to full float precision) and full preset re-runs (byte-identical to pre-cutover numbers) before and after.
+- Also on `main` this session (separate, earlier work, already shipped): Stream Tester performance fix (PR #5) — payload bloat (raw OHLCV dataframe in every saved pkl) and `st.tabs` eagerly rendering every tab on every rerun, both fixed.
+
+**2. `market_data.yml` moved to its own `live-market-data` branch.** It was hardcoded to check out `ref: live-model-1` — an accident of history, and exactly the kind of fragility that caused a real incident already (documented 2026-08-02 entry below). Now insulated from main's churn the same way live-model-1/3 already are. **cron-job.org's market_data job still needs to be retargeted to `ref:live-market-data` — not done yet, this is a required step before touching live-model-1/4.**
+
+**3. `live-model-1` → `live-model-4`.** Old `live-model-1` branch left untouched on GitHub as a rollback point (not deleted). New `live-model-4` branched fresh from `main` (not from old `live-model-1` — tried that first, caught by the user as messier than necessary; also confirmed `main` already had every blended file live-model-3 does, with equal-or-better comments, so `main` was the right base, not `live-model-3` either). On this branch:
+- **Caught and fixed my own mistake before pushing:** a broken grep filter hid the fact that `blended_executor.py`/`blended_order_manager.py`/`blended_position_monitor.py` genuinely import shared helper functions and fee constants from the plain `executor.py`/`notifier.py`/`order_manager.py`/`position_monitor.py`. I initially deleted all of these as "dead Model-1-only files," then restored all four after actually trying to import the modules in Python (not just grepping) and hitting `ImportError`. Only `deploy.py`, `healthcheck.py`, `setup_supabase.py`, `market_data_updater.py` are genuinely Model-1-only dead code — confirmed removed safely.
+- Added `executor_m4.yml`/`healthcheck_m4.yml` (renamed from `_m3` versions — `ref: live-model-4`, `DRY_RUN_M4`). Old `executor.yml`/`healthcheck.yml`/`executor_m3.yml`/`healthcheck_m3.yml` removed from this branch.
+- Bumped `LIVE_MODEL_VERSION` to 4 in `blended_executor.py`/`blended_healthcheck.py`, updated all Model-3-specific log/error text. Diffed line-by-line against `live-model-3`'s originals to confirm every change was exactly the intended one, nothing accidental.
+
+**4. Critical gap found and fixed: none of Model 4's four mechanisms existed in the live code.** They were built into the backtest engine only. Deployed as-is, Model 4 would have silently traded as plain Model 3 forever — the new config keys would just go unread. Fixed:
+- `_tilted_slot_weights` extracted from `engine.py` into `src/backtester/slot_math.py` (`tilted_slot_weights`, pandas-free) alongside `slot_capitals_for`, so backtest and live share the literal same formula. Confirmed behavior-preserving.
+- `blended_order_manager.py`: `place_entry()` now reads today's real Fear & Greed value (new `_get_fng_value`, queries `sentiment_data` directly) and freezes the tilted split into a new `frozen_slot_capitals` column so cascade adds don't re-tilt against a later reading. `check_cascade_add_trigger()` gained the `slot_promotion_days` "impatience" trigger, reproduced with its exact real quirk (promotion allowance spent whether or not it fires that candle) rather than an idealized version.
+- `blended_position_monitor.py`: `check_all()` gained the capitulation ladder (new `marked_count`/`marked_capitals` columns) and the shallow breakeven margin.
+- `src/data/migration_v7_model4_mechanics.sql` — adds `frozen_slot_capitals`, `promotions_used`, `marked_count`, `marked_capitals` to `live.blended_positions`. **Applied to local Postgres only. Supabase still needs this migration run before any real deploy — not done yet.**
+- New `tests/live/test_model4_mechanics.py` (5 tests, all passing) — real integration coverage against a mocked Kraken client + local Postgres for all four mechanisms, where there had been zero. Two of the five initial test scenarios failed on first write — not because the code was wrong, but because of a test arithmetic error and a wrong assumption about ladder timing (confirmed the second one was correct, Gauntlet-validated behavior by reproducing it directly in the backtest engine before adjusting the test).
+- New `tests/live/test_blended_executor_model4_lookup.py` — the one thing actually changed (`LIVE_MODEL_VERSION`) had zero test coverage until this was added.
+- Full suite: **38/38 passing** (pre-existing unrelated `test_signal_parity.py` collection error excluded, as always).
+- Backtest/Gauntlet re-confirmed byte-identical on `live-model-4` multiple times throughout, most recently just before this handoff was written.
+
+**5. ⚠️ Two real safety incidents this session, both from ad-hoc verification scripts (not from anything in the committed codebase) — read before running anything like this again:**
+- A standalone Python replay script (not a pytest test) drove real (non-dry-run) order-placement code without blocking alerts, and a real email/SMS fired. Root cause: blanking `ALERT_*` env vars via `os.environ.pop()` is **fragile** — any later `load_dotenv()` call (several `src/live/*` modules call it) silently refills a var that's merely *missing* (dotenv's `override=False` default only protects vars that are still *present*). `tests/live/conftest.py`'s fixture works because pytest controls timing relative to imports; a standalone script does not have that guarantee.
+- **The fix that actually works, verified in isolation before trusting it:** `mock.patch("src.live.blended_notifier._dispatch")` and `mock.patch("src.live.notifier._dispatch")` — both real chokepoints every alert call funnels through, immune to `load_dotenv()`. Any future script that drives real (non-dry-run) `blended_order_manager`/`blended_position_monitor` code **must** wrap the entire execution in both patches, and should print+assert a quick call-through check before doing anything else, exactly like `tools/live_replay_wip/live_replay_gauntlet.py` and `trade2_diagnose.py` now do (safely preserved on disk, untracked — see the "START HERE" section at the top of this document).
+
+## Critical Open Item — live-code replay surfaced a real, not-yet-resolved question
+
+Built a harness that drives the actual production functions (not the backtest) tick-by-tick against real historical `market_data`/`sentiment_data` in a local Postgres sandbox, with a fake Kraken client. This is fundamentally different from the backtest — it exercises the real DB-backed state machine and, critically, simulates real market-order slippage on exits (the backtest always assumes a perfect fill at the exact stop price; a real market sell fills at whatever the market offers).
+
+Replaying Jan 2026: entry/exit **dates** matched the backtest exactly, but Trade 2's **P&L flipped from a small backtest gain (+$1.01) to a real loss (-$7.18)**. Root-caused with real per-tick instrumentation, not guessed: the position sat at 4 filled slots with `armed=False` for over a week while price crashed, because `gain_pct` (measured against a stale high-water-mark) stayed just under the 4% arm threshold. The **5th and final slot filled right at the bottom of the crash**, which *itself* dragged the average cost down enough to clear the arm threshold *for the first time* — and the instant it armed, that same candle's low was already below the newly-computed breakeven stop, triggering an immediate market-sell exit that filled at the crashed price, not the stop level.
+
+**Not yet resolved:** whether this is a real, previously-unknown risk in the design (a last-slot fill during a crash can arm and immediately force-exit at a bad price in the same instant) or partly an artifact of the replay harness's tick ordering, which was built to match the *backtest's* loop order rather than production's *real* `tick()` order (production checks for a new cascade-add trigger and places that order *before* polling for fills in the same tick — the harness does it in the reverse order). This needs the harness rebuilt to match production's real ordering exactly, then re-run, before drawing a final conclusion. User wants this "tested hard" — likely its own dedicated session given the safety incidents above.
+
+## Remaining Steps To Go Live (in rough order)
+
+1. **Resolve the live-replay timing question** — see the "START HERE" section at the very top of this document; this is now its own initiative on its own branch, paused separately from the rest of this list (or explicitly decide to proceed without full resolution, if that's the call once it's investigated).
+2. Update CLAUDE.md's Model Tournament/Commitment Rule contradiction + document the Model 1/2 retirement decision.
+3. Write `deploy_model4.py` (adapted from `deploy_model3.py`) — **capital must be seeded from whatever real dollar amount Model 1's sellout actually returns, not a hardcoded $100** (this is a capital carry-forward, not new money).
+4. Adapt the Model-1-vs-Model-4 isolation test (mirror `tests/live/test_blended_isolation.py`, which currently only proves Model-1-vs-Model-3 isolation).
+5. Port the pure `slot_math.py`/`engine.py` refactor (item 4 above) back to `main` via its own small PR — it's currently only on `live-model-4`, and `main` should have it too since it's a verified no-op refactor.
+6. **User's turn:** pause Model 1's cron-job.org jobs, then manually sell Breakout Scout on Kraken. Tell Claude the real settlement amount for `deploy_model4.py`.
+7. **User's turn:** on cron-job.org — retarget the executor/healthcheck jobs to `executor_m4.yml`/`healthcheck_m4.yml` + `ref:live-model-4`; retarget the market_data job to `ref:live-market-data`. Apply `migration_v7_model4_mechanics.sql` to Supabase. Add a `DRY_RUN_M4` GitHub secret (start `true`).
+8. Manually trigger one dry-run dispatch, confirm clean, then flip `DRY_RUN_M4` to `false`.
+
+
 
 ## ✅ Real fees were wrong for every model — now corrected everywhere, including the live branches
 

@@ -1,13 +1,11 @@
-import os
-import math
 import pandas as pd
 import numpy as np
 from dotenv import load_dotenv
-from sqlalchemy import create_engine, text
 
-from .indicators import add_indicators, resample_ohlcv, _CANDLES_PER_DAY
+from .indicators import add_indicators, resample_ohlcv
+from .market_data import load_market_data, _warmup_days
 from .signals import generate_signals
-from .slot_math import slot_capitals_for
+from .slot_math import slot_capitals_for, tilted_slot_weights
 from src.data.sentiment import load_sentiment
 from src.fees import MAKER_FEE, TAKER_FEE
 
@@ -32,78 +30,6 @@ load_dotenv()
 SLOT_MODES = ('single', 'staggered', 'scale_down', 'scale_up', 'cascade', 'blended')
 
 
-def _warmup_days(params: dict) -> int:
-    """
-    Compute how many extra calendar days of pre-start data are needed so that
-    every indicator has a full lookback window on the first signal candle.
-    """
-    tf  = params.get("primary_timeframe", "15m")
-    cpd = _CANDLES_PER_DAY.get(tf, 96)
-
-    filters = params.get("filters") or {}
-    core    = params.get("core_signal", "")
-    core_p  = params.get("core_params") or {}
-
-    candles = 0
-
-    # drawdown_from_high — often the largest lookback
-    dfh = filters.get("drawdown_from_high") or {}
-    if dfh:
-        candles = max(candles, int(dfh.get("lookback_days", 30) * cpd))
-
-    # trend SMA filter (e.g. 200-period)
-    tc = filters.get("trend_context") or {}
-    if tc.get("sma_period"):
-        candles = max(candles, int(tc["sma_period"]))
-
-    # signal-specific lookbacks
-    if core == "ema_crossover":
-        candles = max(candles, int(core_p.get("ema_long", 50)))
-    elif core == "range_breakout":
-        candles = max(candles, int(core_p.get("breakout_lookback", 48)))
-    elif core == "pullback_from_high":
-        candles = max(candles, int(core_p.get("lookback_bars", 48)))
-    elif core == "sma_pullback":
-        candles = max(candles, int(core_p.get("pullback_sma", 50)))
-        candles = max(candles, int(core_p.get("trend_sma", 200)))
-
-    # volume / ATR / Bollinger filters
-    vol_f = filters.get("volume") or {}
-    if vol_f.get("avg_period"):
-        candles = max(candles, int(vol_f["avg_period"]))
-    atr_f = filters.get("atr_regime") or {}
-    if atr_f.get("period"):
-        candles = max(candles, int(atr_f["period"]) + int(atr_f.get("avg_period", 30)))
-    bb_f = filters.get("bollinger") or {}
-    if bb_f.get("period"):
-        candles = max(candles, int(bb_f["period"]))
-    adx_f = filters.get("adx") or {}
-    if adx_f.get("period"):
-        candles = max(candles, int(adx_f["period"]) * 3)  # ADX needs ~3x period to stabilize
-
-    return math.ceil(candles / cpd) + 1  # +1 day safety buffer
-
-
-def load_market_data(start: str = None, end: str = None) -> pd.DataFrame:
-    db_url = os.getenv("DATABASE_URL", "postgresql://localhost/forge_anchor")
-    if db_url.startswith("postgresql://") and "+psycopg2" not in db_url:
-        db_url = db_url.replace("postgresql://", "postgresql+psycopg2://", 1)
-    engine = create_engine(db_url)
-
-    conditions = []
-    if start:
-        conditions.append(f"timestamp >= '{start}'")
-    if end:
-        conditions.append(f"timestamp <= '{end} 23:59:59'")
-    where = (" WHERE " + " AND ".join(conditions)) if conditions else ""
-    query = f"SELECT timestamp AT TIME ZONE 'UTC' AS ts, open, high, low, close, volume FROM market_data{where} ORDER BY timestamp"
-
-    with engine.connect() as conn:
-        df = pd.read_sql(text(query), conn, parse_dates=["ts"])
-    df = df.rename(columns={"ts": "timestamp"}).set_index("timestamp")
-    return df
-
-
 def _run_slot(df: pd.DataFrame, signals: pd.Series, params: dict, slot: int,
               initial_capital: float = 10.0,
               maker_fee: float = MAKER_FEE, taker_fee: float = TAKER_FEE) -> list[dict]:
@@ -119,26 +45,33 @@ def _run_slot(df: pd.DataFrame, signals: pd.Series, params: dict, slot: int,
     max_hold = position.get("max_hold_candles")
     partial = position.get("partial_exit")
 
+    # compound=False (default) matches live -- src/live/order_manager.py sizes
+    # every entry from the stream's fixed lot_size_usd, never adjusted by past
+    # P&L. Silently reinvesting realized pnl into the next entry's size here
+    # (the old, unconditional behavior) made backtest quietly diverge from
+    # live for every model using this mode -- undetected because no
+    # live-replay harness covers this slot mode (only blended does). See
+    # HANDOFF.md for the discovery.
+    compound = position.get("compound", False)
+    available_capital = initial_capital  # only grows/shrinks if compound=True
+
     trades = []
     open_trade = None
     pending_entry = None  # (limit_price, candles_remaining, capital)
-    slot_capital = initial_capital
+
+    def _open(ts, price, capital):
+        return {
+            "entry_ts": ts, "entry_price": price, "highest_close": price,
+            "lowest_low": price, "highest_high": price, "candles_held": 0,
+            "partial_done": False, "capital": capital,
+        }
 
     for i, (ts, row) in enumerate(df.iterrows()):
         # --- attempt pending limit fill ---
         if pending_entry and open_trade is None:
             limit_price, ttl, entry_capital = pending_entry
             if row["low"] <= limit_price <= row["high"]:
-                open_trade = {
-                    "entry_ts": ts,
-                    "entry_price": limit_price,
-                    "highest_close": limit_price,
-                    "lowest_low": limit_price,
-                    "highest_high": limit_price,
-                    "candles_held": 0,
-                    "partial_done": False,
-                    "capital": entry_capital,
-                }
+                open_trade = _open(ts, limit_price, entry_capital)
                 pending_entry = None
             else:
                 ttl -= 1
@@ -211,7 +144,18 @@ def _run_slot(df: pd.DataFrame, signals: pd.Series, params: dict, slot: int,
                     exit_price = take_profit_price
                     exit_reason = "take_profit"
                 elif row["low"] <= stop_price:
-                    exit_price = stop_price
+                    # Model 1's real live order_manager.py places an unconditional
+                    # MARKET sell once triggered (a deliberate choice -- see plan
+                    # notes -- a real stop-loss should guarantee execution, not rest
+                    # as an unfilled limit). A market sell doesn't get to choose its
+                    # price: if the whole candle kept falling past the trigger, real
+                    # execution lands closer to the close, not at the idealized
+                    # trigger level -- crediting stop_price outright regardless of
+                    # where the candle actually ended is the same "unreachable
+                    # price" optimism found (and fixed differently, via a real
+                    # limit order) in the blended engine. min() here never assumes
+                    # a fill better than the candle's own close.
+                    exit_price = min(stop_price, row["close"])
                     # distinguish which stop fired
                     if hard_stop and stop_price <= hard_stop:
                         exit_reason = "stop_loss"
@@ -237,12 +181,25 @@ def _run_slot(df: pd.DataFrame, signals: pd.Series, params: dict, slot: int,
                         "mfe_pct":       (open_trade["highest_high"] - ep) / ep * 100,
                     })
                     open_trade = None
-                    slot_capital += pnl
+                    if compound:
+                        available_capital += pnl
 
         # --- check for new signal ---
-        if open_trade is None and pending_entry is None and signals.iloc[i] and slot_capital > 0.01:
+        entry_capital = available_capital if compound else initial_capital
+        if open_trade is None and pending_entry is None and signals.iloc[i] and entry_capital > 0.01:
             limit_price = row["close"]
-            pending_entry = (limit_price, expiry, slot_capital)
+            # Real production checks a freshly placed order for a fill in the
+            # SAME tick it's placed (see blended_executor.tick()) -- a limit
+            # buy AT the current price trivially sits inside this candle's own
+            # [low, high] range, so it fills immediately in reality, not a
+            # full candle later. Deferring this check to the NEXT iteration
+            # (the old behavior) imposed an artificial one-tick delay on every
+            # entry -- confirmed as a real cause of backtest/live divergence
+            # via live-replay (see HANDOFF.md).
+            if row["low"] <= limit_price <= row["high"]:
+                open_trade = _open(ts, limit_price, entry_capital)
+            else:
+                pending_entry = (limit_price, expiry, entry_capital)
 
     # close any open trade at end of data
     if open_trade:
@@ -335,18 +292,24 @@ def _run_staggered_slots(
     gap = int(slots_conf.get("slot_entry_gap_candles", 0))
     weights = slots_conf.get("slot_capital_weight")
 
-    if weights and len(weights) >= slot_count:
-        total_w = sum(weights[:slot_count])
-        slot_capitals = [total_capital * w / total_w for w in weights[:slot_count]]
-    else:
-        slot_capitals = [total_capital / slot_count] * slot_count
+    fixed_slot_capitals = slot_capitals_for(total_capital, weights, slot_count)
+
+    # compound=False (default) matches live -- src/live/order_manager.py sizes
+    # every entry from the stream's fixed lot_size_usd, never adjusted by past
+    # P&L. See the matching comment in _run_slot for why this must default
+    # off. compound=True shares one pool across all slots (same mechanism
+    # _run_blended_slots already uses), recomputed fresh at every new entry --
+    # not each slot silently reinvesting only its own history.
+    compound = (params.get("position") or {}).get("compound", False)
+    available_capital = total_capital
 
     slots = [
         {
+            "idx":              i,
             "slot_number":      i + 1,
             "open_trade":       None,
             "pending_entry":    None,
-            "capital":          slot_capitals[i],
+            "capital":          fixed_slot_capitals[i],
             "last_freed_candle": -1,   # -1 = never occupied; sorts to front (longest free)
             "last_entry_candle": -1,
         }
@@ -364,17 +327,18 @@ def _run_staggered_slots(
     partial_conf = position.get("partial_exit")
     last_global_entry = -1
 
+    def _open(ts, price, capital):
+        return {"entry_ts": ts, "entry_price": price, "highest_close": price,
+                "lowest_low": price, "highest_high": price, "candles_held": 0,
+                "partial_done": False, "capital": capital}
+
     for i, (ts, row) in enumerate(df.iterrows()):
         for slot in slots:
             # attempt pending fill
             if slot["pending_entry"] and slot["open_trade"] is None:
                 lp, ttl, cap = slot["pending_entry"]
                 if row["low"] <= lp <= row["high"]:
-                    slot["open_trade"] = {
-                        "entry_ts": ts, "entry_price": lp,
-                        "highest_close": lp, "lowest_low": lp, "highest_high": lp,
-                        "candles_held": 0, "partial_done": False, "capital": cap,
-                    }
+                    slot["open_trade"] = _open(ts, lp, cap)
                     slot["pending_entry"] = None
                 else:
                     ttl -= 1
@@ -424,7 +388,11 @@ def _run_staggered_slots(
                     if max_hold and t["candles_held"] >= max_hold:
                         exit_price, exit_reason = row["close"], "max_hold"
                     elif row["low"] <= stop_price:
-                        exit_price = stop_price
+                        # Same "never assume a fill better than the candle's own
+                        # close" fix as _run_slot (engine.py) — a real market sell
+                        # can't land at the idealized trigger if the candle blew
+                        # through it.
+                        exit_price = min(stop_price, row["close"])
                         if hard_stop and stop_price <= hard_stop:
                             exit_reason = "stop_loss"
                         else:
@@ -448,21 +416,34 @@ def _run_staggered_slots(
                             "mae_pct":       (ep - t["lowest_low"])  / ep * 100,
                             "mfe_pct":       (t["highest_high"] - ep) / ep * 100,
                         })
-                        slot["capital"] += pnl
+                        if compound:
+                            available_capital += pnl
                         slot["open_trade"] = None
                         slot["last_freed_candle"] = i
 
         # dispatch signal to longest-free slot (gap enforced globally)
         if signals.iloc[i] and (gap == 0 or (i - last_global_entry) >= gap):
+            # compound=True recomputes every slot's share fresh off the current
+            # shared pool at dispatch time (matches _run_blended_slots); False
+            # keeps each slot pinned to its original fixed split forever.
+            entry_capitals = slot_capitals_for(available_capital, weights, slot_count) if compound else fixed_slot_capitals
             free_slots = sorted(
                 [s for s in slots
                  if s["open_trade"] is None and s["pending_entry"] is None
-                 and s["capital"] > 0.01],
+                 and entry_capitals[s["idx"]] > 0.01],
                 key=lambda s: s["last_freed_candle"],
             )
             if free_slots:
                 chosen = free_slots[0]
-                chosen["pending_entry"] = (row["close"], expiry, chosen["capital"])
+                chosen["capital"] = entry_capitals[chosen["idx"]]
+                # Same-tick fill check -- see _run_slot's identical comment:
+                # a limit buy AT the current close trivially sits inside this
+                # candle's own range, so it fills immediately in reality, not
+                # a full candle later (the old, backtest-only behavior).
+                if row["low"] <= row["close"] <= row["high"]:
+                    chosen["open_trade"] = _open(ts, row["close"], chosen["capital"])
+                else:
+                    chosen["pending_entry"] = (row["close"], expiry, chosen["capital"])
                 chosen["last_entry_candle"] = i
                 last_global_entry = i
 
@@ -530,11 +511,14 @@ def _run_cascade_slots(
     max_hold        = position.get("max_hold_candles")
 
     weights = (params.get("slots") or {}).get("slot_capital_weight")
-    if weights and len(weights) >= slot_count:
-        total_w = sum(weights[:slot_count])
-        slot_capitals = [total_capital * w / total_w for w in weights[:slot_count]]
-    else:
-        slot_capitals = [total_capital / slot_count] * slot_count
+    fixed_slot_capitals = slot_capitals_for(total_capital, weights, slot_count)
+
+    # compound=False (default) matches live -- see the matching comment in
+    # _run_slot for why this must default off. compound=True shares one pool
+    # across all slots, recomputed fresh at every fill (same mechanism
+    # _run_blended_slots and _run_staggered_slots use).
+    compound = position.get("compound", False)
+    available_capital = total_capital
 
     slots = [
         {
@@ -542,13 +526,40 @@ def _run_cascade_slots(
             "slot_number":      i + 1,
             "open_trade":       None,
             "pending_entry":    None,
-            "capital":          slot_capitals[i],
+            "capital":          fixed_slot_capitals[i],
             "cascade_trigger":  None,   # price level that auto-fires this slot
         }
         for i in range(slot_count)
     ]
 
     all_trades = []
+
+    def _entry_capital(idx):
+        if compound:
+            return slot_capitals_for(available_capital, weights, slot_count)[idx]
+        return fixed_slot_capitals[idx]
+
+    def _fill(slot, ts, price, capital):
+        """Open a slot's trade and apply the same side effects a fill always
+        triggers (arm the next slot's cascade trigger, arm the previous
+        slot's ladder stop) -- shared so a same-tick fill (see sections 2/3
+        below) behaves identically to one discovered on a later tick."""
+        slot["open_trade"] = {
+            "entry_ts": ts, "entry_price": price, "highest_close": price,
+            "lowest_low": price, "highest_high": price,
+            "candles_held": 0, "capital": capital,
+        }
+        slot["pending_entry"] = None
+        nxt = slot["idx"] + 1
+        if nxt < slot_count:
+            slots[nxt]["cascade_trigger"] = price * (1 - cascade_drop)
+        if ladder_buffer_pct:
+            prev_idx = slot["idx"] - 1
+            if prev_idx >= 0 and slots[prev_idx]["open_trade"] is not None:
+                pt = slots[prev_idx]["open_trade"]
+                if not pt.get("ladder_armed"):
+                    pt["ladder_armed"] = True
+                    pt["ladder_peak"]  = price
 
     for i, (ts, row) in enumerate(df.iterrows()):
 
@@ -558,28 +569,7 @@ def _run_cascade_slots(
             if slot["pending_entry"] and slot["open_trade"] is None:
                 lp, ttl, cap = slot["pending_entry"]
                 if row["low"] <= lp <= row["high"]:
-                    slot["open_trade"] = {
-                        "entry_ts":     ts,
-                        "entry_price":  lp,
-                        "highest_close": lp,
-                        "lowest_low":   lp,
-                        "highest_high": lp,
-                        "candles_held": 0,
-                        "capital":      cap,
-                    }
-                    slot["pending_entry"] = None
-                    # arm the cascade trigger for the next slot
-                    nxt = slot["idx"] + 1
-                    if nxt < slot_count:
-                        slots[nxt]["cascade_trigger"] = lp * (1 - cascade_drop)
-                    # arm the ladder stop on the previous (shallower) slot, if still open
-                    if ladder_buffer_pct:
-                        prev_idx = slot["idx"] - 1
-                        if prev_idx >= 0 and slots[prev_idx]["open_trade"] is not None:
-                            pt = slots[prev_idx]["open_trade"]
-                            if not pt.get("ladder_armed"):
-                                pt["ladder_armed"] = True
-                                pt["ladder_peak"]  = lp
+                    _fill(slot, ts, lp, cap)
                 else:
                     ttl -= 1
                     slot["pending_entry"] = (lp, ttl, cap) if ttl > 0 else None
@@ -630,7 +620,11 @@ def _run_cascade_slots(
                     if max_hold and t["candles_held"] >= max_hold:
                         exit_price, exit_reason = row["close"], "max_hold"
                     elif stop_price is not None and row["low"] <= stop_price:
-                        exit_price = stop_price
+                        # Same "never assume a fill better than the candle's own
+                        # close" fix as _run_slot (engine.py) — a real market sell
+                        # can't land at the idealized trigger if the candle blew
+                        # through it.
+                        exit_price = min(stop_price, row["close"])
                         if hard_stop is not None and stop_price == hard_stop:
                             exit_reason = "stop_loss"
                         elif ladder_stop is not None and stop_price == ladder_stop:
@@ -656,7 +650,8 @@ def _run_cascade_slots(
                             "mae_pct":       (ep - t["lowest_low"])  / ep * 100,
                             "mfe_pct":       (t["highest_high"] - ep) / ep * 100,
                         })
-                        slot["capital"]    += pnl
+                        if compound:
+                            available_capital += pnl
                         slot["open_trade"]  = None
                         # disarm cascade trigger for the next slot
                         nxt = slot["idx"] + 1
@@ -664,25 +659,38 @@ def _run_cascade_slots(
                             slots[nxt]["cascade_trigger"] = None
 
         # ── 2. Slot 0: base signal entry ─────────────────────────────────────
+        # Same-tick fill check -- see _run_slot's identical comment: a limit
+        # buy AT the current close trivially sits inside this candle's own
+        # range, so it fills immediately in reality, not a full candle later.
         s0 = slots[0]
+        s0_capital = _entry_capital(0)
         if (signals.iloc[i]
                 and s0["open_trade"] is None
                 and s0["pending_entry"] is None
-                and s0["capital"] > 0.01):
-            s0["pending_entry"] = (row["close"], expiry, s0["capital"])
+                and s0_capital > 0.01):
+            s0["capital"] = s0_capital
+            if row["low"] <= row["close"] <= row["high"]:
+                _fill(s0, ts, row["close"], s0["capital"])
+            else:
+                s0["pending_entry"] = (row["close"], expiry, s0["capital"])
 
         # ── 3. Slots 1+: cascade trigger check ───────────────────────────────
         for idx in range(1, slot_count):
             slot      = slots[idx]
             prev_slot = slots[idx - 1]
+            slot_capital = _entry_capital(idx)
             if (slot["cascade_trigger"] is not None
                     and prev_slot["open_trade"] is not None   # anchor must still be open
                     and slot["open_trade"] is None
                     and slot["pending_entry"] is None
-                    and slot["capital"] > 0.01
+                    and slot_capital > 0.01
                     and row["close"] <= slot["cascade_trigger"]):
-                slot["pending_entry"]   = (row["close"], expiry, slot["capital"])
                 slot["cascade_trigger"] = None  # consumed; will re-arm on fill
+                slot["capital"] = slot_capital
+                if row["low"] <= row["close"] <= row["high"]:
+                    _fill(slot, ts, row["close"], slot["capital"])
+                else:
+                    slot["pending_entry"] = (row["close"], expiry, slot["capital"])
 
     # ── Close any open trades at end of data ─────────────────────────────────
     for slot in slots:
@@ -708,81 +716,6 @@ def _run_cascade_slots(
             })
 
     return all_trades
-
-
-def _tilted_slot_weights(base_weights: list, row: pd.Series, tilt_cfg: dict, slot_count: int) -> list:
-    """
-    Experimental: skew slot_capital_weight based on the Fear & Greed reading at
-    the moment a position opens (locked in for that whole cascade, not
-    re-evaluated per fill).
-
-    tilt_cfg:
-      direction: +1 = front-load fear (bet bigger, earlier, on more extreme
-                 fear readings); -1 = back-load fear (reserve capital for
-                 later slots on more extreme fear readings, betting more pain
-                 may be coming). Backtested: -1 (back-load) clearly wins.
-      strength:  0 = no skew (falls back to base_weights); higher = more
-                 aggressive skew. Backtested sweep across 0.2-0.8: 0.4 is the
-                 real peak (0.3-0.4 the sweet spot) -- decays on both sides,
-                 not "more is better."
-      apply_to_slot1: if False (default), slot 1 stays at its base weight and
-                 only slots 2..N are skewed relative to each other -- keeps
-                 the entry itself simple/unconditional. If True, slot 1 is
-                 included in the skew too.
-      trend_sma_period: optional. If set (and filters.trend_context.sma_period
-                 matches, so the column actually gets computed), scales
-                 `strength` by trend_strength_below/trend_strength_above
-                 depending on whether close is below/above that SMA at entry
-                 -- e.g. lean into the tilt harder in a confirmed downtrend
-                 (more room to fall, back-loading matters more) and dampen it
-                 in an uptrend (a dip is more likely shallow).
-      trend_strength_below / trend_strength_above: multipliers on `strength`,
-                 default 1.0 each (no trend adjustment) if trend_sma_period unset.
-
-    fng_value 50 (neutral) always reduces to base_weights regardless of
-    strength; 0 (extreme fear) / 100 (extreme greed) are the max skew.
-    """
-    fng_value = row.get("fng_value")
-    if not tilt_cfg or fng_value is None or (isinstance(fng_value, float) and pd.isna(fng_value)):
-        return base_weights
-
-    direction = tilt_cfg.get("direction", 1)
-    strength  = tilt_cfg.get("strength", 0.4)
-    apply_to_slot1 = tilt_cfg.get("apply_to_slot1", False)
-
-    trend_period = tilt_cfg.get("trend_sma_period")
-    if trend_period:
-        trend_val = row.get(f"trend_sma_{trend_period}")
-        if trend_val is not None and not pd.isna(trend_val):
-            below = row["close"] < trend_val
-            mult = tilt_cfg.get("trend_strength_below", 1.0) if below else tilt_cfg.get("trend_strength_above", 1.0)
-            strength *= mult
-
-    tilt = direction * (50 - fng_value) / 50.0  # + on fear, - on greed (direction can flip this)
-
-    start_idx = 0 if apply_to_slot1 else 1
-    n = slot_count - start_idx
-    if n <= 0:
-        return base_weights
-
-    # symmetric ramp: the earliest affected slot gets the most positive skew,
-    # the latest the most negative, centered on zero so total weight units
-    # shift between slots rather than growing/shrinking outright.
-    ramp = [(n - 1) / 2.0 - j for j in range(n)]
-
-    # Floor: 0.5x a $20 base weight = $10, CLAUDE.md's stated minimum lot size
-    # (Kraken order minimums + round-trip fee drag make anything smaller
-    # impractical). Only exact for the $20/slot base this was tuned against --
-    # a differently-sized base weight would need a different floor to hold the
-    # same real $10 minimum.
-    min_factor = tilt_cfg.get("min_factor", 0.5)
-
-    new_weights = list(base_weights[:slot_count])
-    for j, idx in enumerate(range(start_idx, slot_count)):
-        factor = 1 + strength * tilt * ramp[j]
-        factor = max(factor, min_factor)
-        new_weights[idx] = base_weights[idx] * factor
-    return new_weights
 
 
 def _run_blended_slots(
@@ -825,7 +758,7 @@ def _run_blended_slots(
     a smaller bounce-triggered exit instead of a single line.
 
     Optional sentiment-tilted slot weighting (position["sentiment_tilt"], see
-    _tilted_slot_weights), slot promotion for stagnant positions
+    tilted_slot_weights in slot_math.py), slot promotion for stagnant positions
     (slot_promotion_days / max_promotions_per_position), and a shallow
     breakeven margin (shallow_breakeven_margin_pct / shallow_slot_threshold)
     that converts an exact-breakeven exit into a small guaranteed gain.
@@ -877,7 +810,7 @@ def _run_blended_slots(
     weights = (params.get("slots") or {}).get("slot_capital_weight")
     base_weights = weights if weights and len(weights) >= slot_count else [1] * slot_count
     compound = position.get("compound", False)
-    sentiment_tilt = position.get("sentiment_tilt")  # see _tilted_slot_weights; requires params["sentiment"]=True
+    sentiment_tilt = position.get("sentiment_tilt")  # see slot_math.tilted_slot_weights; requires params["sentiment"]=True
 
     available_capital = total_capital  # grows/shrinks as positions close, if compound=True
     slot_capitals = slot_capitals_for(available_capital, weights, slot_count)  # this position's frozen split
@@ -896,6 +829,9 @@ def _run_blended_slots(
     marked_count = 0           # ladder only: how many (oldest-first) slots have been marked down
     marked_capitals = []       # ladder only: parallel to fills, real capital until marked
     promotions_used = 0        # slot_promotion_days only: promoted fills used by this position
+    ever_armed = False         # once true, stays true for the life of this position -- see armed
+                                # gate below: freezes composition (no more cascade adds) and makes
+                                # capitulation permanently unreachable (arming always wins)
 
     def total_qty():
         return sum(q for _, _, q, _ in fills)
@@ -965,7 +901,16 @@ def _run_blended_slots(
                 synthetic_avg = sum(marked_capitals) / total_qty()
 
             gain_pct = (highest_close - synthetic_avg) / synthetic_avg * 100
-            armed = (not trail_arm_gain_pct) or gain_pct >= trail_arm_gain_pct
+            armed_now = (not trail_arm_gain_pct) or gain_pct >= trail_arm_gain_pct
+            # Persisted once true, never reset (mathematically one-directional anyway --
+            # HWM never falls and every new fill only lowers avg cost, which only
+            # raises gain_pct). Arming does NOT stop cascade adds -- a resting buy
+            # (next add, lower) and a resting sell (exit, higher) aren't in conflict,
+            # and each new add only lowers the exit floor (more achievable), never
+            # raises it. The one thing arming permanently disables is capitulation --
+            # see the gate below.
+            ever_armed = ever_armed or armed_now
+            armed = ever_armed
 
             effective_trail_pct = trail_pct
             stop_price = None
@@ -984,12 +929,16 @@ def _run_blended_slots(
             # more room to average down), a further drop forces a full exit instead of
             # holding indefinitely into the unknown. Ladder mode reaches this one step
             # past the last slot being marked; legacy mode is a single fixed line.
+            # Permanently unreachable once armed -- a position that has proven it can
+            # arm (a real profit floor exists) never gets forced into this deliberate
+            # loss-taking backstop, which exists to protect positions that never did.
             capitulation_price = None
-            if ladder_enabled and len(fills) == slot_count and marked_count == slot_count:
-                capitulation_price = original_entry_price * (1 - ladder_final_cut_pct / 100.0)
-            elif capitulation_stop_pct and len(fills) == slot_count:
-                last_fill_price = fills[-1][0]
-                capitulation_price = last_fill_price * (1 - capitulation_stop_pct / 100.0)
+            if not armed:
+                if ladder_enabled and len(fills) == slot_count and marked_count == slot_count:
+                    capitulation_price = original_entry_price * (1 - ladder_final_cut_pct / 100.0)
+                elif capitulation_stop_pct and len(fills) == slot_count:
+                    last_fill_price = fills[-1][0]
+                    capitulation_price = last_fill_price * (1 - capitulation_stop_pct / 100.0)
 
             exit_reason_override = None
             effective_stop = stop_price
@@ -1000,7 +949,21 @@ def _run_blended_slots(
                     effective_stop = capitulation_price
                     exit_reason_override = "capitulation_ladder_cut" if ladder_enabled else "capitulation_stop"
 
-            if effective_stop is not None and row["low"] <= effective_stop:
+            # Capitulation is a deliberate, forced cut -- modeled as a guaranteed
+            # (market-style) fill, same as it is live, so only a low-touch is needed.
+            # The armed/trailing-stop path is modeled as a real resting limit order
+            # (see place_exit's live counterpart), so it needs the SAME two-sided
+            # touch check every entry/add fill already uses below -- crediting a fill
+            # at a price the candle's high never actually reached is exactly the bug
+            # that let the backtest look far rosier than live replay ever could.
+            is_capitulation = exit_reason_override is not None
+            touched = (
+                (effective_stop is not None and row["low"] <= effective_stop)
+                if is_capitulation else
+                (effective_stop is not None and row["low"] <= effective_stop <= row["high"])
+            )
+
+            if touched:
                 exit_price = effective_stop
                 gross = total_qty() * exit_price
                 pnl   = gross * (1 - taker_fee) - total_deployed()
@@ -1028,10 +991,14 @@ def _run_blended_slots(
                 marked_count = 0
                 marked_capitals = []
                 promotions_used = 0
+                ever_armed = False
                 if compound:
                     available_capital += pnl
             else:
-                # arm the next cascade add as a limit order (not an instant fill) --
+                # Cascade adds keep working the same whether armed or not -- a new,
+                # cheaper fill only lowers the exit floor (avg cost drops), it never
+                # raises it, so there's no conflict with an already-armed exit target.
+                # Arm the next cascade add as a limit order (not an instant fill) --
                 # it still has to actually get touched within `expiry` candles, same as slot 1
                 next_idx = len(fills)  # number filled so far == index of the next add
                 if next_idx < slot_count and (next_idx - 1) < len(cumulative_drops) and pending_add is None:
@@ -1045,19 +1012,49 @@ def _run_blended_slots(
                             promotions_used += 1
                     trigger_price = original_entry_price * (1 - trigger_pct / 100.0)
                     if row["close"] <= trigger_price and slot_capitals[next_idx] > 0.01:
-                        pending_add = (row["close"], expiry, next_idx)
+                        lp = row["close"]
+                        # Same-tick fill check -- see _run_slot's identical
+                        # comment: a limit buy AT the current close trivially
+                        # sits inside this candle's own range, so it fills
+                        # immediately in reality, not a full candle later.
+                        if row["low"] <= lp <= row["high"]:
+                            qty = (slot_capitals[next_idx] * (1 - maker_fee)) / lp
+                            fills.append((lp, slot_capitals[next_idx], qty, ts))
+                        else:
+                            pending_add = (lp, expiry, next_idx)
 
         # --- slot 1: base signal entry ---
         if not position_open and pending_entry is None and signals.iloc[i]:
             if compound or sentiment_tilt:
                 capital_base = available_capital if compound else total_capital
-                effective_weights = (
-                    _tilted_slot_weights(base_weights, row, sentiment_tilt, slot_count)
-                    if sentiment_tilt else weights
-                )
+                if sentiment_tilt:
+                    fng_value = row.get("fng_value")
+                    if isinstance(fng_value, float) and pd.isna(fng_value):
+                        fng_value = None
+                    trend_period = sentiment_tilt.get("trend_sma_period")
+                    trend_val = row.get(f"trend_sma_{trend_period}") if trend_period else None
+                    if isinstance(trend_val, float) and pd.isna(trend_val):
+                        trend_val = None
+                    effective_weights = tilted_slot_weights(
+                        base_weights, fng_value, sentiment_tilt, slot_count,
+                        trend_val=trend_val, close=row["close"],
+                    )
+                else:
+                    effective_weights = weights
                 slot_capitals = slot_capitals_for(capital_base, effective_weights, slot_count)
             if slot_capitals[0] > 0.01:
-                pending_entry = (row["close"], expiry)
+                lp = row["close"]
+                # Same-tick fill check -- see _run_slot's identical comment.
+                if row["low"] <= lp <= row["high"]:
+                    qty = (slot_capitals[0] * (1 - maker_fee)) / lp
+                    fills = [(lp, slot_capitals[0], qty, ts)]
+                    position_open = True
+                    original_entry_price = lp
+                    highest_close = lp
+                    entry_ts = ts
+                    candles_held = 0
+                else:
+                    pending_entry = (lp, expiry)
 
     # close an open position at end of data
     if position_open:

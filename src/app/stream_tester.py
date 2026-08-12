@@ -17,6 +17,7 @@ from src.app.db import (
 )
 from src.app.dashboard import render_dashboard
 from src.backtester.engine import run_backtest
+from src.backtester.live_replay_stream import run_live_replay_stream
 from src.backtester.metrics import compute_metrics, btc_buy_and_hold
 
 st.set_page_config(layout="wide")
@@ -319,20 +320,49 @@ with st.sidebar:
 
 # ── Run All Presets ──────────────────────────────────────────────────────────
 
-def _run_and_save(cfg: dict, preset: dict, initial_capital: float = None) -> dict:
-    """Run one backtest for a stream config + preset, save to DB, return the payload."""
+def _run_and_save(cfg: dict, preset: dict, initial_capital: float = None, progress_cb=None) -> dict:
+    """Run one backtest for a stream config + preset, save to DB, return the payload.
+
+    Runs through the real live order_manager/position_monitor code
+    (run_live_replay_stream) for single/staggered slot_mode -- the same
+    live-replay path docs/decisions/009 validated Model 1/2 against, instead
+    of engine.py's independent simulation. Slower (real DB-backed ticks, not
+    vectorized -- can take tens of seconds to a few minutes depending on the
+    window) but the number this produces is provably what would actually
+    happen live, not an approximation of it.
+
+    blended/cascade/scale_down/scale_up have no live-replay path yet
+    (blended has its own separate tool, tools/live_replay/replay_gauntlet.py;
+    cascade's live parity was built and removed 2026-08-10 after a trade-
+    count mismatch was found and not resolved; scale_down/scale_up were
+    never built) -- those fall back to engine.py's run_backtest(), flagged
+    in the UI as not live-validated.
+    """
     if initial_capital is None:
         initial_capital = load_stream_test_capital(cfg["stream_config_id"], cfg["slot_mode"])
     p = cfg["params"]
-    result = run_backtest(
-        params       = p,
-        start        = str(preset["start_date"]),
-        end          = str(preset["end_date"]) if preset.get("end_date") else None,
-        slot_count   = cfg["slot_count"],
-        slot_mode    = cfg["slot_mode"],
-        stream_name  = cfg["stream_name"],
-        lot_size_usd = initial_capital,
-    )
+    live_replay_modes = ("single", "staggered")
+    if cfg["slot_mode"] in live_replay_modes:
+        result = run_live_replay_stream(
+            params       = p,
+            start        = str(preset["start_date"]),
+            end          = str(preset["end_date"]) if preset.get("end_date") else None,
+            slot_count   = cfg["slot_count"],
+            slot_mode    = cfg["slot_mode"],
+            stream_name  = cfg["stream_name"],
+            lot_size_usd = initial_capital,
+            progress_cb  = progress_cb,
+        )
+    else:
+        result = run_backtest(
+            params       = p,
+            start        = str(preset["start_date"]),
+            end          = str(preset["end_date"]) if preset.get("end_date") else None,
+            slot_count   = cfg["slot_count"],
+            slot_mode    = cfg["slot_mode"],
+            stream_name  = cfg["stream_name"],
+            lot_size_usd = initial_capital,
+        )
     metrics = compute_metrics(result["trades"], initial_capital, result["start"], result["end"])
     ending  = initial_capital + (metrics["total_pnl"] or 0)
     bh      = btc_buy_and_hold(result["df"], initial_capital)
@@ -343,6 +373,7 @@ def _run_and_save(cfg: dict, preset: dict, initial_capital: float = None) -> dic
     result_light = {k: v for k, v in result.items() if k != "df"}
     result_light["signals"] = int(result["signals"].sum())
 
+    source = "live_replay" if cfg["slot_mode"] in live_replay_modes else "engine_backtest"
     payload = {
         "stream_name":      cfg["stream_name"],
         "stream_config_id": cfg["stream_config_id"],
@@ -356,6 +387,7 @@ def _run_and_save(cfg: dict, preset: dict, initial_capital: float = None) -> dic
         "slot_count":       cfg["slot_count"],
         "slot_mode":        cfg["slot_mode"],
         "lot_size_usd":     initial_capital,
+        "source":           source,
     }
     save_stream_test(
         stream_config_id = cfg["stream_config_id"],
@@ -366,6 +398,8 @@ def _run_and_save(cfg: dict, preset: dict, initial_capital: float = None) -> dic
         ending_balance   = ending,
         payload          = payload,
         preset_id        = preset["preset_id"],
+        notes            = "" if source == "live_replay" else
+                            "NOT live-validated -- engine.py fallback (slot_mode has no live-replay path)",
     )
     return payload
 
@@ -377,9 +411,10 @@ if run_all or rerun_all:
     else:
         progress = st.progress(0, text=f"Running {len(to_run)} preset(s)…")
         for i, preset in enumerate(to_run):
-            progress.progress(i / len(to_run), text=f"Running {preset['name']}…")
+            def _tick(t, total, i=i, preset=preset):
+                progress.progress(i / len(to_run), text=f"Running {preset['name']}… (candle {t}/{total})")
             try:
-                _run_and_save(selected_config, preset)
+                _run_and_save(selected_config, preset, progress_cb=_tick)
             except Exception as e:
                 st.error(f"Failed on {preset['name']}: {e}")
         progress.progress(1.0, text="Done.")
@@ -443,6 +478,12 @@ if existing is not None:
     payload = load_run_payload(test_id)
 
     if payload is not None:
+        if payload.get("source") == "engine_backtest":
+            st.warning(
+                f"⚠️ NOT live-validated — `{payload.get('slot_mode')}` has no live-replay path yet, "
+                "this ran through engine.py's simulation, not the real order_manager code. "
+                "Don't trust this number for a deployment decision (see docs/decisions/009)."
+            )
         render_dashboard(payload, show_save=False,
                          key_prefix=f"cfg_{selected_config_id}_t{test_id}")
         if entry["type"] == "preset" and st.button(

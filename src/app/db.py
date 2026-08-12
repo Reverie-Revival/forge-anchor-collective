@@ -469,14 +469,22 @@ def load_last_model_run():
 
 
 @st.cache_data(ttl=60)
-def load_models() -> list:
-    """Return all model versions from backtest.models."""
+def load_models(include_archived: bool = False) -> list:
+    """Return model versions from backtest.models.
+
+    Archived models (discontinued attempts, e.g. Model 3/4 -- see
+    project_db_declutter memory) are excluded by default so they don't
+    clutter the active model selectors. Pass include_archived=True to see
+    them (historical reference only -- their version numbers are retired,
+    not meant to be reused).
+    """
     try:
+        where = "" if include_archived else "WHERE status != 'archived'"
         with get_local_engine().connect() as conn:
             rows = conn.execute(text(
-                "SELECT model_id, model_version, description FROM backtest.models ORDER BY model_id"
+                f"SELECT model_id, model_version, status, description FROM backtest.models {where} ORDER BY model_id"
             )).fetchall()
-        return [{"model_id": r[0], "model_version": r[1], "description": r[2]} for r in rows]
+        return [{"model_id": r[0], "model_version": r[1], "status": r[2], "description": r[3]} for r in rows]
     except Exception:
         return []
 
@@ -1010,6 +1018,93 @@ def save_model_test(
         pending.unlink()
 
     return model_test_id, run_num
+
+
+def save_bucket_test(model_id: int, preset_id: int, result: dict, notes: str = "") -> int:
+    """
+    Save (or replace) a run_pooled_model_backtest() result -- backtest.bucket_tests,
+    migration v11. Dedup key: (model_id, preset_id), same upsert pattern as
+    save_model_test. Lets Model Tester's BTC Bucket section persist across
+    page reloads instead of needing a re-run every time.
+    """
+    engine = get_local_engine()
+    b = result["bucket"]
+    vals = {
+        "model_id":            model_id,
+        "preset_id":           preset_id,
+        "baseline_total":      result["baseline_total"],
+        "final_pool_balance":  result["final_pool_balance"],
+        "total_skimmed":       b["total_skimmed"],
+        "bucket_cash":         b["bucket_cash"],
+        "tracked_qty":         b["tracked_qty"],
+        "tracked_cost_basis":  b["tracked_cost_basis"],
+        "house_money_qty":     b["house_money_qty"],
+        "final_price":         b["final_price"],
+        "final_btc_value":     b["final_btc_value"],
+        "total_holdings_value": b["total_holdings_value"],
+        "combined_ending":     result["combined_ending"],
+        "skipped_entries":     result["skipped_entries"],
+        "hard_floor":          result["hard_floor"],
+        "halted_at":           result["halted_at"] if result["halted_at"] not in (None, "start") else None,
+        "bucket_events":       json.dumps(
+            [{**e, "ts": str(e["ts"])} for e in b["events"]]
+        ),
+        "notes":               notes,
+    }
+    with engine.connect() as conn:
+        existing = conn.execute(text("""
+            SELECT bucket_test_id FROM backtest.bucket_tests
+            WHERE model_id = :model_id AND preset_id = :preset_id
+        """), vals).fetchone()
+
+        if existing:
+            bucket_test_id = existing[0]
+            conn.execute(text("""
+                UPDATE backtest.bucket_tests SET
+                    baseline_total = :baseline_total, final_pool_balance = :final_pool_balance,
+                    total_skimmed = :total_skimmed, bucket_cash = :bucket_cash,
+                    tracked_qty = :tracked_qty, tracked_cost_basis = :tracked_cost_basis,
+                    house_money_qty = :house_money_qty, final_price = :final_price,
+                    final_btc_value = :final_btc_value, total_holdings_value = :total_holdings_value,
+                    combined_ending = :combined_ending, skipped_entries = :skipped_entries,
+                    hard_floor = :hard_floor, halted_at = :halted_at,
+                    bucket_events = CAST(:bucket_events AS jsonb), notes = :notes, created_at = NOW()
+                WHERE bucket_test_id = :bucket_test_id
+            """), {**vals, "bucket_test_id": bucket_test_id})
+        else:
+            row = conn.execute(text("""
+                INSERT INTO backtest.bucket_tests (
+                    model_id, preset_id, baseline_total, final_pool_balance,
+                    total_skimmed, bucket_cash, tracked_qty, tracked_cost_basis,
+                    house_money_qty, final_price, final_btc_value, total_holdings_value,
+                    combined_ending, skipped_entries, hard_floor, halted_at, bucket_events, notes
+                ) VALUES (
+                    :model_id, :preset_id, :baseline_total, :final_pool_balance,
+                    :total_skimmed, :bucket_cash, :tracked_qty, :tracked_cost_basis,
+                    :house_money_qty, :final_price, :final_btc_value, :total_holdings_value,
+                    :combined_ending, :skipped_entries, :hard_floor, :halted_at,
+                    CAST(:bucket_events AS jsonb), :notes
+                ) RETURNING bucket_test_id
+            """), vals)
+            bucket_test_id = row.scalar()
+        conn.commit()
+    return bucket_test_id
+
+
+@st.cache_data(ttl=60)
+def load_bucket_tests(model_id: int) -> pd.DataFrame:
+    """All saved BTC-bucket test results for a model, newest preset first."""
+    try:
+        with get_local_engine().connect() as conn:
+            return pd.read_sql(text("""
+                SELECT bt.*, tp.name AS preset_name
+                FROM backtest.bucket_tests bt
+                LEFT JOIN timeframe_presets tp ON tp.preset_id = bt.preset_id
+                WHERE bt.model_id = :mid
+                ORDER BY bt.preset_id
+            """), conn, params={"mid": model_id})
+    except Exception:
+        return pd.DataFrame()
 
 
 def _save_lots(conn, model_test_id: int, model_id: int, stream_results: list):

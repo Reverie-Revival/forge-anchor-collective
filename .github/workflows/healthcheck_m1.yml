@@ -1,10 +1,10 @@
-name: Market Data Updater
+name: Executor Healthcheck — Model 1
 
 on:
   workflow_dispatch:
 
 jobs:
-  update:
+  check:
     runs-on: ubuntu-latest
     timeout-minutes: 3
 
@@ -21,12 +21,11 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Fetch and upsert latest candles
+      - name: Check Model 1 executor heartbeat
         env:
           DATABASE_URL: ${{ secrets.SUPABASE_DATABASE_URL }}
-        run: python -m src.live.market_data_updater
-
-      - name: Update Fear & Greed sentiment (no-op if already current)
-        env:
-          DATABASE_URL: ${{ secrets.SUPABASE_DATABASE_URL }}
-        run: python -m src.data.sentiment
+          ALERT_FROM_EMAIL: ${{ secrets.ALERT_FROM_EMAIL }}
+          ALERT_APP_PASSWORD: ${{ secrets.ALERT_APP_PASSWORD }}
+          ALERT_TO_EMAIL: ${{ secrets.ALERT_TO_EMAIL }}
+          ALERT_TO_SMS: ${{ secrets.ALERT_TO_SMS }}
+        run: python -m src.live.healthcheck
