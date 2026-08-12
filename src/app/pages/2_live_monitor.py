@@ -192,6 +192,28 @@ def load_model_info(model_id):
 
 
 @st.cache_data(ttl=60)
+def load_deployed_models():
+    """Every active live.models row, for the model selector below -- data-
+    driven instead of a hardcoded dict so a newly deployed model (e.g.
+    Model 2, deploy_model2.py) shows up here without a code change."""
+    rows = _q("""
+        SELECT model_id, model_version
+        FROM live.models WHERE status = 'active' ORDER BY model_version
+    """)
+    return {int(r.model_id): f"Model {r.model_version}" for r in rows}
+
+
+@st.cache_data(ttl=60)
+def load_is_blended(model_id):
+    """True if this model uses the blended-DCA state machine (live.blended_*
+    tables) instead of plain live.lots -- deploy_model3.py is the only
+    deploy script that seeds live.blended_capital, so its presence is a
+    reliable per-model signal rather than hardcoding a specific model_id."""
+    rows = _q("SELECT 1 FROM live.blended_capital WHERE model_id = :mid", {"mid": model_id})
+    return len(rows) > 0
+
+
+@st.cache_data(ttl=60)
 def load_blended_positions(model_id, status):
     rows = _q("""
         SELECT bp.position_id, ls.stream_name, bp.status, bp.original_entry_price,
@@ -750,10 +772,13 @@ def _render_slot_ladder(open_positions, pending_positions, fills, blended_params
 
 # ── Model selector + refresh ─────────────────────────────────────────────────
 
-MODEL_LABELS = {1: "Model 1", 3: "Model 3"}
+MODEL_LABELS = load_deployed_models()
 
 col_select, col_refresh = st.columns([6, 1])
 with col_select:
+    if not MODEL_LABELS:
+        st.error("No active models found in live.models.")
+        st.stop()
     model_choice = st.radio(
         "Model", list(MODEL_LABELS.values()), horizontal=True, label_visibility="collapsed",
     )
@@ -763,7 +788,7 @@ with col_refresh:
         st.rerun()
 
 SELECTED_MODEL_ID = {v: k for k, v in MODEL_LABELS.items()}[model_choice]
-IS_BLENDED = SELECTED_MODEL_ID == 3   # Model 3 (Grid Stacker Blended) uses live.blended_* tables, not live.lots
+IS_BLENDED = load_is_blended(SELECTED_MODEL_ID)
 
 # ── Load all data ─────────────────────────────────────────────────────────────
 
