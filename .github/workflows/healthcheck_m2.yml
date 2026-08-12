@@ -1,4 +1,4 @@
-name: Executor Healthcheck — Model 3
+name: Executor Healthcheck — Model 2
 
 on:
   workflow_dispatch:
@@ -11,7 +11,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: live-model-3
+          ref: live-model-2
 
       - uses: actions/setup-python@v5
         with:
@@ -21,11 +21,12 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Check Model 3 executor heartbeat
+      - name: Check Model 2 executor heartbeat
         env:
           SUPABASE_DATABASE_URL: ${{ secrets.SUPABASE_DATABASE_URL }}
+          LIVE_MODEL_VERSION: "2"
           ALERT_FROM_EMAIL: ${{ secrets.ALERT_FROM_EMAIL }}
           ALERT_APP_PASSWORD: ${{ secrets.ALERT_APP_PASSWORD }}
           ALERT_TO_EMAIL: ${{ secrets.ALERT_TO_EMAIL }}
           ALERT_TO_SMS: ${{ secrets.ALERT_TO_SMS }}
-        run: python -m src.live.blended_healthcheck
+        run: python -m src.live.healthcheck
