@@ -78,6 +78,11 @@ class KrakenClient:
 
         Note: Kraken's QueryOrders can return empty for orders that filled
         immediately (taker fills). Falls back to TradesHistory to detect fills.
+        A single order can fill as multiple partial trades against different
+        resting counter-orders (confirmed live 2026-08-17: a $25 maker buy
+        filled as two trades, 0.00032317 + 0.00007097 BTC) — the fallback
+        aggregates every trade matching this ordertxid rather than returning
+        the first, or it silently under-reports the position.
         """
         resp = self._api.query_private("QueryOrders", {"txid": txid, "trades": True})
         if resp.get("error"):
@@ -86,19 +91,23 @@ class KrakenClient:
         if order:
             return order
 
-        # QueryOrders missed it — check TradesHistory for a matching fill
+        # QueryOrders missed it — check TradesHistory for matching fills
         resp2 = self._api.query_private("TradesHistory")
         if resp2.get("error"):
             return {}
-        for trade in resp2["result"].get("trades", {}).values():
-            if trade.get("ordertxid") == txid:
-                return {
-                    "status": "closed",
-                    "vol_exec": trade["vol"],
-                    "price": trade["price"],
-                    "fee": trade.get("fee", "0"),
-                }
-        return {}
+        matches = [t for t in resp2["result"].get("trades", {}).values()
+                   if t.get("ordertxid") == txid]
+        if not matches:
+            return {}
+        total_vol = sum(float(t["vol"]) for t in matches)
+        total_cost = sum(float(t["cost"]) for t in matches)
+        total_fee = sum(float(t["fee"]) for t in matches)
+        return {
+            "status": "closed",
+            "vol_exec": f"{total_vol:.8f}",
+            "price": f"{total_cost / total_vol:.5f}" if total_vol else "0",
+            "fee": f"{total_fee:.5f}",
+        }
 
     def get_ticker_price(self) -> float:
         """Return current BTC/USD last trade price."""
