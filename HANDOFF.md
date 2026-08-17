@@ -1,3 +1,56 @@
+# Handoff — 2026-08-17
+
+## 🔴 Real live-money bug found and fixed: multi-trade order fills were under-recorded
+
+**What happened:** Model 2's Volume Raider signal fired legitimately
+(2026-08-17 04:01 UTC, `volume_surge` on the 4h candle) and its $25 limit
+buy (`OVTFJ5-KAF66-STKY2U`) filled correctly on Kraken — but as **two
+separate maker trades** (0.00032317 BTC + 0.00007097 BTC), not one.
+
+**Root cause:** `kraken_client.py`'s `get_order_status()` falls back to
+scanning `TradesHistory` when `QueryOrders` returns `{}` (a known issue for
+fills that settle before the poll — see the older `QueryOrders` bug in the
+table below). That fallback looped over trades matching the order's txid
+and **returned on the first match**, silently discarding any other trades
+on the same order. Confirmed via Kraken's `TradesHistory` directly: this
+order really did split into two trades, and our code only ever recorded
+the smaller one.
+
+**Real-money impact:** `live.lots` recorded `btc_quantity=0.00007097`
+against the real `opening_capital=$25`, i.e. only ~18% of the position.
+The other 0.00032317 BTC (~$20.50) was bought with real money but had
+**no lot row tracking it — no trailing stop, no exit path, would have sat
+in the account indefinitely.** Confirmed empirically: summed
+`btc_quantity` across all `OPEN`/`PENDING` lots (both models) was
+0.00111962 BTC against a real Kraken balance of 0.00144279 BTC — the
+exact 0.00032317 BTC gap.
+
+**Fixed:**
+1. `get_order_status()`'s `TradesHistory` fallback now sums `vol`/`cost`/
+   `fee` across every matching trade instead of taking the first. Applied
+   identically to `main` (`bc3ee96`), `live-model-2` (`fb56513`, clean
+   cherry-pick — code was byte-identical to main's pre-fix version), and
+   `live-model-1` (`feac3d3`, manual patch — same function, also
+   byte-identical; that branch had no `test_kraken_client.py` yet so one
+   was added directly). New test file: `tests/live/test_kraken_client.py`,
+   4 tests, passing on all three branches.
+2. Reconciled `live.lots` lot_id=4 by hand against Supabase:
+   `btc_quantity` 0.00007097 → 0.00039414, `entry_fee_usd` $0.018 → $0.10
+   (both now match the real aggregated fill exactly).
+3. Audited every other open lot (Model 1's two) against Kraken's real
+   `TradesHistory` — both single-trade, both already matched the DB
+   exactly. This bug only ever hit the one order; confirmed, not assumed.
+4. **Caught and corrected my own mistake mid-fix:** the first reconciliation
+   UPDATE touched `high_water_mark` when it shouldn't have — reset a real
+   trailing-stop peak (64138.7, from the 4h candle closing at 16:00 UTC)
+   back down to the entry price. Recomputed the true peak by resampling
+   raw `market_data` to 4h the same way `position_monitor.py` does, and
+   restored it before it could weaken the live trailing stop.
+
+**All three branches pushed to origin, working trees clean.** Verified
+after the fix: total tracked BTC across all open lots now matches Kraken's
+real account balance exactly (0.00144279 BTC).
+
 # Handoff — 2026-08-12
 
 ## ✅ MODEL 2 IS LIVE. Trading real money, running in parallel with Model 1. Read this before touching live infra again.
@@ -1476,6 +1529,7 @@ Migration: `src/data/migration_v4_model3.sql` (applied to both local Postgres an
 | `market_data_updater.py` | Fixed 2h lookback; gaps never self-healed | Fetch from latest DB timestamp |
 | `executor.py` | tz-naive/aware in `_latest_candle_for_stream` | `.replace(tzinfo=None)` |
 | `kraken_client.py` | `QueryOrders` returns `{}` for taker fills | Fall back to `TradesHistory` |
+| `kraken_client.py` (`get_order_status`) | `TradesHistory` fallback returned only the first matching trade — a single order can fill as multiple partial trades, under-recording the real position (confirmed live 2026-08-17, ~82% of a fill went untracked) | Aggregate `vol`/`cost`/`fee` across every trade matching the ordertxid |
 | `db.py` | `get_engine()` routed backtest queries to Supabase silently | Split into `get_local_engine()` + `get_engine()` |
 | `order_manager.py` | Expiry check ran after Kraken API call — expired lots stuck if Kraken unreachable | Check our own expiry timestamp first |
 | `engine.py` (`_run_blended_slots`) | Breakeven floor double-counted the buy fee (already baked into `avg_ep` via reduced qty), landing ~+0.25% instead of true $0 | `breakeven = avg_ep / (1 - fee)` instead of `avg_ep * (1 + fee*2)` |
