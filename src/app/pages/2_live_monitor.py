@@ -12,6 +12,8 @@ from sqlalchemy import create_engine, text
 
 load_dotenv()
 
+st.set_page_config(page_title="Live Monitor", layout="wide")
+
 from src.backtester.market_data import _warmup_days
 from src.backtester.indicators import add_indicators, resample_ohlcv
 from src.fees import TAKER_FEE
@@ -916,7 +918,8 @@ if not IS_BLENDED:
         rows = _q("""
             SELECT stream_name, parameters->'position'->>'trailing_stop_pct' AS trail_pct
             FROM live.streams
-        """)
+            WHERE model_id = :mid
+        """, {"mid": SELECTED_MODEL_ID})
         trail_map = {r[0]: float(r[1]) for r in rows if r[1]}
 
         for idx, row in display.iterrows():
@@ -942,7 +945,10 @@ if not IS_BLENDED:
         display["Entry Price"] = display["Entry Price"].apply(lambda x: f"${float(x):,.2f}")
         display["Current Price"] = display["Current Price"].apply(lambda x: f"${float(x):,.2f}" if x is not None else "—")
         display["HWM"] = display["HWM"].apply(lambda x: f"${float(x):,.2f}" if x else "—")
-        st.dataframe(display, use_container_width=True, hide_index=True)
+        st.dataframe(display, use_container_width=True, hide_index=True, column_config={
+            "Trail Stop": st.column_config.TextColumn(width="large"),
+            "Est. Gain (HWM)": st.column_config.TextColumn(width="medium"),
+        })
 
     if not pending_lots.empty:
         st.caption(f"**{len(pending_lots)} pending order(s) awaiting fill:**")

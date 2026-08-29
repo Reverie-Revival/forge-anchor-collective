@@ -116,10 +116,15 @@ def run_live_replay_stream(
 
     Returns the same shape run_backtest() does: {trades, df, start, end,
     signals, maker_fee, taker_fee} -- trades is a DataFrame with entry_ts,
-    exit_ts, entry_price, exit_price, capital, pnl, exit_reason,
-    candles_held (mae_pct/mfe_pct are NOT tracked by live.lots per-trade,
-    unlike engine.py's simulation -- compute_metrics treats their absence
-    as "no MAE/MFE data," not an error).
+    exit_ts, entry_price, exit_price, highest_close, capital, pnl,
+    exit_reason, candles_held (mae_pct/mfe_pct are NOT tracked by live.lots
+    per-trade, unlike engine.py's simulation -- compute_metrics treats
+    their absence as "no MAE/MFE data," not an error). highest_close comes
+    from live.lots.high_water_mark, which position_monitor.check_all()
+    already tracks correctly tick-by-tick -- prior to 2026-08-29 this query
+    didn't select that column at all, so every trade saved via this path
+    silently got high_water_mark == exit_price in backtest.lots (0%
+    giveback on every trade, never a real value).
     """
     if slot_mode not in ("single", "staggered"):
         raise ValueError(f"run_live_replay_stream does not support slot_mode={slot_mode!r} -- "
@@ -198,8 +203,8 @@ def run_live_replay_stream(
 
         with engine.begin() as conn:
             rows = conn.execute(text("""
-                SELECT slot_number, entry_price, exit_price, opening_capital, realized_pnl,
-                       exit_reason, opened_at, closed_at
+                SELECT slot_number, entry_price, exit_price, high_water_mark, opening_capital,
+                       realized_pnl, exit_reason, opened_at, closed_at
                 FROM live.lots WHERE model_id = :mid AND status = 'CLOSED' ORDER BY opened_at
             """), {"mid": model_id}).fetchall()
 
@@ -210,6 +215,7 @@ def run_live_replay_stream(
             "exit_ts":      r.closed_at,
             "entry_price":  float(r.entry_price),
             "exit_price":   float(r.exit_price),
+            "highest_close": float(r.high_water_mark) if r.high_water_mark is not None else float(r.exit_price),
             "capital":      float(r.opening_capital),
             "pnl":          float(r.realized_pnl),
             "exit_reason":  r.exit_reason,
