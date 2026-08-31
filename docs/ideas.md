@@ -8,13 +8,18 @@ numbers are permanent once assigned — don't renumber on reorder, just append.
 
 Status values: `raw` (pitched, not investigated) · `parked` (tried, didn't
 work, reason known — worth revisiting if the blocker gets solved) ·
-`active` (currently being built/tested) · `promoted` (became an ADR).
+`gated` (parked behind a specific prerequisite, revisit once that's done) ·
+`active` (currently being built/tested) · `tested — dead end` (genuinely
+tested, not just reasoned about; conclusion is "don't pursue further"
+absent a real new angle) · `promoted` (became an ADR).
 
 ---
 
 ## 1. Higher trade frequency
 
-**Status:** parked — but never got a fair fight; the real blocker is fees, not the signal.
+**Status:** gated — behind #3 (execution-layer fee reduction). Never got a fair fight; the real blocker is fees, not the signal.
+
+**2026-08-31 reassessment (after closing #2 as a tested dead end):** deliberately kept open, not closed — this is a materially weaker "no" than #2's. The only real evidence against it is fee math (real 1.20% round-trip) and one abandoned experiment (Quiet Climber v3: good backtest, bad live-adjacent behavior in an actual 2026 correction) — not "every tested variant loses money regardless of tuning," which is what actually killed #2. Don't test this again until #3 has moved the real per-trade cost down; testing it against today's fee structure would just reproduce the same fee-drag conclusion that shelved it originally.
 
 Tried once adjacent to this: Quiet Climber v3 loosened its trail for more
 frequent fires, got strong backtest numbers (23.7% ann, Primary v2), but
@@ -43,7 +48,10 @@ see how much room there actually is before touching signal design at all.
 
 ## 2. Cascade / pyramid-down DCA slots ("shouldn't lose, worst case average down")
 
-**Status:** parked — built twice (Model 3, Model 4), genuinely failed, not just underperformed. Root cause identified.
+**Status:** tested — dead end (2026-08-31). Built and genuinely tested
+twice now, months apart, by two different approaches, converging on the
+same conclusion. Not closing this because we got tired of it — closing it
+because the evidence is unusually consistent for a "no."
 
 Model 3 (Grid Stacker Blended) backtested at 84.77% ann and went live
 2026-08-01. A phantom-fill bug in the backtest (credited fills the market
@@ -75,6 +83,50 @@ probably why it still failed.
 **Next step if revisited:** redesign the floor-exit mechanism first, not
 the ladder spacing or slot count. Test the mechanism in isolation
 (single-slot, does the floor actually hold?) before scaling to 5 slots.
+
+**2026-08-31 rebuild, from scratch, addressing the floor-exit problem
+head-on:** revisited per the "next step" above — this time with a real,
+accepted stop-loss (slot 5 can genuinely lose, no guaranteed floor),
+graduated per-slot exit targets ("win big on slot 1, hedge more on each
+slot after"), volatility-adaptive entry spacing, and eventually a full
+market-character scoring system (dip/trend/breakout/volume signals,
+reusing the real ingredients from Momentum Rider/Dip Hunter/Breakout
+Scout/Volume Raider) driving both entry and exit continuously. Tested
+against real 2021-2024 data (BTC bull, bear, chop, bull), non-compounding
+$20/slot basis:
+- Plain fixed-percentage ladder: -$47.92 over the 4 years.
+- Adaptive entry spacing alone (volatility-scaled, fixed exit targets):
+  **-$15.04 — the best result of the entire session**, still a loss but
+  meaningfully smaller than the fixed baseline.
+- Every other variant tested — adaptive exit-scaling, both adaptive
+  together, the full market-character system, and a real 144→16-combo
+  coefficient search over that system's weights — **landed worse than
+  the plain fixed baseline**, most far worse (as bad as -$146 in the
+  weakest tested combo).
+
+**Root cause of why "smarter" made it worse, every time:** any mechanism
+that made the system more willing to average down (higher conviction →
+smaller required drop, wider exit ambition, etc.) increased how often a
+cascade built all the way to slot 5 — and slot 5's backstop loss is where
+essentially all the damage lives, in every version tested. The value of
+better entry timing was consistently smaller than the cost of the extra
+deep-cascade exposure it created. Making the system MORE cautious always
+helped; making it more eager never did, no matter how the eagerness was
+justified.
+
+**Verdict:** this isn't one failed attempt, it's two independent ones —
+the original Model 3/4/Phoenix effort (five tuned variants, all net
+negative, killed by the market-order floor-exit gap) and this session's
+from-scratch rebuild (which fixed that exact gap and still lost, for a
+structurally different but equally consistent reason). A fixed-depth
+cascade is a bet that BTC reliably mean-reverts within a bounded window;
+that bet works in a fast V-shaped recovery and loses in a genuine
+sustained decline, which BTC has produced roughly 1 year in 4 in the
+data available (2018, 2022). Not calling this permanently impossible —
+but "smarter timing" was the obvious next thing to try, we tried several
+real versions of it, and it made things worse every time. Don't revisit
+without a genuinely new angle on bounding the downside, not just another
+tuning pass.
 
 ---
 
@@ -156,7 +208,7 @@ different shape.
 
 ## 7. Trailing-stop win/loss distribution audit — is tightening the trail costing us on a handful of big trades?
 
-**Status:** raw
+**Status:** closed 2026-08-28 — tested against Volume Raider (highest-giveback stream), both candidate mechanisms hurt return. Not pursued further; see final verdict below.
 
 Hunch: adjusting trail % has historically hurt performance, but maybe only
 because of a small number of large trades where a tighter trail cut off a
@@ -255,6 +307,45 @@ further") would find bigger peaks the current tight trail never reaches
 in the first place — that's the actual ADR 003 tradeoff and would need a
 fresh backtest variant with different trail parameters, not just
 re-measuring existing trades.
+
+**Mechanism testing, both closed 2026-08-28 (Volume Raider, Primary v2 —
+picked as the test case because it had the highest average giveback of
+the four streams):**
+
+*Ratcheting trail* (`trailing_stop_steps`, already live-validated code in
+`position_monitor.py` — no new build needed): tested flat 10% baseline
+against `[[20,5]]`, `[[20,4]]`, `[[20,6],[40,3]]`, and `[[40,4]]` via
+`run_live_replay_stream`. **Every variant underperformed baseline** —
+best case (peak-only 40%→4%) still lost 2.2pp of annualized return
+(23.43%→21.20%), worst case lost over 3pp. Trade count rose in every
+variant (38→40-43), meaning the tighter trail causes more early-exit +
+re-entry cycling, and for a bursty momentum stream like this some of
+those early exits cut off real continuations rather than just trimming
+fat.
+
+*Hard leading_sell* (`take_profit_pct` — exploratory only, no live wiring
+exists yet, tested via the fast raw engine not the live-validated
+replay path): tested flat 10% baseline against a 20%/25%/30% hard cap.
+**All three caps cut annualized return substantially** — worst at 20%
+(20.73%→13.40%, over a third of return gone), least bad at 30%
+(→17.87%, still down ~14%). Trade count did rise (39→44, confirming
+"redeploy capital faster" works as expected), but only 7-12 trades per
+variant actually hit the cap, and those are exactly the trades that
+would otherwise have run to 40-76% under the trailing stop — capping
+them sacrifices far more than the extra trades gain back.
+
+**Verdict:** both mechanisms fail for the same reason — Volume Raider's
+return is concentrated in a small number of huge runs (top 10 winners =
+43% of total profit), and anything that caps or tightens gains on the
+way up sacrifices more from those specific trades than it recovers
+elsewhere. Real giveback (measured earlier) is closer to "cost of
+admission" for catching the big run than free money left on the table.
+Not tested against Momentum Rider/Breakout Scout/Dip Hunter — could
+revisit per-stream if one of those turns out to have a flatter return
+distribution (less concentrated in outliers) than Volume Raider, but
+deprioritized for now. ADR 003's original reasoning (let winners run,
+don't cap them) holds up empirically here, not just as a stated
+principle.
 
 <details><summary>Original (wrong) first-pass result, kept for the record</summary>
 
