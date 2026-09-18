@@ -76,6 +76,48 @@ adversarial-code-review gate at both stream-locking AND model
 finalization (not just finalization), and a new rule against proposing
 fixes for minor/cosmetic bugs on live-deployed branches.
 
+## Session close (2026-09-18) — committed/pushed, and what's still open
+
+**Committed and pushed to `main`, two commits:**
+1. `792fc68` — Live Monitor Worst/Mid/Best Case fix + ML research tool
+   (`src/research/entry_quality_study.py`) + ideas #9-16 in `docs/ideas.md`.
+2. `6479557` — net-of-fees follow-up: all three case columns now subtract
+   a real 1.60% round-trip fee (`TAKER_FEE * 2`, pulled from `src/fees.py`,
+   not hardcoded) before display, since every real entry checked has paid
+   taker despite being a limit order. Column headers carry a `help` tooltip
+   explaining each case and the fee assumption.
+
+**Verified live and working** (local Streamlit relaunched twice during
+this session to pick up the changes — stale process from Sept 4 was the
+cause of an early "changes aren't showing up" confusion): fee-adjusted
+percentages display correctly (a flat position now reads ~-1.60%, not
+0%). The `help` tooltip on Worst/Mid/Best Case column headers shows on
+**hover only** in this Streamlit version (1.50.0) — there's no separate
+persistent (i) icon glyph next to the header text the way there is on
+some other Streamlit widgets. Confirmed this is expected behavior, not a
+bug — user confirmed hover-only is fine. Columns are `width="small"`
+(tried `"medium"` mid-session looking for a missing icon that was never
+going to appear either way, then reverted — net diff against the commit
+is zero).
+
+**Still uncommitted, deliberately, on top of clean `main`:** the
+ATR-adaptive trailing stop plumbing — `src/live/position_monitor.py`,
+`src/live/executor.py`, `src/backtester/live_replay_stream.py`,
+`src/backtester/market_data.py`. Inert in production (no live stream sets
+`trailing_stop_atr_multiplier`) but touches live-execution modules, and
+the underlying question is unresolved: it underperforms flat 10% for
+Volume Raider at every multiplier tested (2x-8x, see idea #12 in
+`docs/ideas.md` for the full table), but was never tested against
+Momentum Rider, Breakout Scout, or Dip Hunter — VR is specifically the
+stream idea #7 already found doesn't tolerate any trail-tightening
+mechanism, so this may behave completely differently elsewhere.
+
+**Next session, pick up here:** `git status` will show those same 4 files
+still modified. Decide: test the ATR trail against MR/BS/DH before
+deciding its fate, or discard the branch of work entirely and let idea
+#12 note it as explored-but-not-committed. Either way, resolve before
+starting new work so it doesn't keep sitting in the working tree.
+
 ---
 
 
