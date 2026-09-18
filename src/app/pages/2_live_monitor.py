@@ -40,7 +40,11 @@ GLOSSARY = {
         "closed at the Current Stop right now. Mid = if closed at the current "
         "market price right now — a real, live number, not an estimate. Best = "
         "at the position's peak so far (HWM) — the best it has ever looked, not "
-        "a current number. Worst <= Mid <= Best always holds by construction.",
+        "a current number. Worst <= Mid <= Best always holds by construction. "
+        "All three are NET of an assumed round-trip fee (taker+taker, since "
+        "every real entry has crossed the spread despite being a limit order) "
+        "— a raw price move of +0% is a real loss after fees, not breakeven; "
+        "see the column header tooltips (ⓘ) for the exact percentage assumed.",
     "Trail Arm % (Model 3 only)":
         "Grid Stacker's trailing stop doesn't start protecting a position the "
         "moment it opens — it only arms once price rises this % above the "
@@ -935,6 +939,17 @@ if not IS_BLENDED:
         display["mid_pct"] = None
         display["best_pct"] = None
 
+        # Net-of-fees, not raw price move: every real entry checked so far has
+        # paid taker (crossed the spread) despite being placed as a limit
+        # order, and exits are always market orders (always taker) -- so the
+        # realistic round trip is TAKER_FEE twice, not MAKER_FEE+TAKER_FEE.
+        # Subtracted from all three cases (a flat percentage-point haircut,
+        # not the more precise compounding formula -- close enough at these
+        # magnitudes and matches how this reads intuitively). 2026-09-18:
+        # user confirmed 0% raw move is NOT breakeven -- this is what makes
+        # the displayed numbers line up with real realized P&L instead.
+        ROUND_TRIP_FEE_PCT = TAKER_FEE * 2 * 100
+
         rows = _q("""
             SELECT stream_name,
                    parameters->'position'->>'trailing_stop_pct' AS trail_pct,
@@ -967,10 +982,13 @@ if not IS_BLENDED:
 
             if stop_price is not None:
                 display.at[idx, "current_stop"] = f"${stop_price:,.2f}"
-                display.at[idx, "worst_pct"] = f"{((stop_price - ep) / ep * 100):+.2f}%"
+                raw = (stop_price - ep) / ep * 100
+                display.at[idx, "worst_pct"] = f"{(raw - ROUND_TRIP_FEE_PCT):+.2f}%"
             if current_price is not None:
-                display.at[idx, "mid_pct"] = f"{((current_price - ep) / ep * 100):+.2f}%"
-            display.at[idx, "best_pct"] = f"{((hwm - ep) / ep * 100):+.2f}%"
+                raw = (current_price - ep) / ep * 100
+                display.at[idx, "mid_pct"] = f"{(raw - ROUND_TRIP_FEE_PCT):+.2f}%"
+            raw = (hwm - ep) / ep * 100
+            display.at[idx, "best_pct"] = f"{(raw - ROUND_TRIP_FEE_PCT):+.2f}%"
 
         display["current_price"] = current_price
 
@@ -987,11 +1005,12 @@ if not IS_BLENDED:
         display["Entry Price"] = display["Entry Price"].apply(lambda x: f"${float(x):,.2f}")
         display["Current Price"] = display["Current Price"].apply(lambda x: f"${float(x):,.2f}" if x is not None else "—")
         display["HWM"] = display["HWM"].apply(lambda x: f"${float(x):,.2f}" if x else "—")
+        fee_note = f" Net of an assumed {ROUND_TRIP_FEE_PCT:.2f}% round-trip fee (taker+taker -- every real entry so far has crossed the spread despite being a limit order, so this is the realistic case, not the optimistic maker+taker one)."
         st.dataframe(display, use_container_width=True, hide_index=True, column_config={
             "Current Stop": st.column_config.TextColumn(width="medium"),
-            "Worst Case": st.column_config.TextColumn(width="small", help="Unrealized P&L if the position closed at its current stop price right now (trailing stop or hard stop, whichever is more protective)."),
-            "Mid Case": st.column_config.TextColumn(width="small", help="Unrealized P&L at the current market price -- always between Worst and Best by construction."),
-            "Best Case": st.column_config.TextColumn(width="small", help="Unrealized P&L at the position's peak so far (high-water mark) -- not a live number, the best it has ever looked."),
+            "Worst Case": st.column_config.TextColumn(width="small", help="If the position closed at its current stop price right now (trailing stop or hard stop, whichever is more protective)." + fee_note),
+            "Mid Case": st.column_config.TextColumn(width="small", help="If the position closed at the current market price right now -- always between Worst and Best by construction." + fee_note),
+            "Best Case": st.column_config.TextColumn(width="small", help="At the position's peak so far (high-water mark) -- the best it has ever looked, not a live number." + fee_note),
         })
 
     if not pending_lots.empty:
