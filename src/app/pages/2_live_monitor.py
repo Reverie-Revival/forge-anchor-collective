@@ -26,11 +26,21 @@ GLOSSARY = {
     "HWM (High Water Mark)":
         "The highest price reached since a position opened. The trailing stop is "
         "calculated as N% below this — it moves up as price rises, never down.",
-    "Trail Stop":
-        "Trailing stop price = HWM × (1 − trail%). If price falls to this level "
-        "the position is sold at market. Model 1: active as soon as the position "
-        "is open. Model 3 (Grid Stacker): NOT active until price first rises "
-        "'Trail Arm %' above average cost — see below.",
+    "Current Stop":
+        "The real current exit trigger — whichever is MORE protective right now: "
+        "the trailing stop (HWM x (1 - trail%), moves up with the peak) or a hard "
+        "stop_loss_pct (fixed from entry, never moves), if the stream has one. "
+        "If price falls to this level the position is sold at market. Model 1: "
+        "active as soon as the position is open. Model 3 (Grid Stacker): NOT "
+        "active until price first rises 'Trail Arm %' above average cost — see "
+        "below.",
+    "Worst / Mid / Best Case":
+        "Unrealized P&L estimated three ways, replacing the old single "
+        "'Est. Gain (HWM)' column which was only ever the best case. Worst = if "
+        "closed at the Current Stop right now. Mid = if closed at the current "
+        "market price right now — a real, live number, not an estimate. Best = "
+        "at the position's peak so far (HWM) — the best it has ever looked, not "
+        "a current number. Worst <= Mid <= Best always holds by construction.",
     "Trail Arm % (Model 3 only)":
         "Grid Stacker's trailing stop doesn't start protecting a position the "
         "moment it opens — it only arms once price rises this % above the "
@@ -911,34 +921,66 @@ if not IS_BLENDED:
         st.caption("No open positions.")
     else:
         display = open_lots.copy()
-        # Compute trail stop and unrealized P&L estimate using last known HWM
-        display["trail_stop"] = None
-        display["est_pnl_pct"] = None
+        # Worst/Mid/Best case unrealized P&L -- replaces the old single
+        # "Est. Gain (HWM)" column, which was only ever the best case (peak
+        # so far), not a real current estimate. The three are ordered
+        # worst -> mid -> best on purpose: current_stop <= current_price <=
+        # HWM always holds by construction (a trailing stop only ever
+        # trails UP behind the peak, and price can't be below its own
+        # current stop without having already triggered an exit), so Mid
+        # (current price) is genuinely, not just conventionally, between
+        # the other two.
+        display["current_stop"] = None
+        display["worst_pct"] = None
+        display["mid_pct"] = None
+        display["best_pct"] = None
 
         rows = _q("""
-            SELECT stream_name, parameters->'position'->>'trailing_stop_pct' AS trail_pct
+            SELECT stream_name,
+                   parameters->'position'->>'trailing_stop_pct' AS trail_pct,
+                   parameters->'position'->>'stop_loss_pct' AS stop_loss_pct
             FROM live.streams
             WHERE model_id = :mid
         """, {"mid": SELECTED_MODEL_ID})
         trail_map = {r[0]: float(r[1]) for r in rows if r[1]}
+        hard_stop_map = {r[0]: float(r[2]) for r in rows if r[2]}
 
         for idx, row in display.iterrows():
-            hwm = float(row["high_water_mark"] or row["entry_price"])
-            trail = trail_map.get(row["stream_name"])
-            if trail:
-                display.at[idx, "trail_stop"] = f"${hwm * (1 - trail/100):,.2f}  ({trail}% below HWM ${hwm:,.0f})"
             ep = float(row["entry_price"])
-            display.at[idx, "est_pnl_pct"] = f"{((hwm - ep) / ep * 100):+.2f}% (HWM)"
+            hwm = float(row["high_water_mark"] or ep)
+            trail = trail_map.get(row["stream_name"])
+            hard_pct = hard_stop_map.get(row["stream_name"])
+
+            # Current effective stop = whichever of trail-from-peak / hard-from-entry
+            # is more protective right now -- matches position_monitor.py's real
+            # live logic exactly (max of the two), not just the trail alone. A
+            # hard stop_loss_pct can be the binding constraint even with a wider
+            # trailing_stop_pct configured, e.g. Breakout Scout's real 2026-09-15
+            # loss (docs/HANDOFF) -- showing trail-only here would have understated
+            # the real worst case on that exact trade.
+            candidates = []
+            if trail:
+                candidates.append(hwm * (1 - trail / 100))
+            if hard_pct:
+                candidates.append(ep * (1 - hard_pct / 100))
+            stop_price = max(candidates) if candidates else None
+
+            if stop_price is not None:
+                display.at[idx, "current_stop"] = f"${stop_price:,.2f}"
+                display.at[idx, "worst_pct"] = f"{((stop_price - ep) / ep * 100):+.2f}%"
+            if current_price is not None:
+                display.at[idx, "mid_pct"] = f"{((current_price - ep) / ep * 100):+.2f}%"
+            display.at[idx, "best_pct"] = f"{((hwm - ep) / ep * 100):+.2f}%"
 
         display["current_price"] = current_price
 
         cols_show = ["stream_name", "opening_capital", "entry_price", "current_price", "high_water_mark",
-                     "trail_stop", "est_pnl_pct", "opened_at"]
+                     "current_stop", "worst_pct", "mid_pct", "best_pct", "opened_at"]
         labels = {
             "stream_name": "Stream", "opening_capital": "Capital ($)",
             "entry_price": "Entry Price", "current_price": "Current Price", "high_water_mark": "HWM",
-            "trail_stop": "Trail Stop", "est_pnl_pct": "Est. Gain (HWM)",
-            "opened_at": "Opened",
+            "current_stop": "Current Stop", "worst_pct": "Worst Case", "mid_pct": "Mid Case",
+            "best_pct": "Best Case", "opened_at": "Opened",
         }
         display = display[cols_show].rename(columns=labels)
         display["Opened"] = pd.to_datetime(display["Opened"]).apply(_fmt_central)
@@ -946,8 +988,10 @@ if not IS_BLENDED:
         display["Current Price"] = display["Current Price"].apply(lambda x: f"${float(x):,.2f}" if x is not None else "—")
         display["HWM"] = display["HWM"].apply(lambda x: f"${float(x):,.2f}" if x else "—")
         st.dataframe(display, use_container_width=True, hide_index=True, column_config={
-            "Trail Stop": st.column_config.TextColumn(width="large"),
-            "Est. Gain (HWM)": st.column_config.TextColumn(width="medium"),
+            "Current Stop": st.column_config.TextColumn(width="medium"),
+            "Worst Case": st.column_config.TextColumn(width="small", help="Unrealized P&L if the position closed at its current stop price right now (trailing stop or hard stop, whichever is more protective)."),
+            "Mid Case": st.column_config.TextColumn(width="small", help="Unrealized P&L at the current market price -- always between Worst and Best by construction."),
+            "Best Case": st.column_config.TextColumn(width="small", help="Unrealized P&L at the position's peak so far (high-water mark) -- not a live number, the best it has ever looked."),
         })
 
     if not pending_lots.empty:

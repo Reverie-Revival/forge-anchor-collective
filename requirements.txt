@@ -8,3 +8,4 @@ plotly>=5.24.0
 sqlalchemy>=2.0.0
 krakenex>=2.1.0
 pytest>=8.0.0
+scikit-learn>=1.6.0

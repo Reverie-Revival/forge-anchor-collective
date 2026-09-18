@@ -1,3 +1,166 @@
+# Handoff — 2026-09-18
+
+## Live Monitor Worst/Mid/Best Case fix, ML research tool built and closed, ATR-trail exploration, ideas #9-16 added
+
+**Live Monitor accuracy fix (`2_live_monitor.py`):** old "Est. Gain (HWM)"
+column was silently always the best case, and its "Trail Stop" helper
+column ignored hard `stop_loss_pct` entirely (understating the real
+current stop for streams like Breakout Scout that carry one — exactly
+the mechanic that decided BS's real 2026-09-15 loss). Replaced with
+Worst/Mid/Best Case columns (current-stop / current-price / HWM), with
+"Current Stop" now correctly taking whichever of trail-from-peak or
+hard-from-entry is more protective, matching `position_monitor.py`'s
+real live logic. Also found (not fixed, declined as a minor cosmetic
+issue — see `feedback_live_branch_minor_bugs` memory): live alert emails
+show the raw internal `live.models.model_id` (4) instead of the
+human-facing `model_version` (2), which is why an alert can say "Model 4"
+for what's actually Model 2.
+
+**New ML feature-importance research tool, built and closed same
+session** (`src/research/entry_quality_study.py`, idea #16): gradient-
+boosted regressor to systematically find which indicator/core-signal
+combinations predict a good simulated trade outcome, as an alternative to
+hand-picking stream filters. Genuinely tested three ways (raw per-candle,
+yearly walk-forward with daily subsampling, walk-forward with real
+core_signal identity as a feature) — all three converged on zero real
+out-of-sample generalization (test R² negative or near-zero in nearly
+every one of 8 yearly folds spanning 2019-2026, sign-accuracy at or below
+naive majority-class baseline every time). Whichever feature dominated
+importance each run was suspiciously stable across every regime while
+still predicting nothing — read as the model tracking "which era is
+this" (sentiment/volatility level drift over BTC's cycles), not real
+entry-quality signal. Closed as a tested dead end — the tool worked
+correctly, the null result is the finding. Full detail in `docs/ideas.md`
+#16.
+
+**ATR-adaptive trailing stop ported into the live-validated path**
+(`trailing_stop_atr_multiplier` — existed in `engine.py` and the Stream
+Tester UI's help text, zero live implementation before this, same silent-
+gap shape as the `trailing_stop_steps` bug found 2026-08-10). Real
+plumbing added to `position_monitor.py`, `executor.py`,
+`live_replay_stream.py`, `market_data.py` (warmup calc) — no schema
+change needed, ATR recomputed fresh each tick like current price already
+is. Tested multipliers 2x-8x against Volume Raider's real Primary v2
+baseline: every variant underperforms flat 10% (best case, 8x, still only
++13.5% ann vs baseline's +23.4%) — a fifth real data point that VR
+specifically doesn't tolerate any trail-tightening mechanism, joining
+idea #7's ratcheting-trail and hard-leading-sell findings. Not yet tested
+against MR/BS/DH. Plumbing is inert in production (no live config sets
+this parameter) but touches live-execution modules — **left uncommitted
+pending an explicit decision**, not bundled into this session's commit.
+
+**Two real live trades verified end-to-end against real market data**
+(entry conditions re-derived from `market_data`/`sentiment_data`, not
+just P&L reconciliation): Breakout Scout's 2026-09-18 entry (all 6
+filter conditions independently confirmed) and both Momentum Rider
+entries same day (Model 1 + Model 2, genuine EMA(30/120) crossover during
+a real ~3.5%-in-4h rally). All fee math reconciled to the cent. Now
+**6 for 6** real live entries paying the taker rate (0.8%) despite being
+placed as limit orders, not the maker rate (0.4%) — mounting real
+evidence for idea #3 (fee reduction) whenever that's picked back up.
+
+**8 new ideas added to `docs/ideas.md` (#9-16):** other crypto assets as
+new Models (#9, raw), equities/ETF application (#10, raw — assessed as
+likely backwards for this technique given the volatility mismatch and
+PDT rule), confluence + ATR-adaptive next-gen stream candidate (#12,
+raw — partially tested, see above), volatility-harvesting rebalancing
+bands (#13, raw), grid trading (#14, raw — gated behind idea #4), cross-
+asset lead-lag signal (#15, raw — gated behind a new data-source
+decision), time-since-HWM stagnation trigger (#11, raw — a 2-trade
+retrospective check came back genuinely mixed, arguing for a real
+backtest rather than settling anything), and the ML research tool (#16,
+closed, see above).
+
+**New standing feedback memories saved this session:** mandatory
+adversarial-code-review gate at both stream-locking AND model
+finalization (not just finalization), and a new rule against proposing
+fixes for minor/cosmetic bugs on live-deployed branches.
+
+---
+
+
+
+## New `docs/ideas.md` running backlog, and cascade/DCA closed as a tested dead end
+
+**Started a numbered ideas backlog** (`docs/ideas.md`, separate from
+`docs/decisions/` — that's for locked-in ADRs, this is the working list of
+things worth hashing out). 8 ideas logged so far: higher trade frequency
+(gated behind fee reduction), cascade/DCA slots (closed, see below),
+execution-layer fee reduction, a deterministic regime classifier gate, a
+time-of-day liquidity filter, staged/partial exits, a trailing-stop
+win/loss distribution audit (done, see below), and adversarial testing for
+the "silent failure" bug class that's caused most real incidents so far.
+
+**Trailing-stop audit (#7), real result:** giveback (peak unrealized gain
+minus what's actually realized) is real and substantial on big winners —
+averages 10.46pp on trailing_stop exits, up to 17.85pp on the biggest
+runs. Tested three fixes (ratcheting trail, hard leading-sell at 20/25/30%,
+combinations) against Volume Raider specifically — **all of them make
+things worse**, because this stream's return is concentrated in a handful
+of huge trades (top 10 winners = 43% of total profit) and any mechanism
+that caps or tightens gains sacrifices more from those specific trades
+than it recovers elsewhere. ADR 003's "let winners run" holds up
+empirically here, not just as a stated principle. Closed, not pursued
+further for Volume Raider; not tested against the other three streams.
+
+**Cascade/pyramid-down DCA (idea #2) — closed as a tested dead end.**
+Rebuilt from scratch this session to address the exact floor-exit gap that
+killed Model 3/4 originally (real accepted stop-loss on slot 5, no more
+"never lose" guarantee), plus adaptive entry spacing, graduated per-slot
+exit targets, and eventually a full market-character scoring system
+(dip/trend/breakout/volume signals). Tested against real 2021-2024 data:
+best result (adaptive spacing alone, everything else fixed) was -$15.04
+on $100 deployed per cycle, non-compounding — still a loss, but far better
+than the plain fixed-ladder baseline's -$47.92. **Every attempt to add
+"smarter" eagerness (adaptive exit scaling, the full character system, a
+16-combo coefficient search) made it worse**, several dramatically so.
+Root cause: anything that makes the system more willing to average down
+increases how often a cascade builds all the way to slot 5, and slot 5's
+loss is where nearly all the damage lives in every variant tested. This is
+now two independent failures (the original Model 3/4/Phoenix effort, and
+this from-scratch rebuild) converging on the same finding via different
+mechanics — closed, don't revisit without a genuinely new angle on
+bounding the downside. Full detail in `docs/ideas.md` #2.
+
+**Two real bugs found and fixed along the way:**
+1. Live Monitor (`2_live_monitor.py`) was missing `st.set_page_config(layout="wide")`
+   — every other page sets it explicitly, this one never did, so it
+   silently rendered at Streamlit's narrow default the whole time. Also
+   scoped the trailing-stop-pct query to `SELECTED_MODEL_ID` (was
+   unscoped, same bug class as prior Live Monitor cross-model isolation
+   bugs).
+2. `run_live_replay_stream()`'s closing query never selected
+   `high_water_mark` from `live.lots`, even though `position_monitor.py`
+   tracks it correctly tick-by-tick during replay — every model-level test
+   built via this path (including Model 1/2's live-deployed model_tests
+   151 & 156) silently got `high_water_mark == exit_price` in
+   `backtest.lots` (0% giveback on every trade, discovered while running
+   the #7 audit). Doesn't affect `entry_price`/`exit_price`/`realized_pnl`
+   — the trusted 13.6%/15.9% annualized figures for Model 1/2 are
+   untouched, only a diagnostic column was wrong. Fixed; the two existing
+   stale rows (151, 156) were NOT backfilled (would mean writing into the
+   audit trail behind live deployment — flagged as a known caveat instead,
+   see `docs/ideas.md` #7).
+
+Both fixes on `main` only — neither file is part of `live-model-1` or
+`live-model-2`'s actual trading path, so nothing here touches real money.
+`main`'s divergence from those two branches is unchanged from before.
+
+**All exploration today was scratch-only, cleaned up:** one leftover
+sandbox row in the local (non-Supabase) `live.models`/`live.streams`/
+`live.lots` tables, from a `run_live_replay_stream()` call that got
+interrupted before its own cleanup ran — deleted. No other DB state or
+code changes leaked from today's cascade experimentation.
+
+**Next up, whenever picked back up:** idea #3 (execution-layer fee
+reduction — maker-fill optimization, fee-tier climbing) is the natural
+next thing, since it's the actual prerequisite for reopening #1
+(frequency). User is going on a deliberate hiatus from active work on this
+project — Models 1 and 2 keep trading unattended in the meantime, nothing
+here needs a person around.
+
+---
+
 # Handoff — 2026-08-17
 
 ## 🔴 Real live-money bug found and fixed: multi-trade order fills were under-recorded
