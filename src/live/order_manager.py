@@ -8,6 +8,7 @@ In dry_run mode, Kraken calls are skipped and logged instead.
 from __future__ import annotations
 
 import logging
+import time
 from datetime import datetime, timezone, timedelta
 
 from sqlalchemy import text
@@ -19,6 +20,52 @@ from src.live import notifier
 from src.live import bucket_manager
 
 log = logging.getLogger(__name__)
+
+# How hard place_exit tries to read back the real fill of a market sell before
+# it settles for an estimate. Only the status READ is ever retried -- the sell
+# itself is placed exactly once, so a retry can never double-sell.
+EXIT_FILL_POLL_ATTEMPTS = 4
+EXIT_FILL_POLL_DELAY_S = 2.0
+
+
+def _confirmed_fill(order: dict) -> bool:
+    return (order.get("status") == "closed"
+            and float(order.get("vol_exec", 0) or 0) > 0
+            and float(order.get("price", 0) or 0) > 0)
+
+
+def _poll_exit_fill(kraken, txid: str, lot_id: int) -> dict:
+    """Poll for a market sell's real fill, retrying briefly. Returns the
+    confirmed order dict, or {} if it never confirmed (or Kraken kept
+    erroring). 2026-11-12 lot 10: one immediate poll missed a real fill, the
+    row was booked at the estimate, and the real loss was 14% larger."""
+    for attempt in range(1, EXIT_FILL_POLL_ATTEMPTS + 1):
+        try:
+            order = kraken.get_order_status(txid)
+        except Exception as e:
+            log.warning(f"Exit order {txid} (lot {lot_id}) status poll {attempt}/"
+                        f"{EXIT_FILL_POLL_ATTEMPTS} failed: {e}")
+            order = {}
+        if _confirmed_fill(order):
+            return order
+        if attempt < EXIT_FILL_POLL_ATTEMPTS:
+            time.sleep(EXIT_FILL_POLL_DELAY_S)
+    return {}
+
+
+def _estimated_exit_price(kraken, fallback_price: float) -> float:
+    """Best guess at a market sell's price when the real fill can't be read.
+    The caller's price is the STOP level on a stop exit, but price gaps
+    through the stop, so the real fill is below it -- using it always flatters
+    the loss. The live ticker, a few seconds after the sell, is the closer
+    estimate; fall back to the caller's price only if the ticker is down."""
+    try:
+        px = float(kraken.get_ticker_price())
+        if px > 0:
+            return px
+    except Exception as e:
+        log.warning(f"Ticker unavailable for exit-price estimate, using {fallback_price:.2f}: {e}")
+    return fallback_price
 
 
 def _tf_minutes(tf: str) -> int:
@@ -394,11 +441,12 @@ def place_exit(conn, lot, current_price: float, kraken: KrakenClient, dry_run: b
     exit_reason: 'trailing_stop' (default) or 'max_hold' -- see position_monitor.check_all.
 
     Market sells fill essentially instantly on Kraken, so right after placing
-    the order we poll get_order_status once for the real fill price and real
-    fee. If that poll doesn't yet show a confirmed fill (rare -- API lag),
-    fall back to the estimate (current_price + fee constants) and flag the
-    row with fee_is_estimated so it's visible for a manual glance later,
-    rather than blocking the lot from closing.
+    the order we poll get_order_status (a few short retries, read-only) for
+    the real fill price and real fee. If it still isn't confirmed, fall back
+    to an estimate (live ticker price, else current_price; fee from the
+    TAKER_FEE constant) and flag the row with fee_is_estimated so it's
+    visible for manual reconciliation, rather than blocking the lot from
+    closing.
     """
     entry_fee_usd = float(lot.entry_fee_usd) if lot.entry_fee_usd is not None else None
     fee_is_estimated = False
@@ -418,19 +466,16 @@ def place_exit(conn, lot, current_price: float, kraken: KrakenClient, dry_run: b
             log.error(f"Failed to place exit order for lot {lot.lot_id}: {e}")
             return
 
-        try:
-            order = kraken.get_order_status(txid)
-        except Exception as e:
-            log.warning(f"Could not confirm fill for exit order {txid} (lot {lot.lot_id}): {e}")
-            order = {}
+        order = _poll_exit_fill(kraken, txid, lot.lot_id)
 
-        if order.get("status") == "closed" and float(order.get("vol_exec", 0) or 0) > 0:
+        if order:
             exit_price = float(order.get("price", 0) or 0)
             exit_fee_usd = float(order.get("fee", 0) or 0)
         else:
-            log.warning(f"Exit order {txid} (lot {lot.lot_id}) not confirmed filled on first poll -- "
-                        "using estimated price/fee, flagging for manual reconciliation")
-            exit_price = current_price
+            log.error(f"Exit order {txid} (lot {lot.lot_id}) not confirmed filled after "
+                      f"{EXIT_FILL_POLL_ATTEMPTS} polls -- using estimated price/fee, "
+                      "flagging for manual reconciliation (Kraken TradesHistory by ordertxid)")
+            exit_price = _estimated_exit_price(kraken, current_price)
             exit_fee_usd = float(lot.opening_capital) * TAKER_FEE
             fee_is_estimated = True
 
