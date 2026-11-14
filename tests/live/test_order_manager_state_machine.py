@@ -138,36 +138,98 @@ def test_full_cycle_entry_trailing_stop_exit_uses_real_fees(sandbox):
     print(f"\nModel 1 full cycle OK -- entry -> trailing stop exit. pnl=${float(lot.realized_pnl):.2f}")
 
 
-def test_exit_falls_back_to_estimate_when_fill_not_yet_confirmed(sandbox):
-    """Mirrors the Model 3 fallback test -- if the synchronous post-placement
-    poll doesn't confirm the market sell's fill yet, the lot must still close
-    (using the estimate) instead of hanging, flagged for manual reconciliation."""
-    engine, stream, model_id = sandbox
-    kraken = FakeKraken()
+# --- exit fill capture (2026-11-12 lot 10: real fill missed, booked at the stop price) ---
 
+STOP_PRICE = 50000.0 * 1.05 * 0.95        # hwm 52500 * (1 - 5% trail) = 49875
+GAP_MARKET = 49000.0                      # price gapped THROUGH the stop: real fill is lower
+
+
+@pytest.fixture
+def fast_polls(monkeypatch):
+    sleeps = []
+    monkeypatch.setattr(order_manager.time, "sleep", lambda s: sleeps.append(s))
+    return sleeps
+
+
+def _stop_out(sandbox, configure):
+    """Open a lot, then trigger its trailing stop with the market gapped to
+    GAP_MARKET. `configure(kraken)` sets the failure mode for the exit."""
+    engine, stream, _ = sandbox
+    kraken = FakeKraken()
     kraken._next_price = 50000.0
     with engine.begin() as conn:
         order_manager.place_entry(conn, stream, kraken, dry_run=False)
     with engine.begin() as conn:
         order_manager.check_pending(conn, kraken, dry_run=False)
-
     armed_close = 50000.0 * 1.05
-    stop_trigger_low = armed_close * (1 - 0.05) - 1
-    kraken._next_price = armed_close
-    kraken.next_fill_mode = "delayed"
+    kraken._next_price = GAP_MARKET
+    kraken.status_calls = 0          # count only the exit's polls, not the entry fill's
+    configure(kraken)
     with engine.begin() as conn:
-        candle_row = {stream["stream_id"]: {"close": armed_close, "low": stop_trigger_low}}
+        candle_row = {stream["stream_id"]: {"close": armed_close, "low": armed_close * 0.95 - 1}}
         stops = position_monitor.check_all(
-            conn, {stream["stream_id"]: stream}, candle_row, {"1h"}, kraken, dry_run=False
-        )
-        assert stops == 1
+            conn, {stream["stream_id"]: stream}, candle_row, {"1h"}, kraken, dry_run=False)
+    with engine.begin() as conn:
         lot = conn.execute(text("""
-            SELECT status, exit_price, fee_is_estimated FROM live.lots WHERE stream_id = :sid
-        """), {"sid": stream["stream_id"]}).fetchone()
-        assert lot.status == "CLOSED"   # never gets stuck even though the fill wasn't confirmed
-        assert lot.fee_is_estimated is True
-        # Fallback uses the passed-in stop price, not the real (unconfirmed) ticker fill
-        assert float(lot.exit_price) != armed_close
+            SELECT status, exit_price, exit_fee_usd, fee_is_estimated, closing_capital
+            FROM live.lots WHERE stream_id = :sid"""), {"sid": stream["stream_id"]}).fetchone()
+    return stops, lot, kraken
+
+
+def test_exit_unconfirmed_on_first_poll_is_recovered_by_retry(sandbox, fast_polls):
+    """The lot-10 bug: first poll misses the fill. A retry must capture the REAL
+    fill (not an estimate), and the sell must have been placed exactly once."""
+    stops, lot, kraken = _stop_out(sandbox, lambda k: setattr(k, "next_fill_mode", "delayed"))
+    assert stops == 1 and lot.status == "CLOSED"
+    assert lot.fee_is_estimated is False
+    assert float(lot.exit_price) == GAP_MARKET            # real fill, not the 49875 stop
+    assert kraken.place_calls == 2                        # 1 entry + 1 exit: no duplicate sell
+    assert len(fast_polls) == 1
+
+
+def test_exit_never_confirmed_estimates_from_ticker_not_stop(sandbox, fast_polls):
+    stops, lot, kraken = _stop_out(sandbox, lambda k: setattr(k, "next_fill_mode", "never"))
+    assert stops == 1 and lot.status == "CLOSED"          # never gets stuck
+    assert lot.fee_is_estimated is True                   # flagged for reconciliation
+    assert float(lot.exit_price) == GAP_MARKET            # ticker estimate, NOT the stop 49875
+    assert kraken.place_calls == 2
+    assert kraken.status_calls == order_manager.EXIT_FILL_POLL_ATTEMPTS   # bounded, no infinite loop
+    assert len(fast_polls) == order_manager.EXIT_FILL_POLL_ATTEMPTS - 1
+
+
+def test_exit_never_confirmed_and_ticker_down_falls_back_to_stop_price(sandbox, fast_polls):
+    def cfg(k):
+        k.next_fill_mode = "never"; k.ticker_down = True
+    stops, lot, _ = _stop_out(sandbox, cfg)
+    assert stops == 1 and lot.status == "CLOSED" and lot.fee_is_estimated is True
+    assert abs(float(lot.exit_price) - STOP_PRICE) < 0.01
+
+
+def test_exit_transient_status_errors_are_retried(sandbox, fast_polls):
+    """e.g. EAPI:Invalid nonce on the read -- must not abort, must not re-sell."""
+    stops, lot, kraken = _stop_out(sandbox, lambda k: setattr(k, "poll_errors", 2))
+    assert lot.status == "CLOSED" and lot.fee_is_estimated is False
+    assert float(lot.exit_price) == GAP_MARKET and kraken.place_calls == 2
+
+
+def test_exit_status_errors_forever_still_closes_flagged(sandbox, fast_polls):
+    stops, lot, kraken = _stop_out(sandbox, lambda k: setattr(k, "poll_errors", 999))
+    assert stops == 1 and lot.status == "CLOSED" and lot.fee_is_estimated is True
+    assert kraken.place_calls == 2
+
+
+def test_exit_zero_price_fill_is_not_trusted(sandbox, fast_polls):
+    """A 'closed' order reporting price 0 must not be booked as a real fill
+    (it would book a ~-100% loss)."""
+    def cfg(k):
+        k.next_fill_mode = "full"
+        orig = k.place_order
+        def place(*a, **kw):
+            txid = orig(*a, **kw); k.orders[txid]["price"] = "0"; return txid
+        k.place_order = place
+    stops, lot, _ = _stop_out(sandbox, cfg)
+    assert lot.status == "CLOSED" and lot.fee_is_estimated is True
+    assert float(lot.exit_price) > 0
 
 
 def test_exit_with_legacy_null_entry_fee_falls_back_to_estimate(sandbox):

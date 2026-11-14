@@ -26,6 +26,11 @@ class FakeKraken:
                    vol_exec=0) but fills for real by the second poll -- used
                    to test the estimated-fallback path on exits without ever
                    actually losing a fill.
+      "never"   -- order is placed but get_order_status never confirms it
+                   (reports "open", vol_exec=0) -- the genuine fallback path.
+    Also: `poll_errors` = N makes the next N get_order_status calls raise
+    (e.g. EAPI:Invalid nonce); `ticker_down` makes get_ticker_price raise.
+    `place_calls` counts place_order invocations (duplicate-order checks).
     """
 
     def __init__(self):
@@ -34,11 +39,18 @@ class FakeKraken:
         self._next_price = 50000.0
         self.next_fill_mode = "full"
         self.next_partial_fraction = 0.4
+        self.poll_errors = 0
+        self.ticker_down = False
+        self.place_calls = 0
+        self.status_calls = 0
 
     def get_ticker_price(self):
+        if self.ticker_down:
+            raise RuntimeError("ticker down")
         return self._next_price
 
     def place_order(self, side, volume_btc, price_usd=None, order_type="limit"):
+        self.place_calls += 1
         txid = f"FAKE-{self._next_id}"
         self._next_id += 1
         fill_price = price_usd if price_usd is not None else self._next_price
@@ -67,6 +79,11 @@ class FakeKraken:
                 "status": "open", "vol_exec": f"{filled:.8f}", "price": f"{fill_price:.2f}",
                 "fee": f"{fee:.4f}", "_requested": volume_btc,
             }
+        elif mode == "never":
+            self.orders[txid] = {
+                "status": "open", "vol_exec": "0.00000000", "price": "0.00",
+                "fee": "0.0000", "_requested": volume_btc,
+            }
         elif mode == "delayed":
             fee = volume_btc * fill_price * fee_rate
             self.orders[txid] = {
@@ -77,6 +94,10 @@ class FakeKraken:
         return txid
 
     def get_order_status(self, txid):
+        self.status_calls += 1
+        if self.poll_errors > 0:
+            self.poll_errors -= 1
+            raise RuntimeError("EAPI:Invalid nonce")
         order = dict(self.orders[txid])
         if "_polls" in self.orders[txid]:
             self.orders[txid]["_polls"] += 1
