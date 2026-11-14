@@ -275,3 +275,56 @@ def test_exit_with_legacy_null_entry_fee_falls_back_to_estimate(sandbox):
         gain = (armed_close - 50000.0) / 50000.0
         expected_pnl = 20.0 * gain - expected_entry_fee_estimate - expected_exit_fee
         assert abs(float(lot.realized_pnl) - expected_pnl) < 0.01
+
+
+# --- real KrakenClient lookup path, stubbed at the HTTP layer (lot 10 shape) ---
+
+class _StubApi:
+    """QueryOrders always empty (what Kraken did for lot 10); TradesHistory
+    lags: empty for the first `lag` reads, then shows the fill."""
+    def __init__(self, lag):
+        self.lag = lag; self.th_calls = 0; self.orders_placed = 0
+    def query_private(self, method, params=None):
+        if method == "AddOrder":
+            self.orders_placed += 1
+            return {"error": [], "result": {"txid": ["REAL-SELL-1"]}}
+        if method == "QueryOrders":
+            return {"error": [], "result": {}}
+        if method == "TradesHistory":
+            self.th_calls += 1
+            if self.th_calls <= self.lag:
+                return {"error": [], "result": {"trades": {}}}
+            return {"error": [], "result": {"trades": {"T1": {
+                "ordertxid": "REAL-SELL-1", "vol": "0.00040000", "cost": "28.60000", "fee": "0.22880"}}}}
+        raise AssertionError(method)
+    def query_public(self, method, params=None):
+        return {"error": [], "result": {"XXBTZUSD": {"c": ["60000.0"]}}}
+
+
+def _real_client(lag):
+    from src.live.kraken_client import KrakenClient
+    k = KrakenClient.__new__(KrakenClient)
+    k._api = _StubApi(lag)
+    return k
+
+
+@pytest.mark.parametrize("lag,estimated", [(0, False), (3, False), (4, True)])
+def test_exit_with_real_client_and_lagging_trade_history(sandbox, fast_polls, lag, estimated):
+    """lag<=3: the fill shows up within the 4 polls -> real fill (71,500), one sell.
+    lag=4: never within 4 polls -> estimate flagged, still exactly one sell."""
+    engine, stream, _ = sandbox
+    fake = FakeKraken(); fake._next_price = 50000.0
+    with engine.begin() as conn:
+        order_manager.place_entry(conn, stream, fake, dry_run=False)
+    with engine.begin() as conn:
+        order_manager.check_pending(conn, fake, dry_run=False)
+    real = _real_client(lag)
+    with engine.begin() as conn:
+        lot = conn.execute(text("SELECT * FROM live.lots WHERE stream_id=:s"), {"s": stream["stream_id"]}).fetchone()
+        order_manager.place_exit(conn, lot, 49875.0, real, dry_run=False, stream_name="t", model_id=1)
+    with engine.begin() as conn:
+        r = conn.execute(text("SELECT status, exit_price, fee_is_estimated FROM live.lots WHERE stream_id=:s"),
+                         {"s": stream["stream_id"]}).fetchone()
+    assert r.status == "CLOSED" and real._api.orders_placed == 1
+    assert r.fee_is_estimated is estimated
+    assert float(r.exit_price) == (60000.0 if estimated else 71500.0)
